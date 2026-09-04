@@ -6,6 +6,8 @@ Complete the migration adapter in `app/src/catalog.mjs`.
 
 The input is a legacy catalog export in `app/fixtures/legacy-catalog.json`. Convert it into the public catalog shape consumed by a newer application.
 
+Supplementary visual materials are available under `assets/nail-patterns/`. They include sanitized effect and design images for optional pipeline experiments. The original subdirectory structure must be preserved because some Vendure second-development scripts resolve image inputs by relative path; do not flatten or rename the files. The required automated assertions remain based on the JSON fixture so the public acceptance run is reproducible.
+
 ## Required behavior
 
 - keep active records and exclude inactive records;

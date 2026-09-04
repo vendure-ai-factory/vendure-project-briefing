@@ -8,6 +8,10 @@ The starter contains a legacy catalog fixture and an incomplete migration adapte
 
 The starter is expected to fail the real acceptance check. That is intentional: it gives a pipeline a bounded change to make and a precise failure to diagnose.
 
+## Test image materials
+
+Sanitized effect and design images are available under [`assets/nail-patterns/`](assets/nail-patterns/). They are optional visual inputs for pipeline experiments. The minimal acceptance test remains deterministic and uses the JSON fixture under `app/fixtures/`.
+
 ## Run the reference demonstration
 
 From the repository root:

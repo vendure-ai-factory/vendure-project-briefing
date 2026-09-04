@@ -6,6 +6,7 @@
 - Suitable debugging, coding, unit or integration testing, browser E2E testing, and evidence collection capabilities.
 - Explicit source, input, environment, and dependency identities.
 - Controlled code changes, test execution, failure stopping, rollback information, and result reporting.
+- Optional inspection and pipeline experiments using the sanitized public image materials in `evaluation-demo/assets/nail-patterns/`.
 - A maintainer-controlled remote run against the private formal evaluation input after contract.
 
 ## Out of scope for the public demo

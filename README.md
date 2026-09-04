@@ -7,7 +7,8 @@ This is the public, sanitized entry point for the Vendure migration and pipeline
 1. Read [docs/START_HERE.md](docs/START_HERE.md).
 2. Read the public acceptance target in [docs/ACCEPTANCE_OVERVIEW.md](docs/ACCEPTANCE_OVERVIEW.md).
 3. Open the runnable, no-secret hands-on case in [evaluation-demo/](evaluation-demo/).
-4. If you are considering the work, run the demo in your own clone or fork and then send a quote and timeline.
+4. Inspect the public test image materials in [evaluation-demo/assets/nail-patterns/](evaluation-demo/assets/nail-patterns/).
+5. If you are considering the work, run the demo in your own clone or fork and then send a quote and timeline.
 
 The public demo is deliberately small and sanitized. It shows the shape of the migration task, the verification contract, the evidence that a pipeline must produce, and the safe failure boundary. It is not the private legacy source and it is not a production environment.
 
@@ -35,9 +36,13 @@ bash evaluation-demo/scripts/verify.sh --acceptance
 
 The verifier writes a local `evaluation-demo/results/<run_id>/` directory containing the run manifest, status, logs, diff, summary, and rollback note. Results are local evidence; they are not a promise that a PR will be merged.
 
+## Test image materials
+
+The public hands-on package includes sanitized effect and design images at [evaluation-demo/assets/nail-patterns/](evaluation-demo/assets/nail-patterns/). Their original subdirectory structure is preserved because some Vendure second-development scripts depend on relative paths; do not flatten or rename them. They are available for inspection and optional pipeline experiments; the core acceptance test remains deterministic and uses the checked-in JSON fixture.
+
 ## Repository boundaries
 
-- `vendure-project-briefing` is public and contains only sanitized project information and the hands-on demo.
+- `vendure-project-briefing` is public and contains only sanitized project information, the hands-on demo, and approved test image materials.
 - `vendure-evaluation-input` is private and contains the formal legacy source, fixtures, and acceptance inputs.
 - `pipeline-contract` is private and contains the complete pipeline interface, evidence rules, runtime constraints, and acceptance contract.
 

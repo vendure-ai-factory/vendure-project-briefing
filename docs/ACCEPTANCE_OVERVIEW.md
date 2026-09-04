@@ -31,3 +31,7 @@ The demo maps these requirements to a small migration adapter:
 The starter is intentionally incomplete. A baseline run should stop with `BASELINE_BLOCKED_EXPECTED`; this demonstrates that the verifier can recognize a task that has not been completed. After the contractor implements the task in their own copy, `--acceptance` should return `PASS` and write the evidence bundle.
 
 The public demo is not formal private acceptance. The formal run additionally checks frozen private input, runtime identity, browser and service evidence, authorized resource use, cleanup, and the project-owned validator result.
+
+## Public test image path
+
+The sanitized effect and design image materials for optional hands-on experiments are stored at [`evaluation-demo/assets/nail-patterns/`](../evaluation-demo/assets/nail-patterns/). These assets supplement the deterministic JSON fixture and do not expose the private evaluation input.

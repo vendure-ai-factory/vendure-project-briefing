@@ -17,6 +17,8 @@ Read the task, inspect the starter source and tests, then implement the task in 
 bash evaluation-demo/scripts/verify.sh --acceptance
 ```
 
+Optional visual test materials are available at [`evaluation-demo/assets/nail-patterns/`](../evaluation-demo/assets/nail-patterns/). Inspect or use them only in your own clone or fork; they are public sanitized inputs, not private production data. Preserve the complete subdirectory structure and relative paths; do not flatten or rename the files because some Vendure second-development scripts depend on them.
+
 Submit either a fork URL and commit SHA or a pull request. Do not put secrets in the repository. Do not assume that a pull request will be merged.
 
 ## Information to send with a quote

@@ -13,10 +13,11 @@ The public case is a small catalog migration example. It is representative of th
 1. Read [PROJECT_SCOPE.md](PROJECT_SCOPE.md).
 2. Read [ACCEPTANCE_OVERVIEW.md](ACCEPTANCE_OVERVIEW.md).
 3. Read [../evaluation-demo/task.md](../evaluation-demo/task.md).
-4. Run `node ../evaluation-demo/scripts/run-demo.mjs` from this directory, or use the commands in the repository README.
-5. Inspect the generated `evaluation-demo/results/<run_id>/` evidence.
-6. Fork the repository if you want to modify the starter and prove your own approach.
-7. Send the project owner your feasibility judgment, fixed quote, delivery period, scope, assumptions, risks, and fork or commit link.
+4. Inspect the public test image materials in [../evaluation-demo/assets/nail-patterns/](../evaluation-demo/assets/nail-patterns/).
+5. Run `node ../evaluation-demo/scripts/run-demo.mjs` from this directory, or use the commands in the repository README.
+6. Inspect the generated `evaluation-demo/results/<run_id>/` evidence.
+7. Fork the repository if you want to modify the starter and prove your own approach.
+8. Send the project owner your feasibility judgment, fixed quote, delivery period, scope, assumptions, risks, and fork or commit link.
 
 ## What happens after a contract
 
@@ -25,3 +26,7 @@ After the project owner selects a contractor and signs a contract, the contracto
 ## Important distinction
 
 The public demo can prove that your pipeline can work with a small, sanitized case. It cannot prove access to or success against the private formal case. Formal acceptance uses frozen private input and contract revisions and is decided by the project-owned validator.
+
+## Public image materials
+
+The demo includes sanitized effect and design images in [../evaluation-demo/assets/nail-patterns/](../evaluation-demo/assets/nail-patterns/). You may inspect or use them in your own fork. Their original subdirectory structure is part of the test input contract: do not flatten or rename the files. They are supplementary materials; the deterministic acceptance test continues to use the checked-in JSON fixture.
