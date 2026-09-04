@@ -12,6 +12,16 @@ This is the public, sanitized entry point for the Vendure migration and pipeline
 
 The public demo is deliberately small and sanitized. It shows the shape of the migration task, the verification contract, the evidence that a pipeline must produce, and the safe failure boundary. It is not the private legacy source and it is not a production environment.
 
+## English contractor documents
+
+Read these documents before deciding whether to quote:
+
+- [English one-time acceptance contract](docs/CONTRACT_EN.md) — the proposed scope, delivery obligations, acceptance gates, handover requirements, and payment condition.
+- [English project overview](docs/PROJECT_OVERVIEW_EN.md) — the Vendure secondary-development migration scope, two migration batches, and the end-to-end tasks used for validation.
+- [English pipeline technical requirements](docs/PIPELINE_TECHNICAL_REQUIREMENTS_EN.md) — the expected pipeline behavior, evidence, safety boundaries, and remote validation process. OpenHands or ClawAI are recommended reference frameworks but are not mandatory; an equivalent familiar pipeline is acceptable if it achieves the required outcome.
+
+The detailed descriptions of software and frameworks later in the pipeline document record previous trials and research and are provided for reference only.
+
 ## Run the hands-on demo
 
 Requirements: Git, Node.js 20 or newer, and optionally Docker.

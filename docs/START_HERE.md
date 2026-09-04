@@ -12,16 +12,19 @@ The public case is a small catalog migration example. It is representative of th
 
 1. Read [PROJECT_SCOPE.md](PROJECT_SCOPE.md).
 2. Read [ACCEPTANCE_OVERVIEW.md](ACCEPTANCE_OVERVIEW.md).
-3. Read [../evaluation-demo/task.md](../evaluation-demo/task.md).
-4. Inspect the public test image materials in [../evaluation-demo/assets/nail-patterns/](../evaluation-demo/assets/nail-patterns/).
-5. Run `node ../evaluation-demo/scripts/run-demo.mjs` from this directory, or use the commands in the repository README.
-6. Inspect the generated `evaluation-demo/results/<run_id>/` evidence.
-7. Fork the repository if you want to modify the starter and prove your own approach.
-8. Send the project owner your feasibility judgment, fixed quote, delivery period, scope, assumptions, risks, and fork or commit link.
+3. Read the [English one-time acceptance contract](CONTRACT_EN.md), [English project overview](PROJECT_OVERVIEW_EN.md), and [English pipeline technical requirements](PIPELINE_TECHNICAL_REQUIREMENTS_EN.md).
+4. Read [../evaluation-demo/task.md](../evaluation-demo/task.md).
+5. Inspect the public test image materials in [../evaluation-demo/assets/nail-patterns/](../evaluation-demo/assets/nail-patterns/).
+6. Run `node ../evaluation-demo/scripts/run-demo.mjs` from this directory, or use the commands in the repository README.
+7. Inspect the generated `evaluation-demo/results/<run_id>/` evidence.
+8. Fork the repository if you want to modify the starter and prove your own approach.
+9. Send the project owner your feasibility judgment, fixed quote, delivery period, scope, assumptions, risks, and fork or commit link.
 
 ## What happens after a contract
 
-After the project owner selects a contractor and signs a contract, the contractor receives only the approved private development access needed for the formal pipeline. The contractor uploads the pipeline to a designated private branch or candidate repository. The project owner supplies the task prompt and starts the controlled run. The contractor can inspect the agreed result and fix issues, but does not directly operate the minipc, production environment, or shared evidence sink.
+After the project owner selects a contractor and signs a contract, the contractor receives only the approved private development access needed for the formal pipeline. Before formal delivery, the contractor must automatically run at least three representative long-chain tasks from the project overview, in principle covering at least one task from each migration batch plus a third task agreed with the owner. The contractor then uploads the pipeline to a designated private branch or candidate repository.
+
+The project owner supplies the task prompt and starts the controlled run, running the agreed migration batches separately and attempting the complete migration. If failures appear, the owner returns the actual evidence and the contractor tunes and reruns the pipeline. Final acceptance and payment happen only after the agreed migration scope is complete and the pipeline runs the agreed scenarios reliably and automatically. The contractor does not directly operate the minipc, production environment, or shared evidence sink.
 
 ## Important distinction
 
