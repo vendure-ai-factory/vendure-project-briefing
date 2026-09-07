@@ -1,14 +1,15 @@
 name: Validate public demo
-
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - codex/github-refactor-20260904
   pull_request:
-    branches: [main]
-
+    branches:
+      - main
+      - codex/github-refactor-20260904
 permissions:
   contents: read
-
 jobs:
   public-demo:
     runs-on: ubuntu-latest
