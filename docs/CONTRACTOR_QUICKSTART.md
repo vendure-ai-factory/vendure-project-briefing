@@ -31,6 +31,8 @@ Submit either a fork URL and commit SHA or a pull request. Do not put secrets in
 
 OpenHands or ClawAI are recommended reference frameworks, but they are not mandatory. You may use a pipeline you already know if it achieves the required outcome. The long software/framework/tool descriptions in the pipeline document describe previous trials and research and are reference material only.
 
+Optional project-side tooling: [`skill-doctor`](https://github.com/warpdotdev/common-skills/tree/main/.agents/skills/skill-doctor) can analyze selected local Agent conversations and skills and generate reviewable improvement suggestions. It is not required for the public demo, not a replacement for the pipeline, and not part of the acceptance gate.
+
 ## Information to send with a quote
 
 - whether the public demo ran successfully;

@@ -41,6 +41,7 @@ Our original idea was to combine open-source software from GitHub wherever pract
 - **Buzz:** The messaging, coordination, and information-sharing layer between Agents. It lets the main task start branch tasks and lets different roles share context, progress, and results.
 - **OpenHands / ClawAI:** Candidate autonomous development-team or autonomous-execution frameworks. They turn technical work into engineering actions: read code, plan changes, call tools, write code, run tests, and continue investigating and repairing ordinary technical failures.
 - **Codex:** Our primary coding IDE and preferred pipeline-development tool. We would like the contractor to use Codex first to build, debug, and deliver the pipeline itself. If the pipeline calls a coding Agent internally, Codex should also be evaluated as the implementation backend.
+- **skill-doctor (warpdotdev/common-skills):** An optional pipeline-development retrospective and skill-quality analysis tool. It analyzes selected local Agent conversations and skill configurations, then produces efficiency/code-quality/skill-coverage findings, a report, and candidate `SKILL.md` diffs so recurring debugging experience can become reviewable project assets. It does not execute business code, replace tests or validators, or automatically modify the real skills.
 - **Vendure capabilities and surrounding software:** Specialist tools for databases, GraphQL, frontend browsers, payments, email, observability, performance, security, and load testing.
 - **A thin code-owned boundary:** A small amount of code protects task identity, permissions, scope, resources, irreversible actions, and evidence integrity. A validator derives the final PASS/BLOCK; a model sentence saying “completed” does not.
 
@@ -68,6 +69,7 @@ This project should delegate routine technical route selection and recovery to O
 | Codex/coding backend | Concrete code understanding, modification, command execution, and tests | Replacing the independent final validator |
 | Code-owned safety/evidence kernel | Identity, scope, permissions, resources, irreversible operations, evidence integrity, and circuit breaking | Reimplementing every technical workflow or making every technical choice for the Agent |
 | Independent validator | Check required tool evidence, test output, changes, and cleanup; derive PASS/BLOCK | Accepting an Agent self-report as the only proof |
+| skill-doctor/retrospective layer | Analyze selected local conversations and skills and propose reviewable workflow/skill improvements | Executing business work, changing business source, or declaring PASS from a score |
 
 This is a reference model of “adaptive coordination plus code-owned boundaries.” The contractor may use different names for these responsibilities, but may not remove the final evidence validation or dangerous-operation boundary.
 
@@ -356,6 +358,7 @@ A role is a responsibility boundary; it does not necessarily require one permane
 | Evidence/Validation Agent | Independently check expected outputs, signed receipts, changes, tests, and cleanup | Staged evidence from all roles | PASS/BLOCK, evidence index, missing items | Pipeline validator, Harness Starter Kit, observability/test-harness notes |
 | Control-Plane Maintenance Agent | Repair templates, routing, adapters, skills, versions, and validators only | Control-plane BLOCK | Control-plane repair and regression evidence | `pipeline-engineering-sop`, `pipeline-task-contract`, `pipeline-agent-gate-playbook` |
 | Reflection/Optimization Agent | Record version deltas, failure patterns, and next improvements | Run results, reports, client feedback | Reflection/version delta and follow-up | self-iteration, DSPy, promptfoo, Codex |
+| Skill Doctor / Skill-Quality Agent | Reflection/Optimization Agent, Control-Plane Maintenance Agent | Run closeout, skill-quality analysis, and experience-asset updates | Analyzes selected local Agent conversations and skills and generates scores, findings, a report, and candidate `SKILL.md` diffs; it cannot change business source, directly edit real skills, or derive PASS | `skill-doctor` (warpdotdev/common-skills) |
 
 The main Agent plans, supervises, explains, and routes. It must not bypass the control plane and write business code directly. A business Worker performs the concrete work; the validator decides whether the evidence is sufficient. A control-plane maintenance Worker may not modify current business source or turn the current BLOCK into PASS.
 
@@ -380,6 +383,7 @@ Status meanings:
 | OpenHands | Autonomous development team, execution Worker | Technical execution after requirement expansion | Reads code, plans, uses tools, codes, debugs, tests, and recovers. It is the key candidate framework, but this report does not treat a current installation as verified; the contractor must qualify it with a real task. |
 | Codex | Contractor development Agent, coding Worker, supervisory Agent | Pipeline construction and concrete implementation | Preferred coding IDE/backend. The current minipc default PATH did not contain `codex`; the contractor must configure it or document Windows-Codex-to-Linux control. |
 | self-iteration / self-iteration-master | Reflection/optimization Agent | Closeout and next-round optimization | Records failure patterns, version deltas, and improvements; it is not a scheduler, validator, or business Worker. |
+| `skill-doctor` (warpdotdev/common-skills) | Reflection/optimization Agent, Control-Plane Maintenance Agent | Retrospective, skill-quality analysis, and optimization capture | Analyzes selected local conversations and skills and outputs scores, concrete findings, a report, and candidate `SKILL.md` diffs; optional auxiliary tooling that must be qualified in isolation, not a pipeline runtime, test tool, or PASS authority. |
 | parallel-task-orchestrator | Main Agent, branch Workers | Controlled decomposition and limited concurrency | Controls short tasks and named lanes under dependency, scope, resource, and evidence boundaries. |
 | HyperQueue / `hq` | Resource/concurrency Agent | Worker admission and resource queue | Intended to queue shared minipc resources. The report found no verifiable `hq` CLI, so it is not currently a formally healthy capability and must not be an undisclosed production dependency. |
 | minipc-remote-control | Runtime Agent, supervisory Agent | Remote Linux boundary | Uses controlled SSH/tmux-style access to minipc; arbitrary Workers must not receive the entire filesystem. |
@@ -521,6 +525,9 @@ Several names in the final report are not independent runtime programs; they are
 - `mcp-test-harness-notes`: fixtures, verification, and evidence methods.
 - `pipeline-engineering-sop`: converts task type, stack, and tool catalog into an execution brief; it is not a scheduler or validator.
 - `pipeline-task-contract` and `pipeline-agent-gate-playbook`: task contract, role boundaries, receipts, and validation gates. If the contractor reuses the current mainline rules, the evidence boundary must remain compatible.
+- `skill-doctor` ([warpdotdev/common-skills](https://github.com/warpdotdev/common-skills/tree/main/.agents/skills/skill-doctor)): optional local retrospective tooling that analyzes Agent conversations and skill quality and generates candidate edits. It is not a business Worker, scheduler, tester, or validator, and its score cannot be treated as PASS.
+
+When enabled, run `skill-doctor` only after a run has produced real results, failure evidence, and a validator conclusion, and prefer selected, redacted project conversations. Its report and candidate diffs go to an isolated scratch directory first. A Control-Plane Maintenance Agent may promote useful findings into versioned skills, rules, templates, or playbooks only after checking the runtime evidence, confirming that no secrets or business source are included, running regression checks, and creating a Git backup. `skill-doctor` does not commit to Git, push to GitHub, or change the current run's PASS/BLOCK result.
 
 ### 11.2 Quality, contract, and browser methods
 
