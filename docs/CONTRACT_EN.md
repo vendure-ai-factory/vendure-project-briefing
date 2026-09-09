@@ -116,6 +116,20 @@ After formal delivery, the Client shall use the Contractor’s Pipeline to attem
 
 Only when the agreed migration scope is complete, the Pipeline runs the agreed environment and acceptance scenarios reliably and automatically without unresolved Pipeline defects, and the Client-controlled validator and evidence pass the Final Acceptance Run, will final handover and payment proceed.
 
+### 3.4 Acceptance environment, migration scope, and tuning boundary
+
+The migration scope of this Agreement is the project overview and Annex A confirmed by both parties at signature, and is explicitly divided into two batches:
+
+- **Batch 1: foundational capabilities.** Country and channel behavior, currency, customer country, product visibility, cart and checkout channel locking, and the dependent frontend pages, database extensions, and surrounding configuration needed to make these capabilities runnable.
+- **Batch 2: remaining business capabilities.** The remaining secondary-development functions listed in the project overview, including custom press-on-nail product publication, the directory and archive behavior for effect/design images, standard and custom-product purchase, wallet and payment, order merging, size, inventory, restocking, shipping, and the related end-to-end flows.
+- **Explicitly outside this phase.** Accounting-related functionality and WorldFirst-related functionality; coupons and the marketing module marked “to be developed” in the project overview are not treated as completed capabilities under this Agreement.
+
+Batch 1 and Batch 2 must each retain traceable code changes, environment preparation, verification actions, observed results, and evidence. A generic statement that “the migration is complete” is not a substitute for the individual validations. New business features, a new Vendure base version, a new execution environment, a new acceptance scenario, production deployment, or performance requirements outside the declared environment/workload are scope changes and require separate written confirmation by both parties.
+
+The Contractor may complete the 3 pre-delivery long-chain capability validations in the Contractor’s own isolated environment or another temporary environment approved by both parties. Formal acceptance shall not rely on GitHub files, a GitHub Pages page, or the Contractor’s personal computer as the sole runtime. The Client shall start a one-time clean and isolated Linux Acceptance Environment through GitHub Actions `workflow_dispatch`, an equivalent authenticated API, or another interface confirmed in writing. GitHub stores versions, task inputs, workflow interfaces, and evidence; the complete Vendure runtime, database, browser E2E run, and cleanup occur in the temporary Acceptance Environment. If a tool must run on the Client terminal computer, it may be invoked only through a Client-controlled allowlisted adapter; the Contractor receives no root, unrestricted SSH, unrestricted Docker, or unrestricted self-hosted-runner access to the Client minipc.
+
+For Pipeline defects within the agreed scope, there is no fixed upper limit on the number of tuning iterations, and the project is not deemed complete merely because a preset number has been used. The Client will provide reviewable evidence of failure, omission, false pass, insufficient evidence, rollback failure, or manual substitution; the Contractor will submit a repair with a new version identifier and rerun the affected tasks until the agreed migration scope is complete and the Pipeline runs reliably and automatically. New features, versions, environments, or acceptance scenarios are not defect tuning under this paragraph and require written scope-change confirmation.
+
 ## 4. Client inputs and responsibilities
 
 The Client shall provide, before the Acceptance Manifest is frozen:
@@ -212,6 +226,8 @@ Before formally delivering the Pipeline, the Contractor shall select and automat
 ### 7.2 Complete-migration tuning after delivery
 
 After formal delivery, the Client shall use the candidate Pipeline to attempt the complete migration specified by the project overview. Batch 1 and Batch 2 shall be run and recorded separately; the Client will provide failure, omission, false-pass, insufficient-evidence, rollback-failure, or manual-substitution evidence to the Contractor. The Contractor shall repair and submit a new candidate version, and the Client shall rebind the version and rerun affected tasks until the agreed migration scope is complete and the Pipeline runs reliably and automatically.
+
+There is no fixed upper limit on tuning iterations for Pipeline defects within the agreed scope. Each repair must produce an identifiable new candidate version and retain its run result. New features, versions, environments, or acceptance scenarios are outside this paragraph and require separate written confirmation.
 
 ### 7.3 Freeze before final acceptance
 
