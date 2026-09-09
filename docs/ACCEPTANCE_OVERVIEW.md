@@ -12,6 +12,14 @@ For a declared input revision and task, the pipeline must:
 6. return `PASS` only from an independent validator with the required evidence, or return a precise `BLOCK`;
 7. stop and clean up when authorization, identity, safety, or required evidence is missing.
 
+## Three stages of acceptance
+
+1. **Public hands-on stage:** the contractor clones or forks this public repository and runs the no-secret demo in the contractor's own environment. This proves that the contractor can understand the task shape and produce evidence; it does not expose private input or prove the formal migration.
+2. **Pipeline capability/delivery gate:** after contract signing, the contractor automatically completes at least three representative long-chain E2E tasks from the project overview, with at least one from each migration batch and a third agreed with the owner. The contractor submits the code revision, environment identity, task inputs, actual changes, test/browser/backend evidence, cleanup, and rollback evidence. This gate proves capability and permits delivery of the candidate Pipeline; it is not final acceptance and is not, by itself, a payment event.
+3. **Client-controlled final acceptance:** the owner freezes the Acceptance Manifest and runs the remaining complete migration in a clean isolated Linux environment. Batch 1 and Batch 2 are recorded separately and then judged together. If a Pipeline defect appears, the owner returns reproducible evidence and the contractor submits a new identified revision and reruns the affected scenarios. Defects within the frozen scope remain in the tuning loop until the acceptance conditions pass; new features, versions, environments, or scenarios require written scope agreement.
+
+The Acceptance Manifest is the plain-language freeze of what is being tested: exact code and input revisions, runner/environment identity, fixtures and accounts, workflow trigger, expected browser/backend results, evidence files, cleanup, and rollback. GitHub provides the versioned control/evidence surface, while the actual run occurs in an isolated Linux runtime. A project-owner-controlled adapter is required for any tool that can run only on the minipc.
+
 ## Public demo mapping
 
 The demo maps these requirements to a small migration adapter:
