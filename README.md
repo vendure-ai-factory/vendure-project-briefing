@@ -33,7 +33,7 @@ The detailed descriptions of software and frameworks later in the pipeline docum
 Requirements: Git, Node.js 20 or newer, and optionally Docker.
 
 ```bash
-git clone https://github.com/vendure-ai-factory/vendure-project-briefing.git
+git clone --branch codex/github-refactor-20260904 --single-branch https://github.com/vendure-ai-factory/vendure-project-briefing.git
 cd vendure-project-briefing
 node evaluation-demo/scripts/run-demo.mjs
 ```
