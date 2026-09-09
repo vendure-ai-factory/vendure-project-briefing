@@ -5,11 +5,13 @@
 Work only in your own clone or fork:
 
 ```bash
-git clone https://github.com/vendure-ai-factory/vendure-project-briefing.git
+git clone --branch codex/github-refactor-20260904 --single-branch https://github.com/vendure-ai-factory/vendure-project-briefing.git
 cd vendure-project-briefing
 node evaluation-demo/scripts/run-demo.mjs
 bash evaluation-demo/scripts/verify.sh --baseline
 ```
+
+The public hands-on package is currently published on the `codex/github-refactor-20260904` branch. Use the branch-pinned command above until the package is merged into `main`; cloning without `--branch` may retrieve the minimal `main` README instead of the test package.
 
 Read the task, inspect the starter source and tests, then implement the task in your own copy. Run:
 
