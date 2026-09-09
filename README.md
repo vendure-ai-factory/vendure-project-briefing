@@ -12,6 +12,12 @@ This is the public, sanitized entry point for the Vendure migration and pipeline
 
 The public demo is deliberately small and sanitized. It shows the shape of the migration task, the verification contract, the evidence that a pipeline must produce, and the safe failure boundary. It is not the private legacy source and it is not a production environment.
 
+## How the execution boundary works
+
+GitHub is the versioned control and evidence surface: it carries the reviewed source revision, task inputs, workflow entry point, run status, and redacted evidence. GitHub Pages or a repository page is not the environment that runs the complete Vendure migration. The actual work must run in a clean, isolated Linux environment such as a temporary container or ephemeral runner.
+
+The public demo runs in the contractor's own clone, fork, computer, Codespace, or isolated runner and contains no secrets. After a contract, the contractor may develop and run the capability in the contractor's own isolated environment or another agreed isolated runner. Final acceptance is performed by the project owner in a project-controlled temporary environment. The normal control path is an authenticated GitHub Actions `workflow_dispatch` or equivalent API; SSH is not the normal task interface and may be used only as a separately approved, limited diagnostic channel. A tool that can run only on the minipc must be exposed through a project-owner-controlled, allowlisted adapter rather than unrestricted minipc access.
+
 ## English contractor documents
 
 Read these documents before deciding whether to quote:
@@ -57,6 +63,8 @@ The public hands-on package includes sanitized effect and design images at [eval
 - `pipeline-contract` is private and contains the complete pipeline interface, evidence rules, runtime constraints, and acceptance contract.
 
 The formal test run is controlled by the project owner. A contractor must not receive minipc, production, shared-runner, password, API-key, or SSH-key access merely to try the public demo.
+
+The delivery gate is separate from final acceptance: after contract signing, at least three representative long-chain E2E tasks must pass with reviewable evidence before the contractor delivers the candidate Pipeline. This is a capability gate, not a separate public-demo result and not, by itself, a payment or final-acceptance event. The project owner then runs the remaining migration within the frozen scope. Defects in the Pipeline's agreed scope are returned with reproducible evidence and must be repaired and rerun without an arbitrary small limit on tuning rounds. New features, Vendure versions, environments, or acceptance scenarios are scope changes and require written agreement.
 
 ## Submitting a pipeline
 

@@ -33,3 +33,7 @@ bash evaluation-demo/scripts/verify.sh --acceptance
 `--baseline` passes only when the incomplete starter is correctly recognized as an expected block. `--acceptance` passes only when all acceptance tests pass.
 
 The verifier never needs a token, password, database, production service, or network access.
+
+## Execution boundary
+
+Run this demo only in your own clone, fork, computer, Codespace, or isolated no-secret runner. GitHub stores the reviewed source and evidence instructions; the repository page or GitHub Pages is not the runtime for the complete Vendure migration. Do not connect the demo to the private evaluation repository, the minipc, production, or any shared runner. The public demo is a hands-on feasibility step before quoting, not the three-task capability gate and not final acceptance.

@@ -33,3 +33,5 @@ Your pipeline should leave:
 ## Boundary
 
 This is a public demonstration only. Do not attempt to access private repositories, client systems, production services, or credentials. A successful public demo supports a feasibility discussion; it is not formal acceptance of the private Vendure pipeline.
+
+Run the task only in your own clone, fork, computer, Codespace, or isolated no-secret runner. Do not use the Client's minipc, a shared self-hosted runner, unrestricted SSH, repository secrets, or production services. The public task demonstrates the shape of a bounded migration and its evidence; after contract signing, the separate capability gate and final acceptance use the private inputs and the controlled environments described in the public project documents.
