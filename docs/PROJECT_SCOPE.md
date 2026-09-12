@@ -6,7 +6,7 @@
 - Suitable debugging, coding, unit or integration testing, browser E2E testing, and evidence collection capabilities.
 - Explicit source, input, environment, and dependency identities.
 - Controlled code changes, test execution, failure stopping, rollback information, and result reporting.
-- Optional inspection and pipeline experiments using the sanitized public image materials in `evaluation-demo/assets/nail-patterns/`.
+- Inspection and pipeline experiments using the sanitized public image materials in `evaluation-demo/assets/nail-patterns/` and the larger clean-tree package in `evaluation-demo/migration-input/`.
 - A maintainer-controlled remote run against the private formal evaluation input after contract.
 
 ## Current formal migration scope
@@ -17,7 +17,7 @@ The two batches remain separately traceable, but both are part of the complete a
 
 ## Out of scope for the public demo
 
-- The real legacy Vendure source and client-specific configuration.
+- Private Git history, production data, and client-specific secrets or configuration. A sanitized clean-tree source snapshot is public under `evaluation-demo/migration-input/` for review only.
 - Production data, production deployments, personal credentials, minipc login, or shared runner access.
 - Treating a green GitHub workflow, a zero exit code, a model message, or a submitted PR as formal acceptance.
 - Giving a contractor write access to a canonical `main` branch.

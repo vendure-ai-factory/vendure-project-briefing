@@ -21,6 +21,8 @@ bash evaluation-demo/scripts/verify.sh --acceptance
 
 Optional visual test materials are available at [`evaluation-demo/assets/nail-patterns/`](../evaluation-demo/assets/nail-patterns/). Inspect or use them only in your own clone or fork; they are public sanitized inputs, not private production data. Preserve the complete subdirectory structure and relative paths; do not flatten or rename the files because some Vendure second-development scripts depend on them.
 
+The larger [sanitized migration-input package](../evaluation-demo/migration-input/) contains the reviewed clean-tree source snapshot, `acceptance-inputs/测试任务.docx`, `acceptance-inputs/流水线诉求描述.docx`, the matching `fixtures/美甲图案/` tree, and the publication audit. Use it to understand the broader task and path assumptions. It is public review material, not private Git history and not the final owner-controlled acceptance revision.
+
 Submit either a fork URL and commit SHA or a pull request. Do not put secrets in the repository. Do not assume that a pull request will be merged.
 
 ## Read before quoting

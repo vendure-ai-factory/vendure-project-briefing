@@ -8,15 +8,16 @@ This is the public, sanitized entry point for the Vendure migration and pipeline
 2. Read the public acceptance target in [docs/ACCEPTANCE_OVERVIEW.md](docs/ACCEPTANCE_OVERVIEW.md).
 3. Open the runnable, no-secret hands-on case in [evaluation-demo/](evaluation-demo/).
 4. Inspect the public test image materials in [evaluation-demo/assets/nail-patterns/](evaluation-demo/assets/nail-patterns/).
-5. If you are considering the work, run the demo in your own clone or fork and then send a quote and timeline.
+5. Inspect the larger [sanitized migration input package](evaluation-demo/migration-input/), including the source tree and migration task documents.
+6. If you are considering the work, run the demo in your own clone or fork and then send a quote and timeline.
 
-The public demo is deliberately small and sanitized. It shows the shape of the migration task, the verification contract, the evidence that a pipeline must produce, and the safe failure boundary. It is not the private legacy source and it is not a production environment.
+The public repository now has two complementary hands-on layers. `evaluation-demo/app/` is a small deterministic smoke case. `evaluation-demo/migration-input/` is a larger, sanitized snapshot of the source and task inputs so that a contractor can inspect the real task shape. It is a clean-tree publication, not a mirror of private Git history and not a production environment.
 
 ## How the execution boundary works
 
 GitHub is the versioned control and evidence surface: it carries the reviewed source revision, task inputs, workflow entry point, run status, and redacted evidence. GitHub Pages or a repository page is not the environment that runs the complete Vendure migration. The actual work must run in a clean, isolated Linux environment such as a temporary container or ephemeral runner.
 
-The public demo runs in the contractor's own clone, fork, computer, Codespace, or isolated runner and contains no secrets. After a contract, the contractor may develop and run the capability in the contractor's own isolated environment or another agreed isolated runner. Final acceptance is performed by the project owner in a project-controlled temporary environment. The normal control path is an authenticated GitHub Actions `workflow_dispatch` or equivalent API; SSH is not the normal task interface and may be used only as a separately approved, limited diagnostic channel. A tool that can run only on the minipc must be exposed through a project-owner-controlled, allowlisted adapter rather than unrestricted minipc access.
+The public demo and sanitized migration-input package run or are inspected in the contractor's own clone, fork, computer, Codespace, or isolated runner and contain no secrets. After a contract, the contractor may develop and run the capability in the contractor's own isolated environment or another agreed isolated runner. Final acceptance is performed by the project owner in a project-controlled temporary environment. The normal control path is an authenticated GitHub Actions `workflow_dispatch` or equivalent API; SSH is not the normal task interface and may be used only as a separately approved, limited diagnostic channel. A tool that can run only on the minipc must be exposed through a project-owner-controlled, allowlisted adapter rather than unrestricted minipc access.
 
 ## English contractor documents
 
@@ -56,10 +57,12 @@ The verifier writes a local `evaluation-demo/results/<run_id>/` directory contai
 
 The public hands-on package includes sanitized effect and design images at [evaluation-demo/assets/nail-patterns/](evaluation-demo/assets/nail-patterns/). Their original subdirectory structure is preserved because some Vendure second-development scripts depend on relative paths; do not flatten or rename them. They are available for inspection and optional pipeline experiments; the core acceptance test remains deterministic and uses the checked-in JSON fixture.
 
+The larger sanitized package also contains a matching repository-relative fixture tree at `evaluation-demo/migration-input/fixtures/美甲图案/` for scripts that expect the legacy source layout. These are public test inputs only. Use the path from the checked-out repository, not a path from the owner's computer.
+
 ## Repository boundaries
 
-- `vendure-project-briefing` is public and contains only sanitized project information, the hands-on demo, and approved test image materials.
-- `vendure-evaluation-input` is private and contains the formal legacy source, fixtures, and acceptance inputs.
+- `vendure-project-briefing` is public and contains sanitized project information, the hands-on demo, and a reviewed clean-tree publication of the migration inputs.
+- `vendure-evaluation-input` remains private and is the owner-controlled source of formal revisions, private history, and final acceptance inputs. The public package is not a history mirror and does not grant access to the private repository.
 - `pipeline-contract` is private and contains the complete pipeline interface, evidence rules, runtime constraints, and acceptance contract.
 
 The formal test run is controlled by the project owner. A contractor must not receive minipc, production, shared-runner, password, API-key, or SSH-key access merely to try the public demo.

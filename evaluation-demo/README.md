@@ -1,6 +1,6 @@
 # Public Evaluation Demo
 
-This is a small, no-secret, runnable case for testing a contractor's pipeline approach before a quote. It is intentionally separate from the private Vendure legacy source.
+This is a small, no-secret, runnable case for testing a contractor's pipeline approach before a quote. The larger sanitized source and task package is available separately under [`migration-input/`](migration-input/); the two layers serve different purposes.
 
 ## The case
 
@@ -11,6 +11,10 @@ The starter is expected to fail the real acceptance check. That is intentional: 
 ## Test image materials
 
 Sanitized effect and design images are available under [`assets/nail-patterns/`](assets/nail-patterns/). They are optional visual inputs for pipeline experiments. The minimal acceptance test remains deterministic and uses the JSON fixture under `app/fixtures/`.
+
+## Larger sanitized migration input
+
+[`migration-input/`](migration-input/) contains a clean-tree, public-safe snapshot of the sanitized Vendure source, migration task documents, and the repository-relative fixture tree. It lets a contractor inspect more of the actual task context and test path handling in a personal clone or fork. It does not include private Git history, production data, credentials, or the owner-controlled formal acceptance environment. Preserve `migration-input/fixtures/美甲图案/` and all nested directories when testing scripts that depend on relative paths.
 
 ## Run the reference demonstration
 
@@ -36,4 +40,4 @@ The verifier never needs a token, password, database, production service, or net
 
 ## Execution boundary
 
-Run this demo only in your own clone, fork, computer, Codespace, or isolated no-secret runner. GitHub stores the reviewed source and evidence instructions; the repository page or GitHub Pages is not the runtime for the complete Vendure migration. Do not connect the demo to the private evaluation repository, the minipc, production, or any shared runner. The public demo is a hands-on feasibility step before quoting, not the three-task capability gate and not final acceptance.
+Run this demo only in your own clone, fork, computer, Codespace, or isolated no-secret runner. GitHub stores the reviewed source and evidence instructions; the repository page or GitHub Pages is not the runtime for the complete Vendure migration. Do not connect the public package to the private evaluation repository, the minipc, production, or any shared runner. The public materials are a hands-on feasibility step before quoting, not the three-task capability gate and not final acceptance.

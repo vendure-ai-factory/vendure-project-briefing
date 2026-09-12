@@ -11,7 +11,7 @@
 ## What it does not allow
 
 - write to or merge the canonical `main` branch;
-- read the private legacy source or formal acceptance inputs;
+- read the private Git history, owner-controlled formal acceptance revision, or production-only inputs. The public repository does contain a separately audited sanitized source snapshot for review; it must not be treated as private or production data;
 - log in to the minipc, production system, or shared evidence directory;
 - obtain passwords, API keys, SSH keys, or production data;
 - turn a PR, workflow green check, or model statement into formal PASS.

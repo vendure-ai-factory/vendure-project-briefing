@@ -6,7 +6,7 @@ This page gives a contractor the shortest path from the public advertisement to 
 
 The project owner wants a pipeline that can take a bounded Vendure secondary-development task, inspect the code, make controlled changes, start the declared test environment, run verification, collect durable evidence, and stop safely when a required condition is not met.
 
-The public case is a small catalog migration example. It is representative of the required reasoning and evidence shape, but it is not a copy of the private client code.
+The public repository contains a small catalog migration example plus a larger sanitized migration-input package. The small case is the fastest smoke test. The larger package lets you inspect the source and task-document shape more closely, but it is a clean-tree publication rather than a copy of private Git history or a production environment.
 
 ## What you should do
 
@@ -15,10 +15,11 @@ The public case is a small catalog migration example. It is representative of th
 3. Read the [English one-time acceptance contract](CONTRACT_EN.md), [English project overview](PROJECT_OVERVIEW_EN.md), and [English pipeline technical requirements](PIPELINE_TECHNICAL_REQUIREMENTS_EN.md).
 4. Read [../evaluation-demo/task.md](../evaluation-demo/task.md).
 5. Inspect the public test image materials in [../evaluation-demo/assets/nail-patterns/](../evaluation-demo/assets/nail-patterns/).
-6. Run `node ../evaluation-demo/scripts/run-demo.mjs` from this directory, or use the commands in the repository README.
-7. Inspect the generated `evaluation-demo/results/<run_id>/` evidence.
-8. Fork the repository if you want to modify the starter and prove your own approach.
-9. Send the project owner your feasibility judgment, fixed quote, delivery period, scope, assumptions, risks, and fork or commit link.
+6. Inspect the [sanitized migration input package](../evaluation-demo/migration-input/), especially `legacy/`, `acceptance-inputs/`, and `PUBLICATION_SANITIZATION_REPORT.md`.
+7. Run `node ../evaluation-demo/scripts/run-demo.mjs` from this directory, or use the commands in the repository README.
+8. Inspect the generated `evaluation-demo/results/<run_id>/` evidence.
+9. Fork the repository if you want to modify the starter and prove your own approach.
+10. Send the project owner your feasibility judgment, fixed quote, delivery period, scope, assumptions, risks, and fork or commit link.
 
 ## What happens after a contract
 
@@ -32,7 +33,7 @@ The three-task pre-delivery gate proves capability; it is not final project acce
 
 ## Important distinction
 
-The public demo can prove that your pipeline can work with a small, sanitized case. It cannot prove access to or success against the private formal case. Formal acceptance uses frozen private input and contract revisions and is decided by the project-owned validator.
+The public demo can prove that your pipeline can work with a small case, while the sanitized migration-input package lets you inspect a larger source and task context. Neither public layer proves access to or success against the private formal case. Formal acceptance uses frozen private input and contract revisions and is decided by the project-owned validator.
 
 ## Public image materials
 

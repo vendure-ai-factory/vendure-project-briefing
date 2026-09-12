@@ -14,7 +14,7 @@ For a declared input revision and task, the pipeline must:
 
 ## Three stages of acceptance
 
-1. **Public hands-on stage:** the contractor clones or forks this public repository and runs the no-secret demo in the contractor's own environment. This proves that the contractor can understand the task shape and produce evidence; it does not expose private input or prove the formal migration.
+1. **Public hands-on stage:** the contractor clones or forks this public repository, runs the no-secret demo, and inspects the larger sanitized migration-input package in the contractor's own environment. This proves that the contractor can understand the task shape and produce evidence; it does not expose private Git history or prove the formal migration.
 2. **Pipeline capability/delivery gate:** after contract signing, the contractor automatically completes at least three representative long-chain E2E tasks from the project overview, with at least one from each migration batch and a third agreed with the owner. The contractor submits the code revision, environment identity, task inputs, actual changes, test/browser/backend evidence, cleanup, and rollback evidence. This gate proves capability and permits delivery of the candidate Pipeline; it is not final acceptance and is not, by itself, a payment event.
 3. **Client-controlled final acceptance:** the owner freezes the Acceptance Manifest and runs the remaining complete migration in a clean isolated Linux environment. Batch 1 and Batch 2 are recorded separately and then judged together. If a Pipeline defect appears, the owner returns reproducible evidence and the contractor submits a new identified revision and reruns the affected scenarios. Defects within the frozen scope remain in the tuning loop until the acceptance conditions pass; new features, versions, environments, or scenarios require written scope agreement.
 
@@ -38,7 +38,7 @@ The demo maps these requirements to a small migration adapter:
 
 The starter is intentionally incomplete. A baseline run should stop with `BASELINE_BLOCKED_EXPECTED`; this demonstrates that the verifier can recognize a task that has not been completed. After the contractor implements the task in their own copy, `--acceptance` should return `PASS` and write the evidence bundle.
 
-The public demo is not formal private acceptance. The formal run additionally checks frozen private input, runtime identity, browser and service evidence, authorized resource use, cleanup, and the project-owned validator result.
+The public demo and the public sanitized migration-input package are not formal private acceptance. They allow feasibility review and hands-on experiments. The formal run additionally checks the frozen owner-controlled input revision, runtime identity, browser and service evidence, authorized resource use, cleanup, and the project-owned validator result.
 
 ## Public test image path
 
