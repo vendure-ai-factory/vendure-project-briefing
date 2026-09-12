@@ -330,7 +330,7 @@ If a function was previously implemented with custom code but direct migration w
 
 Legacy code and test images are obtained from fixed GitHub revisions as pipeline inputs:
 
-- **Public test-image fixture:** [vendure-project-briefing/evaluation-demo/assets/nail-patterns/](https://github.com/vendure-ai-factory/vendure-project-briefing/tree/codex/github-refactor-20260904/evaluation-demo/assets/nail-patterns), current branch `codex/github-refactor-20260904`, commit `95329a7`;
+- **Public test-image fixture:** [vendure-project-briefing/evaluation-demo/assets/nail-patterns/](https://github.com/vendure-ai-factory/vendure-project-briefing/tree/codex/github-refactor-20260904/evaluation-demo/assets/nail-patterns), on the latest commit of branch `codex/github-refactor-20260904`;
 - **Public sanitized source snapshot:** `evaluation-demo/migration-input/legacy/`, accompanied by the sanitized task inputs and repository-relative fixtures; suitable for inspection and contractor-owned experiments, not formal acceptance;
 - **Formal legacy-code archive:** the Client-controlled private `vendure-evaluation-input` repository. The exact relative path and fixed revision will be provided in a controlled manner after signature and before the Acceptance Manifest is frozen; private history and owner-controlled formal inputs are not public;
 - **Directory constraint:** the original subdirectory structure of the test images is part of the input contract. The pipeline must read the original relative paths and must not mix all images into one directory.
@@ -686,7 +686,7 @@ The following information must be filled in or authorized by the client before a
 | Parameter | Current status |
 |---|---|
 | GitHub repository URL | Public demo: `https://github.com/vendure-ai-factory/vendure-project-briefing`; formal private repositories are provided under the Agreement |
-| Repository-relative path of the test images | `evaluation-demo/assets/nail-patterns/`; current public hands-on revision: `codex/github-refactor-20260904` @ `95329a7` |
+| Repository-relative path of the test images | `evaluation-demo/assets/nail-patterns/` and `evaluation-demo/migration-input/fixtures/美甲图案/`; current public hands-on revision: `codex/github-refactor-20260904` @ `d544405f9534c65f57502da8668326845a5622ca` |
 | Repository-relative path of `projects_backup_full.tar` | Private `vendure-evaluation-input`; controlled confirmation after signature; must not be published |
 | Acceptance commit/tag | To be locked |
 | GitHub URL and fixed revision of the new Vendure base | To be supplied/confirmed |
