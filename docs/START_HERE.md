@@ -12,14 +12,15 @@ The public repository contains a small catalog migration example plus a larger s
 
 1. Read [PROJECT_SCOPE.md](PROJECT_SCOPE.md).
 2. Read [ACCEPTANCE_OVERVIEW.md](ACCEPTANCE_OVERVIEW.md).
-3. Read the [English one-time acceptance contract](CONTRACT_EN.md), [English project overview](PROJECT_OVERVIEW_EN.md), and [English pipeline technical requirements](PIPELINE_TECHNICAL_REQUIREMENTS_EN.md).
-4. Read [../evaluation-demo/task.md](../evaluation-demo/task.md).
-5. Inspect the public test image materials in [../evaluation-demo/assets/nail-patterns/](../evaluation-demo/assets/nail-patterns/).
-6. Inspect the [sanitized migration input package](../evaluation-demo/migration-input/), especially `legacy/`, `acceptance-inputs/`, and `PUBLICATION_SANITIZATION_REPORT.md`.
-7. Run `node ../evaluation-demo/scripts/run-demo.mjs` from this directory, or use the commands in the repository README.
-8. Inspect the generated `evaluation-demo/results/<run_id>/` evidence.
-9. Fork the repository if you want to modify the starter and prove your own approach.
-10. Send the project owner your feasibility judgment, fixed quote, delivery period, scope, assumptions, risks, and fork or commit link.
+3. Read [PIPELINE_IMPLEMENTATION_REFERENCE.md](PIPELINE_IMPLEMENTATION_REFERENCE.md).
+4. Read the [English one-time acceptance contract](CONTRACT_EN.md), [English project overview](PROJECT_OVERVIEW_EN.md), and [English pipeline technical requirements](PIPELINE_TECHNICAL_REQUIREMENTS_EN.md).
+5. Read [../evaluation-demo/task.md](../evaluation-demo/task.md).
+6. Inspect the public test image materials in [../evaluation-demo/assets/nail-patterns/](../evaluation-demo/assets/nail-patterns/).
+7. Inspect the [sanitized migration input package](../evaluation-demo/migration-input/), especially `legacy/`, `acceptance-inputs/`, and `PUBLICATION_SANITIZATION_REPORT.md`.
+8. Run `node ../evaluation-demo/scripts/run-demo.mjs` from this directory, or use the commands in the repository README.
+9. Inspect the generated `evaluation-demo/results/<run_id>/` evidence.
+10. Fork the repository if you want to modify the starter and prove your own approach.
+11. Send the project owner your feasibility judgment, fixed quote, delivery period, scope, assumptions, risks, and fork or commit link.
 
 ## What happens after a contract
 

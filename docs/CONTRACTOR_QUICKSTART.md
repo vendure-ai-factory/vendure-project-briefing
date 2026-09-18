@@ -35,6 +35,8 @@ OpenHands or ClawAI are recommended reference frameworks, but they are not manda
 
 Optional project-side tooling: [`skill-doctor`](https://github.com/warpdotdev/common-skills/tree/main/.agents/skills/skill-doctor) can analyze selected local Agent conversations and skills and generate reviewable improvement suggestions. It is not required for the public demo, not a replacement for the pipeline, and not part of the acceptance gate.
 
+For the expected technical shape of a proposal, see [Pipeline Implementation Reference](PIPELINE_IMPLEMENTATION_REFERENCE.md). It explains the scenario compiler, isolated executor, autonomous debugging, evidence-linked validation, independent PASS/BLOCK validator, and separate code/data rollback. These are outcome requirements; you may use your own framework and suitable open-source components.
+
 ## Information to send with a quote
 
 - whether the public demo ran successfully;

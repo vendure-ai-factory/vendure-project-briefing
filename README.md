@@ -6,10 +6,11 @@ This is the public, sanitized entry point for the Vendure migration and pipeline
 
 1. Read [docs/START_HERE.md](docs/START_HERE.md).
 2. Read the public acceptance target in [docs/ACCEPTANCE_OVERVIEW.md](docs/ACCEPTANCE_OVERVIEW.md).
-3. Open the runnable, no-secret hands-on case in [evaluation-demo/](evaluation-demo/).
-4. Inspect the public test image materials in [evaluation-demo/assets/nail-patterns/](evaluation-demo/assets/nail-patterns/).
-5. Inspect the larger [sanitized migration input package](evaluation-demo/migration-input/), including the source tree and migration task documents.
-6. If you are considering the work, run the demo in your own clone or fork and then send a quote and timeline.
+3. Read the technical implementation reference in [docs/PIPELINE_IMPLEMENTATION_REFERENCE.md](docs/PIPELINE_IMPLEMENTATION_REFERENCE.md).
+4. Open the runnable, no-secret hands-on case in [evaluation-demo/](evaluation-demo/).
+5. Inspect the public test image materials in [evaluation-demo/assets/nail-patterns/](evaluation-demo/assets/nail-patterns/).
+6. Inspect the larger [sanitized migration input package](evaluation-demo/migration-input/), including the source tree and migration task documents.
+7. If you are considering the work, run the demo in your own clone or fork and then send a quote and timeline.
 
 The public repository now has two complementary hands-on layers. `evaluation-demo/app/` is a small deterministic smoke case. `evaluation-demo/migration-input/` is a larger, sanitized snapshot of the source and task inputs so that a contractor can inspect the real task shape. It is a clean-tree publication, not a mirror of private Git history and not a production environment.
 

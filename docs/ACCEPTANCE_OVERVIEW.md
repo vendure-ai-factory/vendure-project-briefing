@@ -40,6 +40,8 @@ The starter is intentionally incomplete. A baseline run should stop with `BASELI
 
 The public demo and the public sanitized migration-input package are not formal private acceptance. They allow feasibility review and hands-on experiments. The formal run additionally checks the frozen owner-controlled input revision, runtime identity, browser and service evidence, authorized resource use, cleanup, and the project-owned validator result.
 
+The shared technical proposal reference is [Pipeline Implementation Reference](PIPELINE_IMPLEMENTATION_REFERENCE.md). It clarifies that a green workflow, zero exit code, or model statement is not enough: the Pipeline must compile the goal, execute bounded changes in isolation, debug and rerun safely, connect evidence to assertions, and let an independent validator derive `PASS` or `BLOCK`.
+
 ## Public test image path
 
 The sanitized effect and design image materials for optional hands-on experiments are stored at [`evaluation-demo/assets/nail-patterns/`](../evaluation-demo/assets/nail-patterns/). These assets supplement the deterministic JSON fixture and do not expose the private evaluation input.
