@@ -1,0 +1,5 @@
+services:
+  public-evaluation-demo:
+    build: .
+    command: ["node", "scripts/run-demo.mjs"]
+    network_mode: none
