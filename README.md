@@ -27,6 +27,7 @@ Read these documents before deciding whether to quote:
 - [English one-time acceptance contract](docs/CONTRACT_EN.md) — the proposed scope, delivery obligations, acceptance gates, handover requirements, and payment condition.
 - [English project overview](docs/PROJECT_OVERVIEW_EN.md) — the Vendure secondary-development migration scope, two migration batches, and the end-to-end tasks used for validation.
 - [English pipeline technical requirements](docs/PIPELINE_TECHNICAL_REQUIREMENTS_EN.md) — the expected pipeline behavior, evidence, safety boundaries, and remote validation process. OpenHands or ClawAI are recommended reference frameworks but are not mandatory; an equivalent familiar pipeline is acceptable if it achieves the required outcome.
+- [Public contractor testing environment guide](docs/testing-environment-guide-en.md) — the public demo, authorized staging entry points, temporary-access model, and CI-versus-staging test boundaries.
 
 The detailed descriptions of software and frameworks later in the pipeline document record previous trials and research and are provided for reference only.
 
@@ -78,4 +79,4 @@ See [docs/CONTRACTOR_QUICKSTART.md](docs/CONTRACTOR_QUICKSTART.md) for the hando
 
 ## 中文说明
 
-这是公开入口。承包商可以先看任务和代码，再在自己的电脑或 fork 中运行、修改和测试。正式旧二开代码仍在私有仓库；PR 只是提交作业，不等于合并。正式远程验证由项目方控制。
+这是公开入口。承包商可以先看任务和代码，再在自己的电脑或 fork 中运行、修改和测试。正式旧二开代码和 staging 源码仍在私有仓库；PR 只是提交作业，不等于合并。正式远程验证由项目方控制。中文测试环境指南见 [docs/testing-environment-guide-zh.md](docs/testing-environment-guide-zh.md)。
