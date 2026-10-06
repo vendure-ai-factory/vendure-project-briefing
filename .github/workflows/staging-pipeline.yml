@@ -1,0 +1,147 @@
+name: Staging Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Run only the environment preflight, or run the fixed Pipeline entrypoint"
+        required: true
+        type: choice
+        options:
+          - preflight
+          - pipeline
+        default: preflight
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-pipeline
+  cancel-in-progress: false
+
+env:
+  STAGING_API_URL: https://staging.tibella.eu
+  STAGING_ARCHIVE_DIR: /opt/pipeline-archive
+
+jobs:
+  staging-preflight:
+    name: Staging preflight
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/maleeha-pipeline'
+    runs-on: [self-hosted, linux, x64, staging-vps]
+    environment: staging
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout the requested revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify runner toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          git --version
+          bash --version | head -n 1
+          curl --version | head -n 1
+          jq --version
+          python3 --version
+          psql --version
+          test -x /opt/pipeline-archive || test -d /opt/pipeline-archive
+          test -r /opt/pipeline-archive
+          test -w /opt/pipeline-archive
+
+      - name: Check staging health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(curl --fail-with-body --silent --show-error --max-time 20 "$STAGING_API_URL/health")"
+          printf '%s\n' "$response"
+          printf '%s\n' "$response" | jq -e '.status == "ok"'
+
+      - name: Check staging Shop API
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(curl --fail-with-body --silent --show-error --max-time 20 \
+            -H 'content-type: application/json' \
+            --data '{"query":"{ __typename }"}' \
+            "$STAGING_API_URL/shop-api")"
+          printf '%s\n' "$response"
+          printf '%s\n' "$response" | jq -e '.data.__typename == "Query"'
+
+      - name: Record non-sensitive preflight evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/preflight
+          {
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'sha=%s\n' "$GITHUB_SHA"
+            printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'runner_labels=self-hosted,linux,x64,staging-vps\n'
+            printf 'archive_path=%s\n' "$STAGING_ARCHIVE_DIR"
+            printf 'secrets_values=not_printed\n'
+          } > evidence/preflight/runner-environment.txt
+
+      - name: Upload preflight evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-preflight-${{ github.run_id }}
+          path: evidence/preflight
+          if-no-files-found: ignore
+          retention-days: 30
+
+  pipeline-run:
+    name: Fixed Pipeline entrypoint
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.run_mode == 'pipeline'
+    needs: staging-preflight
+    runs-on: [self-hosted, linux, x64, staging-vps]
+    environment: staging
+    timeout-minutes: 600
+
+    steps:
+      - name: Checkout the requested revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Require the Pipeline entrypoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f pipeline/run-staging.mjs ]]; then
+            echo "::error::pipeline/run-staging.mjs is not present. Add the Pipeline entrypoint through the branch/PR before selecting run_mode=pipeline."
+            exit 78
+          fi
+
+      - name: Run Pipeline in staging
+        shell: bash
+        env:
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          STAGING_ADMIN_EMAIL: ${{ secrets.STAGING_ADMIN_EMAIL }}
+          STAGING_ADMIN_PASSWORD: ${{ secrets.STAGING_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          set +x
+          node pipeline/run-staging.mjs \
+            --environment staging \
+            --staging-url "$STAGING_API_URL" \
+            --archive-dir "$STAGING_ARCHIVE_DIR"
+
+      - name: Upload Pipeline evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-pipeline-${{ github.run_id }}
+          path: |
+            evidence
+            reports
+          if-no-files-found: ignore
+          retention-days: 30
