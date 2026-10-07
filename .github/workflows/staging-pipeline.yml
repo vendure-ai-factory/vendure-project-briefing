@@ -26,7 +26,9 @@ env:
 jobs:
   staging-preflight:
     name: Staging preflight
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/maleeha-pipeline'
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/maleeha-pipeline')
     runs-on: [self-hosted, linux, x64, staging-vps]
     environment: staging
     timeout-minutes: 30
@@ -99,7 +101,8 @@ jobs:
     name: Fixed Pipeline entrypoint
     if: >-
       github.event_name == 'workflow_dispatch' &&
-      inputs.run_mode == 'pipeline'
+      inputs.run_mode == 'pipeline' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/maleeha-pipeline')
     needs: staging-preflight
     runs-on: [self-hosted, linux, x64, staging-vps]
     environment: staging
