@@ -1,0 +1,5 @@
+evaluation-demo/results/*
+!evaluation-demo/results/.gitkeep
+
+# Editable design-source files are not part of the public evaluation package.
+evaluation-demo/migration-input/**/*.psd
