@@ -1,2 +1,26 @@
 evaluation-demo/results/*
 !evaluation-demo/results/.gitkeep
+
+# Editable design-source files are not part of the public evaluation package.
+evaluation-demo/migration-input/**/*.psd
+
+pipeline/*
+!pipeline/run-staging.mjs
+workspace/
+*.log
+.env
+.crush/
+docs/reports/
+docs/client-input-timeline.md
+docs/evidence/
+docs/progress.md
+docs/PROGRESS.md
+progress.md
+PROGRESS.md
+reports/
+.crushrc
+runs/
+evidence/
+# Node.js
+node_modules/
+package-lock.json

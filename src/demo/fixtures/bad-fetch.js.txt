@@ -1,0 +1,6 @@
+```js catalog.mjs
+export function migrateCatalog(legacyCatalog) {
+  var result = await fetch('/api/catalog');
+  return legacyCatalog.items.filter((item) => item.active).map((item) => item);
+}
+```

@@ -1,0 +1,18 @@
+export function migrateCatalog(legacyCatalog) {
+  var netPrice = function(price) { return Math.round(Number(price) * 100); };
+  return legacyCatalog.items
+    .filter((item) => item.active)
+    .map(function(item) {
+      var priceInCents = netPrice(item.price);
+      var tz = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+      var offset = 0;
+      return {
+        sku: item.legacySku,
+        name: item.name,
+        slug: item.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''),
+        price_cents: priceInCents,
+        image_count: item.imagePaths.length
+      };
+    })
+    .sort(function(left, right) { return left.sku.localeCompare(right.sku); });
+}

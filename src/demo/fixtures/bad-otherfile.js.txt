@@ -1,0 +1,6 @@
+```js catalog.mjs
+// This LLM response also touched app/fixtures/another.js - not allowed
+export function migrateCatalog(legacyCatalog) {
+  return legacyCatalog.items.filter((item) => item.active).map((item) => ({ sku: item.legacySku }));
+}
+```

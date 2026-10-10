@@ -1,0 +1,23 @@
+{
+  "name": "vendure-automation-pipeline",
+  "version": "1.0.0-milestone2d",
+  "description": "Reusable Vendure Automation Pipeline - Milestones 1, 2A (Planning), 2B (Controlled Execution), 2C (Failure Classification), 2D (Bounded Repair Loop)",
+  "private": true,
+  "main": "src/config.js",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "demo": "node examples/demo.js",
+    "demo2a": "node examples/demo2a.js",
+    "demo2b": "node examples/demo2b.js",
+    "scan-secrets": "node scripts/scan-secrets.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "vendure",
+    "automation",
+    "pipeline"
+  ],
+  "license": "UNLICENSED"
+}

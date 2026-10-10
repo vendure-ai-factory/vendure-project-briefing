@@ -1,0 +1,5 @@
+```javascript
+export function migrateCatalog(legacyCatalog) {
+  return legacyCatalog.items.filter((item) => item.active).map((item) => ({ sku: item.legacySku }));
+}
+```

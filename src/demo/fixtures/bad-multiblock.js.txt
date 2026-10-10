@@ -1,0 +1,9 @@
+Here is the fixed catalog.mjs:
+
+```js catalog.mjs
+export function migrateCatalog(legacyCatalog) {
+  return legacyCatalog.items.filter((item) => item.active).map((item) => ({ sku: item.legacySku }));
+}
+```
+
+This approach ensures we filter correctly.

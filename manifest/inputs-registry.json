@@ -1,0 +1,207 @@
+{
+  "schemaVersion": "1.0",
+  "registryVersion": "0.4",
+  "notice": "No credential values here — only env-var names in secretRef. Status reflects what is documented in the canonical-task-map frozenInputs.",
+  "frozenHash": "48aef7fbbcabd05be384e2e837b0c2fe3ceb3596cd8fe92a6dab20ee2c46a1af",
+  "frozenFixturesRef": "manifest/fixtures.v1.json",
+  "frozenFixturesSha256": "48aef7fbbcabd05be384e2e837b0c2fe3ceb3596cd8fe92a6dab20ee2c46a1af",
+  "inputs": [
+    {
+      "id": "stagingUrl",
+      "description": "Base URL of the staging Vendure instance (Shop API at /shop-api, health at /health). Source: frozenInputs.environment.stagingUrl.",
+      "status": "FROZEN",
+      "secretRef": null,
+      "fixturePath": null,
+      "frozenHash": null,
+      "frozenValue": "https://staging.tibella.eu"
+    },
+    {
+      "id": "testAccounts",
+      "description": "Test accounts for DE, AT, HU, GB with sufficient balance and KYC to test cross-country flows. Names sourced from fixtures.v1.json (origin VERIFIED).",
+      "status": "CONTRACTOR_FREEZE",
+      "secretRef": null,
+      "fixturePath": "manifest/fixtures.v1.json",
+      "frozenHash": "48aef7fbbcabd05be384e2e837b0c2fe3ceb3596cd8fe92a6dab20ee2c46a1af",
+      "frozenValue": null,
+      "toConfirm": "Contractor creates synthetic test accounts; frozen fixtures provide verified names."
+    },
+    {
+      "id": "stripeTestKeys",
+      "description": "Stripe test-mode API keys for payment callback and order-state consistency testing. Source: PENDING_CLIENT. Supplied as GitHub Actions secrets on the Runner; never in this file.",
+      "status": "MISSING",
+      "secretRef": "STRIPE_TEST_SECRET_KEY",
+      "fixturePath": null,
+      "frozenHash": null,
+      "frozenValue": null
+    },
+    {
+      "id": "simulatedCarrierConfig",
+      "description": "Simulated carrier configuration for per-country weight-based shipping (used by CAN-B2-13). Source: fixtures.v1.json (origin synthetic-staging).",
+      "status": "CONTRACTOR_FREEZE",
+      "secretRef": null,
+      "fixturePath": "manifest/fixtures.v1.json",
+      "frozenHash": "48aef7fbbcabd05be384e2e837b0c2fe3ceb3596cd8fe92a6dab20ee2c46a1af",
+      "frozenValue": null,
+      "toConfirm": "Frozen fixture provides synthetic carrier config; executors verify live behaviour independently."
+    },
+    {
+      "id": "isolatedCloneRestartRollback",
+      "description": "Documentation and scripts for clean restart/rollback on an isolated DB clone (used by CAN-B1-07). Source: frozenInputs.runtime.databaseAndContainerIdentity (PENDING_CLIENT).",
+      "status": "CONTRACTOR_FREEZE",
+      "secretRef": null,
+      "fixturePath": null,
+      "frozenHash": null,
+      "frozenValue": null,
+      "toConfirm": "Requires client-provided DB/container identity and restart procedure."
+    },
+    {
+      "id": "scriptPathMap",
+      "description": "Map of script paths frozen at a6b8b829: setup_tax_rates.mjs, process_shipping_csv.mjs, mark_shipped_from_csv.sh (tools/), run_export.mjs, publish_product_v11.mjs, set_craft_fee.mjs, admin_delist_products.mjs, sync_vendor_uploads.mjs, check_order.sh. Source: v0.4 section 5 and F.2 table.",
+      "status": "FROZEN",
+      "secretRef": null,
+      "fixturePath": null,
+      "frozenHash": null,
+      "frozenValue": null,
+      "toConfirm": "set_commission_tiers.ts is pipeline-authored, not a client-provided script."
+    },
+    {
+      "id": "exchangeRates",
+      "description": "Frozen exchange rates between DE(EUR), AT(EUR), HU(HUF), GB(GBP). Source: fixtures.v1.json (origin VERIFIED).",
+      "status": "CONTRACTOR_FREEZE",
+      "secretRef": null,
+      "fixturePath": "manifest/fixtures.v1.json",
+      "frozenHash": "48aef7fbbcabd05be384e2e837b0c2fe3ceb3596cd8fe92a6dab20ee2c46a1af",
+      "frozenValue": null,
+      "toConfirm": "Values come from fixtures.v1.json; DE and AT share EUR but stay on separate country tracks."
+    },
+    {
+      "id": "taxConfig",
+      "description": "Per-country Tax Zone and rate mapping. Source: fixtures.v1.json (origin VERIFIED; DE=19%, AT=20%, HU=27%, GB=20%).",
+      "status": "CONTRACTOR_FREEZE",
+      "secretRef": null,
+      "fixturePath": "manifest/fixtures.v1.json",
+      "frozenHash": "48aef7fbbcabd05be384e2e837b0c2fe3ceb3596cd8fe92a6dab20ee2c46a1af",
+      "frozenValue": {
+        "DE": 19,
+        "AT": 20,
+        "HU": 27,
+        "GB": 20
+      }
+    },
+    {
+      "id": "commissionTiers",
+      "description": "Platform/designer commission split tiers per country. Source: fixtures.v1.json (DE, HU origin VERIFIED; AT, GB origin synthetic-staging).",
+      "status": "CONTRACTOR_FREEZE",
+      "secretRef": null,
+      "fixturePath": "manifest/fixtures.v1.json",
+      "frozenHash": "48aef7fbbcabd05be384e2e837b0c2fe3ceb3596cd8fe92a6dab20ee2c46a1af",
+      "frozenValue": null,
+      "toConfirm": "Values come from fixtures.v1.json; DE and HU are verified; AT and GB are synthetic-staging."
+    },
+    {
+      "id": "lowStockThreshold",
+      "description": "Threshold for low-stock warning on physical blank-nail inventory. Source: fixtures.v1.json (origin synthetic-staging).",
+      "status": "CONTRACTOR_FREEZE",
+      "secretRef": null,
+      "fixturePath": "manifest/fixtures.v1.json",
+      "frozenHash": "48aef7fbbcabd05be384e2e837b0c2fe3ceb3596cd8fe92a6dab20ee2c46a1af",
+      "frozenValue": null,
+      "toConfirm": "Frozen fixture provides synthetic threshold value."
+    },
+    {
+      "id": "productsImagesArchiveRoot",
+      "description": "Root path to the products/images archive. Source: client 6 Oct 2026.",
+      "status": "FROZEN",
+      "secretRef": null,
+      "fixturePath": null,
+      "frozenHash": null,
+      "frozenValue": "/opt/pipeline-archive"
+    },
+    {
+      "id": "nailSizeReferenceData",
+      "description": "Reference table mapping finger size to nail shape and model/size. Source: fixtures.v1.json (origin VERIFIED, from nail-size-data.ts at pinned commit).",
+      "status": "CONTRACTOR_FREEZE",
+      "secretRef": null,
+      "fixturePath": "manifest/fixtures.v1.json",
+      "frozenHash": "48aef7fbbcabd05be384e2e837b0c2fe3ceb3596cd8fe92a6dab20ee2c46a1af",
+      "frozenValue": null,
+      "toConfirm": "Source file frozen at pinned commit; content hash recorded in fixtures.v1.json."
+    },
+    {
+      "id": "craftFeesFrozen",
+      "description": "Frozen craft fee values per country. Source: fixtures.v1.json (origin VERIFIED).",
+      "status": "CONTRACTOR_FREEZE",
+      "secretRef": null,
+      "fixturePath": "manifest/fixtures.v1.json",
+      "frozenHash": "48aef7fbbcabd05be384e2e837b0c2fe3ceb3596cd8fe92a6dab20ee2c46a1af",
+      "frozenValue": null,
+      "toConfirm": "Values come from fixtures.v1.json (verified origin)."
+    },
+    {
+      "id": "splitTiers",
+      "description": "Designer/platform financial split tier configuration used by CAN-B2-08. Alias for commissionTiers for clarity in task requiredInputs. Source: fixtures.v1.json.",
+      "status": "CONTRACTOR_FREEZE",
+      "secretRef": null,
+      "fixturePath": "manifest/fixtures.v1.json",
+      "frozenHash": "48aef7fbbcabd05be384e2e837b0c2fe3ceb3596cd8fe92a6dab20ee2c46a1af",
+      "frozenValue": null,
+      "toConfirm": "Same source as commissionTiers."
+    },
+    {
+      "id": "openRouterApiKey",
+      "description": "OpenRouter API key for the language model integration. Source: PENDING_CLIENT. Supplied as GitHub Actions secret on the Runner; never in this file. Env-var: OPENROUTER_API_KEY.",
+      "status": "PENDING_CLIENT",
+      "secretRef": null,
+      "fixturePath": null,
+      "frozenHash": null,
+      "frozenValue": null
+    },
+    {
+      "id": "stagingAdminCredentials",
+      "description": "Admin credentials for the isolated staging clone. Source: PENDING_CLIENT. Supplied as GitHub Actions secrets on the Runner; never in this file. Env-var names: SUPERADMIN_USERNAME, SUPERADMIN_PASSWORD (aliases STAGING_ADMIN_EMAIL, STAGING_ADMIN_PASSWORD).",
+      "status": "PENDING_CLIENT",
+      "secretRef": null,
+      "fixturePath": null,
+      "frozenHash": null,
+      "frozenValue": null,
+      "envVars": ["SUPERADMIN_USERNAME", "SUPERADMIN_PASSWORD"],
+      "envVarAliases": {
+        "SUPERADMIN_USERNAME": ["STAGING_ADMIN_EMAIL"],
+        "SUPERADMIN_PASSWORD": ["STAGING_ADMIN_PASSWORD"]
+      }
+    },
+    {
+      "id": "vendureAdminToken",
+      "description": "Client-owned, secret token for mark_shipped_from_csv.sh in non-dry-run mode. Optional: not required by any task in scope. Source: PENDING_CLIENT. Supplied as a GitHub Actions secret on the Runner; never in this file. Env-var name: VENDURE_ADMIN_TOKEN.",
+      "status": "PENDING_CLIENT",
+      "secretRef": "VENDURE_ADMIN_TOKEN",
+      "fixturePath": null,
+      "frozenHash": null,
+      "frozenValue": null
+    },
+    {
+      "id": "channelTokens",
+      "description": "Staging channel tokens for DE, AT, HU, GB. Source: client-confirmed 2 Oct 2026. No env var required; CHANNEL_TOKENS may override. Token values are non-confidential channel identifiers.",
+      "status": "FROZEN",
+      "secretRef": null,
+      "fixturePath": null,
+      "frozenHash": null,
+      "frozenValue": {
+        "DE": "de-token",
+        "AT": "at-token",
+        "HU": "hu-token",
+        "GB": "gb-token"
+      },
+      "envVars": ["CHANNEL_TOKENS"]
+    },
+    {
+      "id": "syncRestartStorefront",
+      "description": "Controls whether the storefront is restarted after sync. Frozen to false per client decision. Source: client-confirmed 2 Oct 2026.",
+      "status": "FROZEN",
+      "secretRef": null,
+      "fixturePath": null,
+      "frozenHash": null,
+      "frozenValue": false
+    }
+  ]
+}
