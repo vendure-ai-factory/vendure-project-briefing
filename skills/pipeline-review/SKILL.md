@@ -23,6 +23,9 @@ for anything unless the evidence holds up.
 - `reports/<runId>/compliance-report.json` - the generateReport output
   persisted by the runner. Optional: if it is missing the review still
   derives its verdict from the evidence.
+- `reports/<runId>/chain-<id>.json` - chain-level summaries written by the
+  chain runner (chunk 16). The review reads them and re-derives each chain's
+  verdict from the evidence, never trusting the summary's claimed result.
 
 ## Exact commands
 
@@ -96,6 +99,7 @@ Then a reasoned paragraph per non-passing group, then the overall line:
 ```
 MISSING_EVIDENCE: CAN-B1-05
   CAN-B1-05: evidence integrity failure (missing, tampered or field-short file)
+CHAIN A PASS (summary declared PASS, consistent)
 OVERALL: MISSING_EVIDENCE
 ```
 

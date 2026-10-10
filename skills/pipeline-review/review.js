@@ -20,6 +20,42 @@ var RUN_LEVEL_END = 'run-level';
 var verifyEvidence = evidenceCollector.verifyEvidence;
 
 var DEFAULT_EXPECTED_TASKS = 24;
+
+/**
+ * Locate chain-level summaries written by the chain runner (chunk 16) as
+ * reports/<runId>/chain-<id>.json. Returns the parsed file list; a file that
+ * fails to parse is included with valid:false so the review reports it rather
+ * than silently ignoring it.
+ */
+function loadChainSummaries(runId, options) {
+  var norm = normalizeOptions(options);
+  var reportsDir = path.join(norm.root, norm.reportsBaseDir, runId);
+  if (!fs.existsSync(reportsDir)) {
+    return [];
+  }
+  var names;
+  try {
+    names = fs.readdirSync(reportsDir).sort();
+  } catch (e) {
+    return [];
+  }
+  var out = [];
+  for (var i = 0; i < names.length; i++) {
+    var match = /^chain-(.+)\.json$/.exec(names[i]);
+    if (!match) {
+      continue;
+    }
+    var file = path.join(reportsDir, names[i]);
+    var parsed = null;
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (e) {
+      parsed = null;
+    }
+    out.push({ file: file, chainId: match[1], summary: parsed, valid: parsed !== null });
+  }
+  return out;
+}
 var PENDING_CLASSES = {};
 
 // The Skill itself is delivered frozen with a content hash (SKILL.sha256).
@@ -304,6 +340,79 @@ function deriveTaskVerdict(taskId, verifyTask, index) {
   };
 }
 
+/**
+ * Rank a chain-task entry for "worst" selection, mirroring the review's
+ * overall precedence: a verified PASS is the best, every other verdict is
+ * worse, with MISSING_EVIDENCE the worst and an unmet BLOCK above a pending
+ * BLOCK above UNRESOLVED_ASSUMPTION.
+ */
+function chainEntrySeverity(entry) {
+  if (entry.verdict === RESULT_PASS) return 0;
+  if (entry.verdict === RESULT_READINESS_PASS) return 1;
+  if (entry.verdict === BLOCK && entry.status === STATUS_PENDING) return 2;
+  if (entry.verdict === UNRESOLVED_ASSUMPTION) return 3;
+  if (entry.verdict === BLOCK) return 4;
+  return 5;
+}
+
+/**
+ * Re-derive a chain summary's verdict from evidence alone (never from the
+ * summary's own claims). A chain is a passing outcome only when every task in
+ * its canonicalIds has an evidence verdict of RESULT_PASS. The worst task by
+ * severity wins otherwise.
+ */
+function deriveChainVerdict(chainSummary, taskVerdicts) {
+  var ids = (chainSummary && Array.isArray(chainSummary.canonicalIds)) ? chainSummary.canonicalIds : [];
+  var per = [];
+  var allPass = true;
+  var worstSev = -1;
+  var worst = null;
+  for (var i = 0; i < ids.length; i++) {
+    var id = ids[i];
+    var v = taskVerdicts ? taskVerdicts[id] : null;
+    var entry = { taskId: id };
+    if (!v) {
+      entry.verdict = MISSING_EVIDENCE;
+      entry.failureClass = null;
+      entry.status = null;
+      entry.reason = 'no evidence for chain task ' + id;
+      allPass = false;
+    } else {
+      entry.verdict = v.verdict;
+      entry.failureClass = v.failureClass;
+      entry.status = v.status;
+      entry.cause = v.cause;
+      entry.reason = v.reason;
+      if (v.verdict !== RESULT_PASS) {
+        allPass = false;
+      }
+    }
+    per.push(entry);
+    var sev = chainEntrySeverity(entry);
+    if (sev > worstSev) {
+      worstSev = sev;
+      worst = entry;
+    }
+  }
+
+  var verdict = allPass ? RESULT_PASS : (worst ? worst.verdict : MISSING_EVIDENCE);
+  var declaredResult = chainSummary ? chainSummary.result : null;
+  var declaredCoverage = chainSummary ? chainSummary.coverage : null;
+  var claimsPass = declaredResult === RESULT_PASS;
+  var evidencePass = verdict === RESULT_PASS;
+
+  return {
+    chainId: chainSummary ? (chainSummary.chainId || null) : null,
+    verdict: verdict,
+    failureClass: worst ? worst.failureClass : null,
+    status: worst ? worst.status : null,
+    taskVerdicts: per,
+    declaredResult: declaredResult,
+    declaredCoverage: declaredCoverage,
+    consistent: declaredResult === null || claimsPass === evidencePass
+  };
+}
+
 function groupByVerdict(tasks, fields) {
   var groups = [];
   var ids = Object.keys(tasks);
@@ -406,6 +515,24 @@ function reviewRun(runId, options) {
       (compliance.report.verdict || compliance.report.overall || null);
   }
 
+  // Chain summaries are read and re-derived from the same evidence verdict map.
+  // A chain never changes the overall verdict; the overall verdict comes from
+  // all evidence tasks exactly as before. The chains cross-check exists so the
+  // review Skill can see the chain-level claim against evidence.
+  var chainFiles = loadChainSummaries(runId, options);
+  var chains = [];
+  for (var c = 0; c < chainFiles.length; c++) {
+    var cf = chainFiles[c];
+    if (!cf.valid) {
+      chains.push({ chainId: cf.chainId, file: cf.file, valid: false, verdict: MISSING_EVIDENCE, failureClass: null, status: null, taskVerdicts: [], declaredResult: null, declaredCoverage: null, consistent: false });
+      continue;
+    }
+    var derived = deriveChainVerdict(cf.summary, tasks);
+    derived.file = cf.file;
+    derived.valid = true;
+    chains.push(derived);
+  }
+
   return {
     runId: runId,
     verdict: verdict,
@@ -416,7 +543,8 @@ function reviewRun(runId, options) {
     observedTaskCount: taskIds.length,
     missingTaskCount: missingCount,
     tasks: tasks,
-    groups: groups
+    groups: groups,
+    chains: chains
   };
 }
 
@@ -447,6 +575,21 @@ function formatReview(result) {
     var reason = groupReason(group);
     lines.push(header);
     if (reason) lines.push('  ' + reason);
+  }
+
+  // Chain summaries read from reports/<runId>/chain-<id>.json. Each chain is
+  // shown with its evidence-derived verdict and whether the chain summary's
+  // own claim agrees with the evidence.
+  var chainList = result.chains || [];
+  for (var ci = 0; ci < chainList.length; ci++) {
+    var ch = chainList[ci];
+    var chainLine = 'CHAIN ' + (ch.chainId || '?') + ' ' + ch.verdict;
+    if (ch.declaredResult) {
+      chainLine += ' (summary declared ' + ch.declaredResult + ', ' + (ch.consistent ? 'consistent' : 'INCONSISTENT') + ')';
+    }
+    if (ch.failureClass) chainLine += ' ' + ch.failureClass;
+    if (ch.status) chainLine += ' ' + ch.status;
+    lines.push(chainLine);
   }
 
   lines.push('OVERALL: ' + result.verdict);
@@ -510,6 +653,8 @@ module.exports = {
   reviewRun: reviewRun,
   formatReview: formatReview,
   groupReason: groupReason,
+  loadChainSummaries: loadChainSummaries,
+  deriveChainVerdict: deriveChainVerdict,
   SKILL_MD_PATH: SKILL_MD_PATH,
   SKILL_SHA_PATH: SKILL_SHA_PATH,
   skillSha256Hex: skillSha256Hex,

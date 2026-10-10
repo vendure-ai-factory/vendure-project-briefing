@@ -146,9 +146,13 @@ jobs:
           set -euo pipefail
           set +x
           node pipeline/run-staging.mjs \
+            --mode full \
             --environment staging \
             --staging-url "$STAGING_API_URL" \
-            --archive-dir "$STAGING_ARCHIVE_DIR"
+            --archive-dir "$STAGING_ARCHIVE_DIR" \
+            --task CAN-B1-03 \
+            --task CAN-B1-04 \
+            --task CAN-B2-16
 
       - name: Upload Pipeline evidence
         if: always()

@@ -360,6 +360,82 @@ test('pipelineReview: a changed run-level end hash still gives MISSING_EVIDENCE'
 });
 
 // ---------------------------------------------------------------------------
+// Chain summaries (chunk 16): the review reads reports/<runId>/chain-<id>.json
+// and re-derives each chain's verdict from evidence.
+// ---------------------------------------------------------------------------
+
+function writeChainSummary(runId, chainId, summaryOverrides) {
+  var chainDir = path.join(TEST_ROOT, REP_BASE, runId);
+  fs.mkdirSync(chainDir, { recursive: true });
+  var summary = {
+    chainId: chainId,
+    canonicalIds: [],
+    result: RESULT_PASS,
+    coverage: 'full',
+    tasks: []
+  };
+  Object.assign(summary, summaryOverrides || {});
+  fs.writeFileSync(path.join(chainDir, 'chain-' + chainId + '.json'), JSON.stringify(summary, null, 2), 'utf8');
+  return summary;
+}
+
+test('pipelineReview: reads a chain summary and re-derives a PASS chain from evidence', function(t, done) {
+  wipeAll();
+  var runId = 'pr-chain-pass-' + Date.now();
+  var ids = ['CAN-B2-04', 'CAN-B2-11', 'CAN-B2-12'];
+  evidenceCollector.initEvidenceIndex(runId, { protectedPathsHash: 'pin-abc' }, opts({ expectedTaskCount: ids.length }));
+  ids.forEach(function(id) { buildTask(runId, id); });
+  writeChainSummary(runId, 'BE', { canonicalIds: ids });
+
+  var result = review.reviewRun(runId, opts({ expectedTaskCount: ids.length }));
+  assert.strictEqual(result.verdict, RESULT_PASS);
+  assert.strictEqual(result.chains.length, 1);
+  var ch = result.chains[0];
+  assert.strictEqual(ch.chainId, 'BE');
+  assert.strictEqual(ch.verdict, RESULT_PASS);
+  assert.strictEqual(ch.consistent, true);
+  var formatted = review.formatReview(result);
+  assert.ok(formatted.indexOf('CHAIN BE ' + RESULT_PASS) !== -1);
+  assert.ok(formatted.indexOf('consistent') !== -1);
+  removeRun(runId);
+  done();
+});
+
+test('pipelineReview: flags a chain summary that claims PASS when evidence BLOCKS', function(t, done) {
+  wipeAll();
+  var runId = 'pr-chain-liar-' + Date.now();
+  var ids = ['CAN-B2-04', 'CAN-B2-11', 'CAN-B2-12'];
+  evidenceCollector.initEvidenceIndex(runId, { protectedPathsHash: 'pin-abc' }, opts({ expectedTaskCount: ids.length }));
+  for (var bi = 0; bi < ids.length; bi++) {
+    var bid = ids[bi];
+    if (bid === 'CAN-B2-12') {
+      // Bust this task's evidence once so its re-derived verdict is not PASS.
+      buildTask(runId, 'CAN-B2-12', {
+        result: BLOCK,
+        finalClassification: BLOCK,
+        classification: FAILURE_CLASSES.PIPELINE_DEFECT,
+        cause: 'NOT_IMPLEMENTED'
+      });
+    } else {
+      buildTask(runId, bid);
+    }
+  }
+  writeChainSummary(runId, 'BE', { canonicalIds: ids, result: RESULT_PASS });
+
+  var result = review.reviewRun(runId, opts({ expectedTaskCount: ids.length }));
+  assert.strictEqual(result.verdict, BLOCK);
+  var ch = result.chains[0];
+  assert.strictEqual(ch.chainId, 'BE');
+  assert.strictEqual(ch.verdict, BLOCK);
+  assert.strictEqual(ch.failureClass, FAILURE_CLASSES.PIPELINE_DEFECT);
+  assert.strictEqual(ch.consistent, false, 'summary over-claims PASS');
+  var formatted = review.formatReview(result);
+  assert.ok(formatted.indexOf('INCONSISTENT') !== -1);
+  removeRun(runId);
+  done();
+});
+
+// ---------------------------------------------------------------------------
 // pipeline-review Skill content hash (SKILL.md pinned by SKILL.sha256)
 // ---------------------------------------------------------------------------
 

@@ -145,6 +145,18 @@ function createWorkspace(runId) {
     };
   }
 
+  var gitattributesContent = '* text=auto eol=lf\n';
+  var gitattributesPath = path.join(workspaceRoot, '.gitattributes');
+  try {
+    fs.writeFileSync(gitattributesPath, gitattributesContent, 'utf8');
+  } catch (err) {
+    return {
+      success: false,
+      error: 'Failed to write .gitattributes: ' + err.message,
+      errorCode: 'FILE_WRITE_ERROR'
+    };
+  }
+
   var gitInitResult = execGit(workspaceRoot, ['init']);
   if (!gitInitResult.success) {
     return {

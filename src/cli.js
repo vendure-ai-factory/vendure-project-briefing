@@ -26,6 +26,7 @@ var COVERAGE_NONE = terminalStateModule.COVERAGE_NONE;
 var protectedPathsModule = require('./protectedPaths');
 var evidenceCollector = require('./evidenceCollector');
 var reportModule = require('./reportGenerator');
+var chainModule = require('./chain');
 
 // Executors are discovered automatically (chunk 12a): src/executors/index.js
 // scans its own directory, registers every module that exports a register()
@@ -558,6 +559,7 @@ function parseArgs(args) {
   var goal = null;
   var provider = 'mock';
   var scenario = null;
+  var chain = null;
   var iAcceptNoSandbox = false;
   var i = 0;
 
@@ -568,6 +570,7 @@ function parseArgs(args) {
     if (arg === 'demo-repair') { command = 'demo-repair'; i++; continue; }
     if (arg === '--manifest') { i++; if (i >= args.length) return { error: 'Missing value for --manifest' }; manifest = args[i++]; continue; }
     if (arg === '--task') { i++; if (i >= args.length) return { error: 'Missing value for --task' }; task = args[i++]; continue; }
+    if (arg === '--chain') { i++; if (i >= args.length) return { error: 'Missing value for --chain' }; chain = args[i++]; continue; }
     if (arg === '--scope') { i++; if (i >= args.length) return { error: 'Missing value for --scope' }; scope = args[i++]; continue; }
     if (arg === '--out') { i++; if (i >= args.length) return { error: 'Missing value for --out' }; out = args[i++]; continue; }
     if (arg === '--goal') { i++; if (i >= args.length) return { error: 'Missing value for --goal' }; goal = args[i++]; continue; }
@@ -580,8 +583,15 @@ function parseArgs(args) {
 
   if (command === 'run') {
     if (!manifest) return { error: 'Missing --manifest' };
+    if (chain !== null) {
+      if (task !== null) return { error: 'Cannot specify both --task and --chain' };
+      if (!chainModule.isValidChainCode(chain)) {
+        return { error: 'Invalid --chain: ' + chain + ' (expected A, B, C, DF, BE or G)' };
+      }
+      return { command: 'run', manifest: manifest, task: null, scope: scope, out: out, chain: chainModule.normalizeCode(chain) };
+    }
     if (!task) return { error: 'Missing --task' };
-    return { command: 'run', manifest: manifest, task: task, scope: scope, out: out };
+    return { command: 'run', manifest: manifest, task: task, scope: scope, out: out, chain: null };
   }
   if (command === 'compile') {
     if (goal !== null && task !== null) return { error: 'Cannot specify both --goal and --task' };
@@ -598,6 +608,7 @@ function parseArgs(args) {
 function printUsage(error, consoleObj) {
   if (error) consoleObj.error('Error: ' + error);
   consoleObj.error('Usage: node bin/pipeline.js run --manifest <path> --task <CAN-ID> [--scope <name>] [--out <dir>]');
+  consoleObj.error('       node bin/pipeline.js run --manifest <path> --chain <A|B|C|DF|BE|G> [--scope <name>] [--out <dir>]');
   consoleObj.error('       node bin/pipeline.js compile --goal "<text>"');
   consoleObj.error('       node bin/pipeline.js compile --task <CAN-ID> --manifest <path>');
 }
@@ -716,6 +727,9 @@ async function runAsync(argv, deps) {
 
     if (parsed.task === 'all') {
       return runAllTasks(parsed, shared);
+    }
+    if (parsed.chain) {
+      return runChain(parsed, shared);
     }
     return runOneTask(parsed, shared);
   }
@@ -1246,6 +1260,178 @@ async function runAllTasks(parsed, shared) {
   return { exitCode: maxExit, result: summary, outDir: shared.outDir, tasks: outcomes, reportWritten: true, evidenceInvalid: evidenceInvalid };
 }
 
+// ---------------------------------------------------------------------------
+// runChain (chunk 16)
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a manifest chain (`bin/pipeline.js run --chain <A|B|C|DF|BE|G>`).
+ *
+ * Resolves the chain's canonical task ids from the manifest chains table and
+ * executes them in order through the existing runOneTask flow (one evidence
+ * folder per task). The chain stops at the first BLOCK of class
+ * SAFETY_AUTHORIZATION but continues past every other failure class. A
+ * chain-level summary is written to reports/<runId>/chain-<id>.json: the
+ * chain result is RESULT_PASS only if every task in it has coverage "full" and result
+ * RESULT_PASS; otherwise the chain result is the worst task outcome with a
+ * reason.
+ */
+async function runChain(parsed, shared) {
+  var manifest = shared.manifest;
+  var consoleObj = shared.console;
+  var writeFileSync = shared.writeFileSync;
+
+  var chain = chainModule.resolveChain(manifest, parsed.chain);
+  if (chain.error) {
+    consoleObj.error('Error: ' + chain.error);
+    return { exitCode: 2, result: null, outDir: shared.outDir };
+  }
+  var taskIds = chain.canonicalIds;
+  for (var ti = 0; ti < taskIds.length; ti++) {
+    if (!manifestModule.getTask(manifest, taskIds[ti])) {
+      consoleObj.error('Error: chain ' + chain.chainId + ' references unknown task ' + taskIds[ti]);
+      return { exitCode: 2, result: null, outDir: shared.outDir };
+    }
+  }
+
+  shared.multi = true;
+
+  var startedAt = new Date().toISOString();
+  var runEnvRecord = runEnvModule.collectRunEnvironment({
+    root: process.cwd(),
+    runId: shared.runId,
+    revisionId: 'rev-' + Date.now().toString(36),
+    startedAt: startedAt,
+    taskId: 'chain-' + chain.chainId,
+    scope: parsed.scope || null,
+    manifest: manifest,
+    registry: shared.registry,
+    result: null,
+    classification: null,
+    exitCode: null,
+    childProcess: shared.childProcess
+  });
+  runEnvRecord.command = 'node bin/pipeline.js run --manifest ' + parsed.manifest + ' --chain ' + chain.chainId +
+    (parsed.scope ? ' --scope ' + parsed.scope : '');
+
+  // protectedStart + pinned check once for the whole chain.
+  var startCheck = await checkProtectedStart(shared, runEnvRecord);
+  if (!startCheck.ok) {
+    initRunEvidence(shared, runEnvRecord);
+    writeRunReport(shared);
+    return { exitCode: 7, result: startCheck.outcome, outDir: shared.outDir, reportWritten: true, evidenceInvalid: false };
+  }
+  initRunEvidence(shared, runEnvRecord);
+
+  var outcomes = [];
+  var evidenceInvalid = false;
+  var stopped = false;
+  var stopReason = null;
+  var j;
+  for (j = 0; j < taskIds.length; j++) {
+    var taskParsed = { manifest: parsed.manifest, task: taskIds[j], scope: parsed.scope || null };
+    var perTask = await runOneTask(taskParsed, shared);
+    if (perTask && perTask.evidenceInvalid) {
+      evidenceInvalid = true;
+    }
+    var perResult = perTask && perTask.result ? perTask.result : { result: 'BLOCK', classification: null, cause: null };
+    outcomes.push({
+      taskId: taskIds[j],
+      result: perResult.result,
+      classification: perResult.classification || null,
+      cause: perResult.cause || null,
+      coverage: perTask && perTask.record ? (perTask.record.coverage || 'full') : 'full',
+      exitCode: perTask ? perTask.exitCode : 3,
+      cleanupResult: perTask ? perTask.cleanupResult : null,
+      evidenceInvalid: !!(perTask && perTask.evidenceInvalid)
+    });
+    // A chain stops at the first BLOCK of class SAFETY_AUTHORIZATION; every
+    // other failure class is passed through and the chain continues.
+    if (perResult.result === 'BLOCK' && perResult.classification === FAILURE_CATEGORIES.SAFETY_AUTHORIZATION) {
+      stopped = true;
+      stopReason = 'chain ' + chain.chainId + ' stopped after SAFETY_AUTHORIZATION on ' + taskIds[j];
+      break;
+    }
+  }
+
+  // protectedEnd once: run-level end hash + protected-end evidence, exactly
+  // like --task all.
+  var endPh = protectedPathsModule.computeProtectedHashes({ root: process.cwd() });
+  var endDiff = protectedPathsModule.diffProtectedHashes(shared.protectedStart || [], endPh.entries);
+  if (endDiff.changed.length > 0) {
+    for (j = 0; j < outcomes.length; j++) {
+      if (outcomes[j].result !== 'BLOCK') {
+        outcomes[j].result = 'BLOCK';
+        outcomes[j].classification = FAILURE_CATEGORIES.SAFETY_AUTHORIZATION;
+        outcomes[j].cause = 'END_HASH_DIFF';
+        outcomes[j].exitCode = 7;
+      }
+    }
+  }
+  try {
+    writeProtectedEndRunLevel(shared, endPh);
+  } catch (e) {
+    consoleObj.error('Failed to write run-level protected-end evidence: ' + e.message);
+  }
+
+  writeRunReport(shared);
+
+  var sumData = buildRunSummary(shared, runEnvRecord, outcomes, startedAt, endPh.combinedHash, evidenceInvalid);
+  var summary = sumData.summary;
+  var maxExit = sumData.maxExit;
+
+  writeJsonFile(writeFileSync, path.join(shared.outDir, 'run-summary.json'), summary, consoleObj);
+  runEnvRecord.result = 'SUMMARY';
+  runEnvRecord.exitCode = maxExit;
+  writeRunEnvironment(writeFileSync, shared.outDir, runEnvRecord, { ok: true }, consoleObj);
+
+  // Chain-level summary: RESULT_PASS only if every task has coverage full and result
+  // RESULT_PASS; otherwise the worst task outcome wins, with a reason.
+  var aggregate = chainModule.aggregateChain(chain, outcomes);
+  var chainSummary = {
+    schemaVersion: '1.0',
+    chainId: chain.chainId,
+    name: chain.name || null,
+    specChains: chain.specChains || null,
+    specChainsRaw: chain.specChainsRaw || null,
+    mappingTypeSource: chain.mappingTypeSource || null,
+    canonicalIds: taskIds,
+    runId: shared.runId,
+    startedAt: startedAt,
+    completedAt: new Date().toISOString(),
+    totalTasks: taskIds.length,
+    executedTasks: outcomes.length,
+    stopped: stopped,
+    stopReason: stopReason || null,
+    coverage: aggregate.coverage,
+    result: aggregate.result,
+    classification: aggregate.classification || null,
+    cause: aggregate.cause || null,
+    reason: aggregate.reason,
+    worstTaskId: aggregate.worstTaskId || null,
+    tasks: outcomes.map(function(o) {
+      return { taskId: o.taskId, result: o.result, classification: o.classification, cause: o.cause, coverage: o.coverage, exitCode: o.exitCode };
+    })
+  };
+  if (stopped && outcomes.length < taskIds.length) {
+    chainSummary.skippedTaskIds = taskIds.slice(outcomes.length);
+  }
+  if (evidenceInvalid) {
+    chainSummary.evidenceInvalid = 'EVIDENCE_INVALID';
+  }
+  writeJsonFile(writeFileSync, path.join(shared.outDir, 'chain-' + chain.chainId + '.json'), chainSummary, consoleObj);
+
+  return {
+    exitCode: maxExit,
+    result: aggregate,
+    outDir: shared.outDir,
+    tasks: outcomes,
+    chainSummary: chainSummary,
+    reportWritten: true,
+    evidenceInvalid: evidenceInvalid
+  };
+}
+
 module.exports = {
   run: run,
   runAsync: runAsync,
@@ -1257,5 +1443,6 @@ module.exports = {
   finalizeNoExecutor: finalizeNoExecutor,
   finalizePreflightBlock: finalizePreflightBlock,
   runOneTask: runOneTask,
-  runAllTasks: runAllTasks
+  runAllTasks: runAllTasks,
+  runChain: runChain
 };

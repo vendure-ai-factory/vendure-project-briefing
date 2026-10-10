@@ -10,30 +10,126 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const DEFAULT_ARCHIVE_ROOT = '/opt/pipeline-archive';
-const DEFAULT_MODE = 'preflight';
-const DEFAULT_TASK = 'all';
-const VALID_MODES = ['preflight', 'full'];
+const MODE_PREFLIGHT = 'preflight';
+const MODE_FULL = 'full';
+// The safe, non-mutating default: without an explicit mode flag the runner
+// performs preflight checks only and never spawns a task. Full mode requires
+// an explicit approved task selection.
+const DEFAULT_MODE = MODE_PREFLIGHT;
+const DEFAULT_TASK = 'all'; // retained for exports; never used as a default selection
+const VALID_MODES = [MODE_PREFLIGHT, MODE_FULL];
 const INVALID_MODE_EXIT = 2;
+const PIPELINE_DEFECT_EXIT = 1;
 const MANIFEST_PATH = 'manifest/acceptance-manifest.v0.4.json';
 const PIPELINE_SCRIPT = 'bin/pipeline.js';
 const REVIEW_SCRIPT = 'skills/pipeline-review/review.js';
+const ADMIN_API_PATH = '/admin-api';
+const SHOP_API_PATH = '/shop-api';
 
 const CLASS_DEPENDENCY = 'DEPENDENCY_ENVIRONMENT';
 const CLASS_CLIENT_INPUT = 'CLIENT_INPUT_SCOPE';
+const CLASS_PIPELINE_DEFECT = 'PIPELINE_DEFECT';
 
-// Admin API path read from the Vendure config snapshot. Do not guess:
-// evaluation-demo/migration-input/legacy/vendure-store/src/vendure-config.ts:40
-//   apiOptions: { adminApiPath: 'admin-api', shopApiPath: 'shop-api', ... }
-// The supplied legacy scripts resolve the admin GraphQL endpoint against this
-// same path, so an unset VENDURE_ADMIN_API_URL is derived as
-// <PIPELINE_STAGING_URL>/admin-api.
-const ADMIN_API_PATH = '/admin-api';
+// Canonical task IDs explicitly approved by the client for the authorized
+// staging run. Source: docs/client/acceptance-manifest-v0.4-reconciled.md
+// section F.1 "Readiness tasks" (the three readiness tasks: CAN-B1-03,
+// CAN-B1-04, CAN-B2-16). The runner must never select any other task and
+// never default to `all`; a run with an empty or unapproved selection is
+// rejected before anything is spawned.
+const AUTHORIZED_TASK_IDS = ['CAN-B1-03', 'CAN-B1-04', 'CAN-B2-16'];
+
+// CAN-B2-16 is the shipping dry-run readiness task; the manifest documents
+// its exact invocation as `--task CAN-B2-16 --scope shipping-dryrun`.
+const DRY_RUN_TASK = { taskId: 'CAN-B2-16', scope: 'shipping-dryrun' };
 
 /**
- * Validate the staging mode against the allowed set. The pipeline may only
- * start when the operator explicitly sets PIPELINE_MODE=full; any other value
- * (including the default preflight) is preflight-only, and an unlisted value
- * fails safely without spawning. The error names the variable, never the value.
+ * Build the ordered execution stages from an approved task selection. Each
+ * selected task becomes one stage; a blocked or failed stage never stops the
+ * others. Chain runs are NOT part of the restricted staging run: executing
+ * chains B/C/D+F would touch canonical task ids the client has not approved.
+ */
+function buildStagesForTaskIds(taskIds) {
+  return (taskIds || []).map(function(id) {
+    if (id === DRY_RUN_TASK.taskId) {
+      return { name: 'task-' + id, flag: '--task', value: id, scope: DRY_RUN_TASK.scope, summaryFile: 'run-summary.json' };
+    }
+    return { name: 'task-' + id, flag: '--task', value: id, scope: null, summaryFile: 'run-summary.json' };
+  });
+}
+
+/**
+ * Validate the task selection for a full-mode run. The client authorizes
+ * exactly the three canonical ids in AUTHORIZED_TASK_IDS, in order: any
+ * missing, duplicate, additional or reordered selection is rejected before
+ * anything spawns. Names only appear in the error, never secret values
+ * (task ids are not secrets).
+ */
+function checkTaskSelection(cfg) {
+  if (cfg.mode !== MODE_FULL) {
+    return { ok: true, error: null };
+  }
+  const ids = cfg.taskIds || [];
+  if (ids.length !== AUTHORIZED_TASK_IDS.length) {
+    return {
+      ok: false,
+      error: 'expected exactly the ' + AUTHORIZED_TASK_IDS.length + ' approved task ids: ' +
+        AUTHORIZED_TASK_IDS.join(', ') + ' (got ' + ids.length + ')'
+    };
+  }
+  for (let i = 0; i < ids.length; i += 1) {
+    if (ids[i] !== AUTHORIZED_TASK_IDS[i]) {
+      return {
+        ok: false,
+        error: 'task ' + ids[i] + ' is not approved or out of order; expected exactly the approved set in order: ' +
+          AUTHORIZED_TASK_IDS.join(', ')
+      };
+    }
+  }
+  return { ok: true, error: null };
+}
+
+function hasText(v) {
+  return v != null && String(v) !== '';
+}
+
+/**
+ * Parse run-staging CLI flags. Accepts --environment, --staging-url,
+ * --archive-dir, --mode and --shop-api-url. Unknown flags and missing values
+ * return { error }; values are never logged or written.
+ */
+function parseArgs(argv) {
+  argv = argv || [];
+  var out = { mode: null, environment: null, stagingUrl: null, shopApiUrl: null, archiveDir: null, taskIds: [] };
+  var i = 0;
+  while (i < argv.length) {
+    var a = argv[i];
+    if (a === '--mode' || a === '--environment' || a === '--staging-url' ||
+        a === '--archive-dir' || a === '--shop-api-url' || a === '--task') {
+      if (i + 1 >= argv.length) {
+        return { error: 'Missing value for ' + a };
+      }
+      var val = argv[i + 1];
+      i += 2;
+      if (a === '--mode') out.mode = val;
+      else if (a === '--environment') out.environment = val;
+      else if (a === '--staging-url') out.stagingUrl = val;
+      else if (a === '--archive-dir') out.archiveDir = val;
+      else if (a === '--shop-api-url') out.shopApiUrl = val;
+      else if (a === '--task') out.taskIds.push(val);
+      continue;
+    }
+    if (String(a).charAt(0) === '-') {
+      return { error: 'Unknown flag: ' + a };
+    }
+    i++;
+  }
+  return out;
+}
+
+/**
+ * Validate the staging mode against the allowed set. The full sequence is
+ * the default when no mode flag is given; the error names the variable,
+ * never the value.
  */
 function validateMode(mode) {
   if (VALID_MODES.indexOf(mode) !== -1) {
@@ -68,10 +164,11 @@ function nodeFs() {
 }
 
 /**
- * Normalise config. Reads env var values (never their secrets): names only
- * are ever logged or written. Dependencies (child_process, fs, fetch) can be
- * injected for testing; nothing here touches the network or the filesystem
- * except through the injected/normalised dependencies.
+ * Normalise config. Reads CLI flags (deps.args) plus env var values (never
+ * their secrets): names only are ever logged or written. The workflow env
+ * (STRIPE_SECRET_KEY, OPENROUTER_API_KEY, STAGING_ADMIN_EMAIL,
+ * STAGING_ADMIN_PASSWORD) is passed through untouched to dependents; no
+ * value is ever printed or persisted by this module.
  */
 function resolveConfig(deps) {
   deps = deps || {};
@@ -79,6 +176,22 @@ function resolveConfig(deps) {
   const childProcess = deps.childProcess || require('node:child_process');
   const fsMod = deps.fs || nodeFs();
   const fetchImpl = deps.fetch || globalThis.fetch;
+  const parsed = deps.args !== undefined && deps.args !== null ? deps.args : parseArgs([]);
+
+  const stagingUrl = hasText(parsed.stagingUrl)
+    ? String(parsed.stagingUrl)
+    : (hasText(env.PIPELINE_STAGING_URL) ? env.PIPELINE_STAGING_URL : null);
+  const shopApiUrl = hasText(parsed.shopApiUrl)
+    ? String(parsed.shopApiUrl)
+    : (hasText(env.PIPELINE_SHOP_API_URL)
+      ? env.PIPELINE_SHOP_API_URL
+      : (stagingUrl ? stagingUrl + SHOP_API_PATH : null));
+  const archiveRoot = hasText(parsed.archiveDir)
+    ? String(parsed.archiveDir)
+    : (env.PIPELINE_ARCHIVE_ROOT || DEFAULT_ARCHIVE_ROOT);
+  const mode = hasText(parsed.mode)
+    ? String(parsed.mode)
+    : (env.PIPELINE_MODE || DEFAULT_MODE);
 
   return {
     env: env,
@@ -88,12 +201,15 @@ function resolveConfig(deps) {
     fetch: fetchImpl,
     cwd: deps.cwd || process.cwd(),
     nodeVersion: deps.nodeVersion || process.version,
-    archiveRoot: env.PIPELINE_ARCHIVE_ROOT || DEFAULT_ARCHIVE_ROOT,
-    mode: env.PIPELINE_MODE || DEFAULT_MODE,
+    archiveRoot: archiveRoot,
+    mode: mode,
     task: env.PIPELINE_TASK || DEFAULT_TASK,
-    stagingUrl: env.PIPELINE_STAGING_URL || null,
-    shopApiUrl: env.PIPELINE_SHOP_API_URL || null,
-    runId: deps.runId || generateRunId()
+    taskIds: Array.isArray(parsed.taskIds) ? parsed.taskIds.slice() : [],
+    stagingUrl: stagingUrl,
+    shopApiUrl: shopApiUrl,
+    environment: hasText(parsed.environment) ? parsed.environment : (env.PIPELINE_ENVIRONMENT || null),
+    runId: deps.runId || generateRunId(),
+    parseError: parsed.error || null
   };
 }
 
@@ -231,7 +347,7 @@ async function checkHealth(cfg) {
 }
 
 async function checkShopApi(cfg) {
-  const url = cfg.shopApiUrl || (cfg.stagingUrl ? cfg.stagingUrl + '/shop-api' : null);
+  const url = cfg.shopApiUrl || (cfg.stagingUrl ? cfg.stagingUrl + SHOP_API_PATH : null);
   if (!url) {
     return {
       name: 'shop-api',
@@ -271,19 +387,18 @@ async function checkShopApi(cfg) {
 }
 
 function envNamesOnly(cfg) {
-  // Names of the environment variables this stage reads, never their values.
+  // Names of environment variables this stage reads, never their values.
   return ['PIPELINE_ARCHIVE_ROOT', 'PIPELINE_MODE', 'PIPELINE_TASK',
     'PIPELINE_STAGING_URL', 'PIPELINE_SHOP_API_URL',
     'SUPERADMIN_USERNAME', 'SUPERADMIN_PASSWORD', 'VENDURE_ADMIN_API_URL',
-    'STAGING_ADMIN_EMAIL', 'STAGING_ADMIN_PASSWORD'];
+    'STAGING_ADMIN_EMAIL', 'STAGING_ADMIN_PASSWORD',
+    'STRIPE_SECRET_KEY', 'OPENROUTER_API_KEY'];
 }
 
 /**
  * Resolve the admin identity the child pipeline will use, without ever
  * materialising values. Returns only booleans (present or not) and the name
- * of the variable supplying each mapped target. An explicit SUPERADMIN_*
- * value always wins; otherwise the workflow fallback name is used;
- * VENDURE_ADMIN_API_URL falls back to staging URL + ADMIN_API_PATH.
+ * of the variable supplying each mapped target.
  */
 function adminEnvMapping(cfg) {
   const env = cfg.env || {};
@@ -384,7 +499,7 @@ async function runPreflight(cfg) {
     await checkHealth(cfg),
     await checkShopApi(cfg)
   ];
-  const ok = checks.every(function(c) { return c.ok === true; });
+  const ok = checks.every(function(c) { return c.ok !== false && c.ok === true; });
   const preflight = {
     runId: cfg.runId,
     ok: ok,
@@ -397,10 +512,6 @@ async function runPreflight(cfg) {
 }
 
 function preflightDir(cfg) {
-  // Preflight evidence lives under the archive run folder so it never
-  // collides with evidence/<runId>/index.json (written by the pipeline's
-  // initEvidenceIndex for the same runId). Falls back to a local folder only
-  // when the archive root is missing/unusable.
   const primary = path.join(cfg.archiveRoot, cfg.runId, 'preflight');
   try {
     cfg.fs.mkdirSync(primary, { recursive: true });
@@ -423,16 +534,29 @@ function writePreflightEvidence(cfg, preflight) {
     JSON.stringify(preflight, null, 2) + '\n', 'utf8');
 }
 
-function runFullStage(cfg) {
-  const logDir = path.join(cfg.archiveRoot, cfg.runId, 'logs');
-  cfg.fs.mkdirSync(logDir, { recursive: true });
-  const logFile = path.join(logDir, 'pipeline.log');
-  const args = [PIPELINE_SCRIPT, 'run', '--manifest', MANIFEST_PATH, '--task', cfg.task];
-  // Inject the run id and mapped admin identity into the child environment.
-  // cli.js accepts deps.runId; bin/pipeline.js forwards PIPELINE_RUN_ID into
-  // deps.runId. Passing it as a CLI flag is not possible because cli.js
-  // parseArgs rejects unknown flags. buildChildEnv performs the admin env
-  // mapping (explicit SUPERADMIN_* wins) on the child env object only.
+/**
+ * Run one ordered stage (task all, or a chain) as a child pipeline process.
+ * A failure or block in any stage never stops the others: runStaging always
+ * iterates over every stage. Summarizes the stage outcome.
+ */
+function runStage(cfg, stage) {
+  let logDir = null;
+  try {
+    logDir = path.join(cfg.archiveRoot, cfg.runId, 'logs');
+    cfg.fs.mkdirSync(logDir, { recursive: true });
+  } catch (e) {
+    // continue without a log dir; a logging failure must not stop the run
+  }
+  const logFile = logDir ? path.join(logDir, stage.name + '.log') : null;
+  const args = [PIPELINE_SCRIPT, 'run', '--manifest', MANIFEST_PATH];
+  if (stage.flag === '--task') {
+    args.push('--task', stage.value);
+    if (stage.scope) {
+      args.push('--scope', stage.scope);
+    }
+  } else {
+    args.push('--chain', stage.value);
+  }
   const childEnv = buildChildEnv(cfg);
   const result = cfg.childProcess.spawnSync(process.execPath, args, {
     cwd: cfg.cwd,
@@ -441,11 +565,27 @@ function runFullStage(cfg) {
     maxBuffer: 64 * 1024 * 1024
   });
   const output = (result.stdout || '') + (result.stderr || '');
-  cfg.fs.writeFileSync(logFile, output, 'utf8');
-  if (result.status === null) {
-    return 127;
+  if (logFile) {
+    try {
+      cfg.fs.writeFileSync(logFile, output, 'utf8');
+    } catch (e) {}
   }
-  return result.status;
+  const outcome = {
+    name: stage.name,
+    command: args.join(' '),
+    args: args,
+    exitCode: result.status === null ? 127 : result.status,
+    classification: null,
+    cause: null,
+    summary: readStageSummary(cfg, stage.summaryFile)
+  };
+  if (result.status === null) {
+    outcome.classification = CLASS_PIPELINE_DEFECT;
+    outcome.cause = 'SPAWN_FAILED';
+  } else {
+    classifyStage(outcome);
+  }
+  return outcome;
 }
 
 function copyDir(cfg, src, dest) {
@@ -469,6 +609,93 @@ function copyDir(cfg, src, dest) {
   } catch (e) {
     return false;
   }
+}
+
+function readStageSummary(cfg, fileName) {
+  const file = path.join(cfg.cwd, 'reports', cfg.runId, fileName);
+  if (!cfg.fs.existsSync(file)) {
+    return null;
+  }
+  try {
+    return JSON.parse(cfg.fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Determine whether a stage summary contains a PIPELINE_DEFECT result.
+ * Chain summaries carry a top-level classification (the worst task in the
+ * chain); task/run summaries carry per-task classifications.
+ */
+function hasPipelineDefect(summary) {
+  if (!summary) return false;
+  if (summary.classification === CLASS_PIPELINE_DEFECT) return true;
+  const tasks = summary.tasks;
+  if (Array.isArray(tasks)) {
+    for (let i = 0; i < tasks.length; i++) {
+      if (tasks[i].classification === CLASS_PIPELINE_DEFECT) return true;
+    }
+  }
+  return false;
+}
+
+function isPassResult(v) {
+  return v === 'PASS' || v === 'RESULT_PASS';
+}
+
+function firstTaskProblem(summary) {
+  const tasks = summary && summary.tasks;
+  if (!Array.isArray(tasks)) return null;
+  for (let i = 0; i < tasks.length; i++) {
+    const t = tasks[i];
+    if (!t) continue;
+    const blockedOrFailed = !isPassResult(t.result) ||
+      (t.classification != null && t.classification !== '');
+    if (blockedOrFailed) return t;
+  }
+  return null;
+}
+
+function classifyStage(outcome) {
+  const summary = outcome.summary;
+  if (summary === null) {
+    if (outcome.exitCode !== 0) {
+      outcome.classification = CLASS_PIPELINE_DEFECT;
+      outcome.cause = 'SUMMARY_MISSING';
+    }
+    return;
+  }
+  if (hasPipelineDefect(summary)) {
+    outcome.classification = CLASS_PIPELINE_DEFECT;
+    outcome.cause = summary.cause || 'PIPELINE_DEFECT';
+    return;
+  }
+  const problem = firstTaskProblem(summary);
+  if (problem) {
+    // Propagate task-level BLOCK / classifications (CLIENT_INPUT_SCOPE,
+    // DEPENDENCY_ENVIRONMENT, ...) up to the stage so a blocked or failed
+    // task never yields an overall successful exit code, even at exit 0.
+    outcome.classification = problem.classification != null && problem.classification !== ''
+      ? problem.classification
+      : CLASS_PIPELINE_DEFECT;
+    outcome.cause = problem.cause || problem.result || 'task failed';
+    return;
+  }
+  outcome.cause = summary.cause || null;
+}
+
+/**
+ * A stage counts as blocked or failed when its child pipeline exited
+ * non-zero (task failed, spawn failed) or a classification was recorded
+ * (e.g. CLIENT_INPUT_SCOPE / DEPENDENCY_ENVIRONMENT block). Any such stage
+ * makes the whole run exit non-zero.
+ */
+function stageBlockedOrFailed(stage) {
+  if (stage.exitCode !== 0) {
+    return true;
+  }
+  return stage.classification != null && stage.classification !== '';
 }
 
 function readRunSummary(cfg, runId) {
@@ -514,13 +741,10 @@ function newestEvidenceFolder(cfg) {
 }
 
 /**
- * Determine the runId the pipeline actually wrote evidence under.
- * The runId is passed in up front; this only confirms it. The authoritative
- * source is the pipeline's run-summary.json. This avoids guessing: the newest
- * evidence folder is used only as a documented last resort.
+ * Determine the runId actually used. The injected id is authoritative; the
+ * pipeline's own run-summary under reports/<runId> confirms it.
  */
 function resolvePipelineRunId(cfg) {
-  // 1. Authoritative: the pipeline's own run-summary.json for the injected id.
   const summary = readRunSummary(cfg, cfg.runId);
   if (summary && summary.runId) {
     return {
@@ -528,12 +752,10 @@ function resolvePipelineRunId(cfg) {
       source: summary.runId === cfg.runId ? 'injected' : 'run-summary'
     };
   }
-  // 2. The injected id was honored (no summary written, but folders exist).
   if (cfg.fs.existsSync(path.join(cfg.cwd, 'reports', cfg.runId)) ||
       cfg.fs.existsSync(path.join(cfg.cwd, 'evidence', cfg.runId))) {
     return { runId: cfg.runId, source: 'injected' };
   }
-  // 3. Last resort: the newest evidence folder (documented as such).
   const newest = newestEvidenceFolder(cfg);
   if (newest) {
     return { runId: newest, source: 'newest-folder' };
@@ -541,8 +763,55 @@ function resolvePipelineRunId(cfg) {
   return { runId: cfg.runId, source: 'injected-unconfirmed' };
 }
 
-function archiveAndReview(cfg, runId, runIdSource, preflight, pipelineExit, expectsPipelineEvidence) {
-  const archiveRun = path.join(cfg.archiveRoot, runId);
+function writeAggregatedSummary(cfg, preflight, stages) {
+  const outDir = path.join(cfg.cwd, 'reports', cfg.runId);
+  const stageRows = [];
+  const allTasks = [];
+  for (let i = 0; i < stages.length; i += 1) {
+    const stage = stages[i];
+    stageRows.push({
+      name: stage.name,
+      command: stage.command,
+      exitCode: stage.exitCode,
+      classification: stage.classification,
+      cause: stage.cause
+    });
+    const summary = stage.summary;
+    if (summary && Array.isArray(summary.tasks)) {
+      for (let j = 0; j < summary.tasks.length; j += 1) {
+        const t = summary.tasks[j];
+        allTasks.push({
+          stage: stage.name,
+          taskId: t.taskId,
+          result: t.result,
+          classification: t.classification,
+          cause: t.cause
+        });
+      }
+    }
+  }
+  const anyDefect = stages.some(function(s) { return s.classification === CLASS_PIPELINE_DEFECT; });
+  const summary = {
+    schemaVersion: '1.0',
+    runId: cfg.runId,
+    mode: cfg.mode,
+    startedAt: preflight.checkedAt,
+    completedAt: new Date().toISOString(),
+    preflightOk: preflight.ok === true,
+    anyPipelineDefect: anyDefect,
+    stages: stageRows,
+    tasks: allTasks
+  };
+  const file = path.join(outDir, 'run-summary.json');
+  try {
+    cfg.fs.mkdirSync(outDir, { recursive: true });
+    cfg.fs.writeFileSync(file, JSON.stringify(summary, null, 2) + '\n', 'utf8');
+  } catch (e) {}
+  return summary;
+}
+
+function archiveRun(cfg, runId, runIdSource, preflight, stages) {
+  const archiveRun = `${cfg.archiveRoot}/${runId}`;
   let archiveOk = true;
   try {
     cfg.fs.mkdirSync(archiveRun, { recursive: true });
@@ -551,13 +820,8 @@ function archiveAndReview(cfg, runId, runIdSource, preflight, pipelineExit, expe
   }
 
   const evidenceCopied = copyDir(cfg, path.join(cfg.cwd, 'evidence', runId), path.join(archiveRun, 'evidence'));
-  // reports/ only exists after a pipeline run; absent reports are normal in
-  // preflight-only mode.
   copyDir(cfg, path.join(cfg.cwd, 'reports', runId), path.join(archiveRun, 'reports'));
-  // Evidence is only expected once the pipeline has run (full mode). In
-  // preflight-only mode there is no pipeline evidence yet, so a missing
-  // evidence folder is not an archive failure.
-  if (archiveOk && expectsPipelineEvidence && !evidenceCopied) {
+  if (archiveOk && stages.length > 0 && !evidenceCopied) {
     archiveOk = false;
   }
 
@@ -577,15 +841,20 @@ function archiveAndReview(cfg, runId, runIdSource, preflight, pipelineExit, expe
     archiveOk = false;
   }
 
+  const anyDefect = stages.some(function(s) { return s.classification === CLASS_PIPELINE_DEFECT; });
   const summary = {
     runId: runId,
     runIdSource: runIdSource,
     mode: cfg.mode,
     task: cfg.task,
+    environment: cfg.environment,
     archivePath: archiveRun,
     envVarNames: envNamesOnly(cfg),
     preflightOk: preflight.ok,
-    pipelineExit: pipelineExit,
+    anyPipelineDefect: anyDefect,
+    stages: stages.map(function(s) {
+      return { name: s.name, exitCode: s.exitCode, classification: s.classification, cause: s.cause };
+    }),
     archiveOk: archiveOk
   };
   try {
@@ -597,25 +866,42 @@ function archiveAndReview(cfg, runId, runIdSource, preflight, pipelineExit, expe
 }
 
 /**
- * Entry point. Defaults to preflight-only (PIPELINE_MODE=preflight or unset);
- * runs the full pipeline only when PIPELINE_MODE=full, archives
- * evidence/reports, runs the review, and returns the exit code of the
- * pipeline (never converting a non-zero exit to 0). Any other PIPELINE_MODE
- * value fails safely without spawning.
+ * Entry point. With no mode flag (default) runs preflight checks only and
+ * never spawns. With full mode, stages run only when the runner's own
+ * preflight passes (zero tasks on preflight failure); all approved stages
+ * run after an individual failure so evidence is collected. A blocked or
+ * failed stage makes the run exit non-zero. State is archived under
+ * archive-dir/<runId>/.
  */
 async function runStaging(deps) {
   deps = deps || {};
   const cfg = resolveConfig(deps);
-  const modeCheck = validateMode(cfg.mode);
-  if (!modeCheck.ok) {
-    // Invalid mode fails safely: nothing is spawned, no preflight evidence
-    // is written, and the archive is left untouched.
+  if (cfg.parseError) {
     return {
       runId: cfg.runId,
       runIdSource: 'none',
       mode: cfg.mode,
       task: cfg.task,
       preflightOk: false,
+      stages: [],
+      anyPipelineDefect: false,
+      pipelineExit: null,
+      exitCode: INVALID_MODE_EXIT,
+      archiveOk: false,
+      archivePath: path.join(cfg.archiveRoot, cfg.runId),
+      error: cfg.parseError
+    };
+  }
+  const modeCheck = validateMode(cfg.mode);
+  if (!modeCheck.ok) {
+    return {
+      runId: cfg.runId,
+      runIdSource: 'none',
+      mode: cfg.mode,
+      task: cfg.task,
+      preflightOk: false,
+      stages: [],
+      anyPipelineDefect: false,
       pipelineExit: null,
       exitCode: INVALID_MODE_EXIT,
       archiveOk: false,
@@ -624,29 +910,53 @@ async function runStaging(deps) {
       error: modeCheck.error
     };
   }
+
+  // Task-selection validation: full mode requires a non-empty selection of
+  // only client-approved canonical ids. An empty selection or any unapproved
+  // id is rejected BEFORE preflight evidence is written or anything spawns.
+  const taskCheck = checkTaskSelection(cfg);
+  if (!taskCheck.ok) {
+    return {
+      runId: cfg.runId,
+      runIdSource: 'none',
+      mode: cfg.mode,
+      preflightOk: false,
+      stages: [],
+      anyPipelineDefect: false,
+      pipelineExit: null,
+      exitCode: INVALID_MODE_EXIT,
+      archiveOk: false,
+      archivePath: path.join(cfg.archiveRoot, cfg.runId),
+      taskSelectionError: true,
+      error: taskCheck.error
+    };
+  }
+
   const preflight = await runPreflight(cfg);
   const preflightOk = preflight.ok === true;
 
-  let pipelineExit = null;
-  if (cfg.mode === 'full') {
-    if (preflightOk) {
-      pipelineExit = runFullStage(cfg);
-    } else {
-      pipelineExit = 4;
+  let stages = [];
+  if (cfg.mode === MODE_FULL && preflightOk) {
+    const planned = buildStagesForTaskIds(cfg.taskIds);
+    for (let i = 0; i < planned.length; i += 1) {
+      stages.push(runStage(cfg, planned[i]));
     }
   }
 
+  writeAggregatedSummary(cfg, preflight, stages);
+
   const resolved = resolvePipelineRunId(cfg);
-  const archived = archiveAndReview(cfg, resolved.runId, resolved.source, preflight, pipelineExit, cfg.mode === 'full');
+  const archived = archiveRun(cfg, resolved.runId, resolved.source, preflight, stages);
 
   let exitCode;
-  if (cfg.mode === 'full') {
-    exitCode = pipelineExit === null ? 0 : pipelineExit;
+  if (cfg.mode === MODE_FULL) {
+    const anyBlockedOrFailed = !preflightOk || stages.some(stageBlockedOrFailed);
+    exitCode = anyBlockedOrFailed ? PIPELINE_DEFECT_EXIT : 0;
+    if (exitCode === 0 && !archived.ok) {
+      exitCode = PIPELINE_DEFECT_EXIT;
+    }
   } else {
     exitCode = preflightOk ? 0 : 1;
-  }
-  if (exitCode === 0 && !archived.ok) {
-    exitCode = 5;
   }
 
   return {
@@ -655,7 +965,9 @@ async function runStaging(deps) {
     mode: cfg.mode,
     task: cfg.task,
     preflightOk: preflightOk,
-    pipelineExit: pipelineExit,
+    pipelineExit: stages.length > 0 ? stages[stages.length - 1].exitCode : (preflightOk ? 0 : 1),
+    anyPipelineDefect: stages.some(function(s) { return s.classification === CLASS_PIPELINE_DEFECT; }),
+    stages: stages,
     exitCode: exitCode,
     archiveOk: archived.ok,
     archivePath: path.join(cfg.archiveRoot, resolved.runId)
@@ -663,9 +975,10 @@ async function runStaging(deps) {
 }
 
 async function main() {
+  const parsed = parseArgs(process.argv.slice(2));
   let result;
   try {
-    result = await runStaging(undefined);
+    result = await runStaging({ args: parsed });
   } catch (e) {
     console.error('run-staging failed: ' + ((e && e.message) || String(e)));
     process.exitCode = 3;
@@ -681,6 +994,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export {
   runStaging,
   resolveConfig,
+  parseArgs,
   envNamesOnly,
   generateRunId,
   runPreflight,
@@ -688,10 +1002,15 @@ export {
   buildChildEnv,
   adminEnvMapping,
   checkAdminEnvMapping,
+  buildStagesForTaskIds,
+  checkTaskSelection,
+  AUTHORIZED_TASK_IDS,
+  DRY_RUN_TASK,
   DEFAULT_ARCHIVE_ROOT,
   DEFAULT_MODE,
   DEFAULT_TASK,
   VALID_MODES,
   INVALID_MODE_EXIT,
+  PIPELINE_DEFECT_EXIT,
   validateMode
 };
