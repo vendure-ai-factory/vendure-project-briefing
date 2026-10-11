@@ -35,7 +35,7 @@ bash evaluation-demo/scripts/verify.sh --acceptance
 | 健康检查 | `https://staging.tibella.eu/health` | 只读预检；预期 HTTP 200 和 `{"status":"ok"}` |
 | Shop GraphQL | `https://staging.tibella.eu/shop-api` | 使用 POST GraphQL；最小身份检查为 `{ __typename }` |
 
-Admin GraphQL、Dashboard、支付、业务写入和浏览器业务流程需要单独发放的 staging 测试账号、夹具和任务授权。不得使用 production 凭据或生产数据。
+Admin GraphQL、Dashboard、支付、业务写入和浏览器业务流程需要单独发放的 staging 测试账号、夹具和任务授权。Vendure 后台账号仅授予应用层权限，不代表 VPS、SSH 或 Docker 权限；凭据由项目方通过批准的私下渠道单独提供，不写入本公开指南、仓库或公开工件。不得使用 production 凭据或生产数据。
 
 ## 4. 代码如何进入 staging
 
@@ -136,7 +136,7 @@ staging 源码仓库和部署凭据由项目方控制。承包商运行公开 de
 - `/usr/local/sbin/pipeline-debug-status` 是受限只读状态入口，报告主机资源、staging Compose、staging health、Runner 状态和有限的 Runner journal 尾部；
 - `/usr/local/sbin/pipeline-debug-runner-restart` 只能重启指定 Runner 服务，并通过 syslog 记录；
 - 两个 wrapper 只通过空的 `pipeline-debug` 组和 `/etc/sudoers.d/90-pipeline-debug-ops` 提供；
-- 当前还没有创建 `maleeha-debug` Linux 账号。创建它需要 Maleeha 的个人 SSH 公钥以及书面确认的开始/过期/撤销时间；创建后绝不能拥有 root、无限制 sudo、Docker socket/组、数据库、Redis 或 production 权限。
+- `maleeha-debug` Linux 调试身份现已建立，SSH 使用 Maleeha 提供的公钥，并由受限登录入口控制；只允许受控状态/日志查看及重启专用 Runner 服务。其 sudo 仅限两个经审计 wrapper，不属于 rootful `docker` 组，也没有通用 root、数据库、Redis 或 production 权限。该身份与 Vendure 后台账号是两个不同系统层级的身份。
 
 ### 8.5 备份、回滚和当前结果
 
@@ -150,4 +150,12 @@ VPS 上保留 root-only 回滚标记：`/root/vps-pre-formal-config-latest.path`
 4. 受控 PostgreSQL gateway 通过允许路径测试，并拒绝负面测试；
 5. 公开工作流边界、production 分离和“不修改 minipc”规则保持不变。
 
-仍待完成、不能报告为 PASS：Maleeha 的 SSH 公钥接入、受保护 staging Environment 的审核人/分支限制、完整出站域名 allowlist、实际定制 Pipeline workflow、业务 E2E、压测和获准红队测试。当前基础设施结果为 `STAGING_RUNNER_INFRASTRUCTURE_READY`，不是 Pipeline 最终验收。
+仍待完成、不能报告为 PASS：受保护 staging Environment 的审核人/分支限制、完整出站域名 allowlist、实际定制 Pipeline workflow、业务 E2E、压测和获准红队测试。Maleeha 的 SSH 公钥身份已接入，但不改变上述未完成项。当前基础设施结果为 `STAGING_RUNNER_INFRASTRUCTURE_READY`，不是 Pipeline 最终验收。
+
+## 9. 2026-10-11 Vendure staging 管理员账号
+
+- Vendure staging 应用此前已完成首次启动初始化，已有 SuperAdmin；本次没有重置数据库、重建 staging 或更改现有管理员。
+- 已在隔离的 Vendure staging 应用中新增专用后台管理员账号，供授权的 staging 开发/验收工作使用。该账号权限属于 Vendure 应用层，不是 VPS/Linux/SSH/Docker 身份，也不提供 production 访问。
+- 登录凭据由项目方通过批准的私下渠道另行提供；密码不写入本指南、GitHub 仓库、日志或公开工件。请勿将凭据粘贴到代码或任务报告。
+- 本次验证了新账号的 Admin API 登录、管理员记录和角色；staging health 与 Dashboard 页面也正常。此记录不代表 Pipeline 已完成或业务任务已通过。
+- 如果 GitHub Actions 后续确实需要该账号，需另行由项目方将凭据放入受保护的 GitHub Environment secrets；本次没有创建或更新这些 secrets。

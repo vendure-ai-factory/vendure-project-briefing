@@ -35,7 +35,7 @@ The project-owned staging service is separate from production. When the project 
 | Health check | `https://staging.tibella.eu/health` | Read-only preflight; expected HTTP 200 and `{"status":"ok"}` |
 | Shop GraphQL | `https://staging.tibella.eu/shop-api` | POST GraphQL; the minimal identity check is `{ __typename }` |
 
-Admin GraphQL, Dashboard, payment, business writes and browser business flows require a separately issued staging test account, fixture and task authorization. Never use production credentials or production data.
+Admin GraphQL, the Dashboard, payment, business writes and browser flows require a separately issued staging test account, fixtures and task authorization. A Vendure administrator grants application-level access only; it does not grant VPS, SSH or Docker access. The owner issues credentials separately through an approved private channel; do not put them in this public guide, repository or public artifacts. Never use production credentials or production data.
 
 ## 4. How code reaches staging
 
@@ -136,7 +136,7 @@ Verification passed: the allowed path returned `SELECT 1`; a wrong database was 
 - `/usr/local/sbin/pipeline-debug-status` is a bounded read-only status wrapper for host resources, staging Compose, staging health, Runner state and a limited Runner journal tail.
 - `/usr/local/sbin/pipeline-debug-runner-restart` can restart only the named Runner service and records the action through syslog.
 - Both wrappers are available only through the empty `pipeline-debug` group and `/etc/sudoers.d/90-pipeline-debug-ops`.
-- No `maleeha-debug` Linux account has been created yet. It requires Maleeha's individual SSH public key and a written start/expiry/revocation window. When created, it must never receive root, unrestricted sudo, Docker socket/group, database, Redis or production access.
+- The `maleeha-debug` Linux debugging identity is now provisioned using Maleeha's SSH public key and a restricted login entrypoint. It permits only bounded status/log viewing and restart of the dedicated Runner service. Its sudo allowlist contains only the two audited wrappers; it is not a member of the rootful `docker` group and has no general root, database, Redis or production access. This identity is separate from the Vendure application administrator.
 
 ### 8.5 Backup, rollback and current result
 
@@ -150,4 +150,12 @@ Post-change verification passed:
 4. the controlled PostgreSQL gateway passes the allow case and rejects the negative cases;
 5. the public-workflow boundary, production separation and no-MinicPC rule remain unchanged.
 
-Still pending and intentionally not reported as PASS: Maleeha's SSH public-key onboarding, protected staging Environment reviewers/branch restrictions, a fully enforced outbound domain allowlist, the actual custom Pipeline workflow, business E2E, load/pressure testing and authorized red-team testing. The current infrastructure result is `STAGING_RUNNER_INFRASTRUCTURE_READY`, not final Pipeline acceptance.
+Still pending and intentionally not reported as PASS: protected staging Environment reviewers/branch restrictions, a fully enforced outbound domain allowlist, the actual custom Pipeline workflow, business E2E, load/pressure testing and authorized red-team testing. Maleeha's SSH public-key identity is now onboarded, but that does not change any of the pending items above. The current infrastructure result is `STAGING_RUNNER_INFRASTRUCTURE_READY`, not final Pipeline acceptance.
+
+## 9. Vendure staging administrator account (2026-10-11)
+
+- The Vendure staging application had already completed its first-start bootstrap and already had a SuperAdmin. This operation did not reset the database, rebuild staging or change the existing administrator.
+- A dedicated administrator account has now been added inside the isolated Vendure staging application for authorized staging development and acceptance work. Its privileges are at the Vendure application layer; it is not a VPS/Linux/SSH/Docker identity and grants no production access.
+- The owner provides login credentials separately through an approved private channel. The password is not included in this guide, the GitHub repository, logs or public artifacts. Do not paste credentials into source code or task reports.
+- The new account's Admin API login, administrator record and role were verified; staging health and the Dashboard page also responded successfully. This does not mean the Pipeline is complete or business tasks have passed.
+- If GitHub Actions later needs this account, the owner must separately place its credentials in protected GitHub Environment secrets. This operation did not create or update those secrets.
