@@ -136,18 +136,29 @@ function ensureDir(dirPath) {
 /**
  * Create evidence/<runId>/index.json with the schema 1.0 shape.
  * meta: { executionRevision, referenceCommit, protectedPathsHash }
- * If the index already exists it is replaced (fresh run index).
+ * If the index already exists it is replaced (fresh run index) UNLESS
+ * options.reuseExisting === true, in which case an existing index that parses
+ * with the same runId is returned untouched ({ ok: true, index, reused: true })
+ * so later child processes sharing a runId never erase earlier tasks.
  */
 function initEvidenceIndex(runId, meta, options) {
   if (!runId) {
     throw new Error('initEvidenceIndex: runId is required');
   }
+  options = options || {};
   if (!meta) {
     meta = {};
   }
   var root = resolveRoot(options);
   var dir = runDir(root, runId);
   ensureDir(dir);
+
+  if (options.reuseExisting === true) {
+    var existing = loadIndex(root, runId);
+    if (existing.exists && existing.index && existing.index.runId === runId) {
+      return { ok: true, index: existing.index, reused: true };
+    }
+  }
 
   var index = {
     schemaVersion: EV_SCHEMA_VERSION,
@@ -161,7 +172,7 @@ function initEvidenceIndex(runId, meta, options) {
   var serialized = JSON.stringify(index, null, 2) + '\n';
   var finalContent = redactContent(serialized, collectSecrets(options).values);
   fs.writeFileSync(indexFile(root, runId), finalContent, 'utf8');
-  return { ok: true, index: JSON.parse(finalContent) };
+  return { ok: true, index: JSON.parse(finalContent), reused: false };
 }
 
 function loadIndex(root, runId) {

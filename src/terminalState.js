@@ -25,6 +25,14 @@
  *   APPLICATION_DEFECT and PIPELINE_DEFECT with exhausted repairs = BLOCK.
  *   Circuit-open yields BLOCK with safeStop:true and never PASS_CANDIDATE.
  *   Each classification carries: reason, evidence, and the rule that triggered it.
+ *   GraphQL error codes:
+ *     QUERY_INVALID        -> PIPELINE_DEFECT (our own query does not match the
+ *                             Shop API schema; e.g. a field that does not exist)
+ *     STAGING_SERVER_ERROR -> DEPENDENCY_ENVIRONMENT (HTTP 200 with a resolver
+ *                             or runtime GraphQL error from the staging server)
+ *     GRAPHQL_ERROR        -> DEPENDENCY_ENVIRONMENT (fallback so a code-less
+ *                             GraphQL error never falls through to the message
+ *                             regex which can mislabel "invalid" as client input)
  */
 
 var RESULT_PASS = 'PASS';  // the only sanctioned definition
@@ -130,6 +138,21 @@ function buildClassification(failureClass, reason, evidence, rule) {
  */
 function classifyByErrorCode(errorCode, errorMessage) {
   switch (errorCode) {
+    case 'QUERY_INVALID':
+      return buildClassification(
+        FAILURE_CLASSES.PIPELINE_DEFECT,
+        errorMessage || 'Query is invalid: ' + errorCode,
+        { errorCode: errorCode },
+        'errorCode:QUERY_INVALID -> PIPELINE_DEFECT'
+      );
+    case 'STAGING_SERVER_ERROR':
+    case 'GRAPHQL_ERROR':
+      return buildClassification(
+        FAILURE_CLASSES.DEPENDENCY_ENVIRONMENT,
+        errorMessage || 'Staging server error: ' + errorCode,
+        { errorCode: errorCode },
+        'errorCode:STAGING_SERVER_ERROR|GRAPHQL_ERROR -> DEPENDENCY_ENVIRONMENT'
+      );
     case 'UNKNOWN_TOOL':
     case 'EXECUTION_ERROR':
       return buildClassification(

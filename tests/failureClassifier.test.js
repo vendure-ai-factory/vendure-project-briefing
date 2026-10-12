@@ -581,3 +581,44 @@ test('failureClassifier: failure is never converted to PASS through classificati
   assert.strictEqual(stepResult.success, false, 'Original step result should remain failed');
   done();
 });
+// ---------------------------------------------------------------------------
+// Fix 4: new GraphQL error codes never fall through to the message regex
+// ---------------------------------------------------------------------------
+
+test('failureClassifier: (terminalState) QUERY_INVALID maps to PIPELINE_DEFECT', function(t, done) {
+  var terminalState = require('../src/terminalState');
+  var c = terminalState.classifyByErrorCode('QUERY_INVALID', 'Cannot query field "enabled" on type "ProductVariant"');
+  assert.strictEqual(c.failureClass, 'PIPELINE_DEFECT');
+  assert.strictEqual(c.recoverable, false);
+  assert.ok(c.rule.indexOf('QUERY_INVALID') !== -1, 'rule text names QUERY_INVALID');
+  done();
+});
+
+test('failureClassifier: (terminalState) STAGING_SERVER_ERROR maps to DEPENDENCY_ENVIRONMENT', function(t, done) {
+  var terminalState = require('../src/terminalState');
+  var c = terminalState.classifyByErrorCode('STAGING_SERVER_ERROR', 'invalid input syntax for type integer: "undefined"');
+  assert.strictEqual(c.failureClass, 'DEPENDENCY_ENVIRONMENT');
+  assert.strictEqual(c.recoverable, true);
+  assert.ok(c.rule.indexOf('STAGING_SERVER_ERROR') !== -1, 'rule text names STAGING_SERVER_ERROR');
+  done();
+});
+
+test('failureClassifier: (terminalState) GRAPHQL_ERROR fallback maps to DEPENDENCY_ENVIRONMENT (never falls to message regex)', function(t, done) {
+  var terminalState = require('../src/terminalState');
+  var c = terminalState.classifyByErrorCode('GRAPHQL_ERROR', 'invalid input syntax for type integer: "undefined"');
+  assert.strictEqual(c.failureClass, 'DEPENDENCY_ENVIRONMENT');
+  assert.strictEqual(c.recoverable, true);
+  assert.strictEqual(c.rule.indexOf('GRAPHQL_ERROR') !== -1, true);
+  done();
+});
+
+test('failureClassifier: new GraphQL codes map via classifyStepFailure and never fall to message regex', function(t, done) {
+  function cat(code, err) {
+    return failureClassifier.classifyStepFailure({ success: false, errorCode: code, error: err || 'invalid input syntax for type integer: "undefined"' }).failureCategory;
+  }
+  assert.strictEqual(cat('QUERY_INVALID'), 'PIPELINE_DEFECT');
+  assert.strictEqual(cat('STAGING_SERVER_ERROR'), 'DEPENDENCY_ENVIRONMENT');
+  assert.strictEqual(cat('GRAPHQL_ERROR'), 'DEPENDENCY_ENVIRONMENT', 'GRAPHQL_ERROR fallback never hits the message regex');
+
+  done();
+});

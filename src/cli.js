@@ -187,7 +187,7 @@ function initRunEvidence(shared, runEnvRecord) {
     referenceCommit: source.referenceCommit || null,
     protectedPathsHash: startInfo ? startInfo.combinedHash : null
   };
-  evidenceCollector.initEvidenceIndex(shared.runId, meta, shared.evOpts());
+  evidenceCollector.initEvidenceIndex(shared.runId, meta, Object.assign({ reuseExisting: true }, shared.evOpts()));
   return { ok: true, already: false };
 }
 

@@ -39,6 +39,11 @@ function isRecoverable(category) {
 
 function classifyErrorCode(errorCode) {
   switch (errorCode) {
+    case 'QUERY_INVALID':
+      return FAILURE_CATEGORIES.PIPELINE_DEFECT;
+    case 'STAGING_SERVER_ERROR':
+    case 'GRAPHQL_ERROR':
+      return FAILURE_CATEGORIES.DEPENDENCY_ENVIRONMENT;
     case 'UNKNOWN_TOOL':
     case 'EXECUTION_ERROR':
       return FAILURE_CATEGORIES.PIPELINE_DEFECT;

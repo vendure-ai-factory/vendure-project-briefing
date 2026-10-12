@@ -144,8 +144,8 @@ test('readOnlyShopApi B1-03: all correct returns PASS with expected == actual', 
   assert.strictEqual(outcome.evidence.actual.countryCurrencyMap.HU, 'HUF');
   assert.strictEqual(outcome.evidence.table.length, 4, 'one table row per country');
   assert.strictEqual(outcome.evidence.checks.mismatchCount, 0, 'no mismatches');
-  assert.strictEqual(outcome.evidence.rawRequests.length, 4, 'raw request per country');
-  assert.strictEqual(outcome.evidence.rawResponses.length, 4, 'raw response per country');
+  assert.strictEqual(outcome.evidence.rawRequests.length, 8, 'raw request per probe and per products query per country');
+  assert.strictEqual(outcome.evidence.rawResponses.length, 8, 'raw response per probe and per products query per country');
   // channel tokens are redacted from evidence
   assert.strictEqual(outcome.evidence.rawRequests[0].headers['vendure-token'], '[REDACTED]', 'token redacted');
 
@@ -491,4 +491,105 @@ test('readOnlyShopApi: direct context.channelTokens has highest precedence', fun
   assert.strictEqual(result.source, 'context', 'context value wins over env and frozen');
   assert.strictEqual(result.tokens.DE, 'ctx-de');
   done();
+});
+
+// ---------------------------------------------------------------------------
+// Fix 3, Fix 4, Fix 5
+// ---------------------------------------------------------------------------
+
+test('readOnlyShopApi: B1_04_QUERY selects no `enabled` field (Shop API does not expose it)', function(t, done) {
+  var query = executors.B1_04_QUERY;
+  assert.ok(query.indexOf('enabled') === -1, 'query must not select enabled on Product or ProductVariant');
+  assert.ok(query.indexOf('sku') !== -1, 'query still checks sku for isolation');
+  done();
+});
+
+test('readOnlyShopApi B1-03: HTTP 400 GRAPHQL_VALIDATION_FAILED is QUERY_INVALID / PIPELINE_DEFECT', async function(t) {
+  var server = fakeShopServer({
+    'de-token': { status: 400, body: { errors: [{ message: 'Cannot query field "enabled" on type "ProductVariant"', path: ['products', 'items', 'variants'], extensions: { code: 'GRAPHQL_VALIDATION_FAILED' } }] } },
+    'at-token': { status: 200, body: b1_03Body('EUR', [b1_03Item('AT product', 3000, 'EUR')]) },
+    'hu-token': { status: 200, body: b1_03Body('HUF', [b1_03Item('HU product', 875000, 'HUF')]) },
+    'gb-token': { status: 200, body: b1_03Body('GBP', [b1_03Item('GB product', 2200, 'GBP')]) }
+  });
+  var ctx = baseContext('CAN-B1-03', { fetch: server });
+  var outcome = await executors.handlerB1_03(ctx);
+  assert.strictEqual(outcome.success, false);
+  assert.strictEqual(outcome.errorCode, 'QUERY_INVALID');
+  assert.ok(outcome.error.indexOf('GraphQL error') !== -1, 'keeps the GraphQL error message');
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-03');
+  assert.strictEqual(finalOutcome.result, 'BLOCK');
+  assert.strictEqual(finalOutcome.classification, 'PIPELINE_DEFECT');
+});
+
+test('readOnlyShopApi B1-03: HTTP 200 resolver runtime error is STAGING_SERVER_ERROR / DEPENDENCY_ENVIRONMENT', async function(t) {
+  var server = fakeShopServer({
+    'de-token': { status: 200, body: { data: null, errors: [{ message: 'invalid input syntax for type integer: "undefined"', path: ['products'], extensions: {} }] } },
+    'at-token': { status: 200, body: b1_03Body('EUR', [b1_03Item('AT product', 3000, 'EUR')]) },
+    'hu-token': { status: 200, body: b1_03Body('HUF', [b1_03Item('HU product', 875000, 'HUF')]) },
+    'gb-token': { status: 200, body: b1_03Body('GBP', [b1_03Item('GB product', 2200, 'GBP')]) }
+  });
+  var ctx = baseContext('CAN-B1-03', { fetch: server });
+  var outcome = await executors.handlerB1_03(ctx);
+  assert.strictEqual(outcome.success, false);
+  assert.strictEqual(outcome.errorCode, 'STAGING_SERVER_ERROR');
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-03');
+  assert.strictEqual(finalOutcome.result, 'BLOCK');
+  assert.strictEqual(finalOutcome.classification, 'DEPENDENCY_ENVIRONMENT');
+  // Fix 5: probe succeeded, products failed -> executor-error.json records the split.
+  var execError = outcome.evidence;
+  assert.ok(execError.graphQLError, 'graphQL error details kept in evidence');
+  assert.strictEqual(execError.graphQLError.message.indexOf('invalid input syntax') !== -1, true);
+});
+
+test('readOnlyShopApi B1-04: HTTP 200 GraphQL runtime error never passes and is DEPENDENCY_ENVIRONMENT', async function(t) {
+  var server = fakeShopServer({
+    'de-token': { status: 200, body: { data: null, errors: [{ message: 'ProductVariant.enabled does not exist', extensions: { code: 'INTERNAL_SERVER_ERROR' } }] } },
+    'at-token': { status: 200, body: b1_04Body([]) },
+    'hu-token': { status: 200, body: b1_04Body([]) },
+    'gb-token': { status: 200, body: b1_04Body([]) }
+  });
+  var real = realWorkspace();
+  var ctx = baseContext('CAN-B1-04', {
+    fetch: server,
+    workspace: real.ws,
+    mkdirSync: real.deps.mkdirSync,
+    writeFileSync: real.deps.writeFileSync,
+    readFileSync: real.deps.readFileSync
+  });
+  var outcome = await executors.handlerB1_04(ctx);
+  assert.strictEqual(outcome.success, false, 'GraphQL error must not pass');
+  assert.strictEqual(outcome.errorCode, 'STAGING_SERVER_ERROR');
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-04');
+  assert.strictEqual(finalOutcome.result, 'BLOCK');
+  assert.strictEqual(finalOutcome.classification, 'DEPENDENCY_ENVIRONMENT');
+  fs.rmSync(real.ws.workspacePath, { recursive: true, force: true });
+});
+
+test('readOnlyShopApi B1-03: probe succeeds + products Postgres error -> STAGING_SERVER_ERROR, exit 6 path', async function(t) {
+  function postgresServer() {
+    return function fakeFetch(url, init) {
+      var headers = init && init.headers ? init.headers : {};
+      var body = init && init.body ? init.body : '';
+      var token = headers['vendure-token'];
+      var isProbe = String(body).indexOf('ActiveChannelProbe') !== -1;
+      if (isProbe) {
+        return Promise.resolve({ status: 200, ok: true, text: function() {
+          return Promise.resolve(JSON.stringify({ data: { activeChannel: { code: 'DE', currencyCode: 'EUR' } } }));
+        } });
+      }
+      // products query: runtime Postgres error from staging
+      return Promise.resolve({ status: 200, ok: true, text: function() {
+        return Promise.resolve(JSON.stringify({ data: null, errors: [{ message: 'invalid input syntax for type integer: "undefined"', path: ['products'] }] }));
+      } });
+    };
+  }
+  var ctx = baseContext({ fetch: postgresServer(), runEnvRecord: { runId: 'run-probe-fix5', stagingUrl: 'https://staging.tibella.eu' }, evidenceRoot: undefined });
+  var outcome = await executors.handlerB1_03(ctx);
+  assert.strictEqual(outcome.success, false);
+  assert.strictEqual(outcome.errorCode, 'STAGING_SERVER_ERROR');
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-03');
+  assert.strictEqual(finalOutcome.classification, 'DEPENDENCY_ENVIRONMENT');
+  // exit code 6 for DEPENDENCY_ENVIRONMENT
+  var cliMod = require('../src/cli');
+  assert.strictEqual(cliMod.exitCodeForOutcome('BLOCK', 'DEPENDENCY_ENVIRONMENT'), 6);
 });

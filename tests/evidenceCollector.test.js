@@ -90,6 +90,47 @@ test('evidenceCollector: initEvidenceIndex creates correct schema', function(t, 
   done();
 });
 
+test('evidenceCollector: initEvidenceIndex reuseExisting keeps earlier tasks and verify covers both', function(t, done) {
+  wipeAll();
+  var runId = 'run-reuse-' + Date.now();
+  // First "child" process initializes the index.
+  var first = evidence.initEvidenceIndex(runId, { executionRevision: 'rev-1' }, opts({ reuseExisting: true }));
+  assert.strictEqual(first.ok, true);
+  assert.strictEqual(first.reused, false);
+  assert.deepStrictEqual(first.index.tasks, {});
+
+  // Between child processes a task file is written and recorded in the index.
+  var res = evidence.writeEvidenceFile(runId, 'CAN-B1-01', 'note.txt', 'first task evidence\n', opts());
+  assert.strictEqual(res.ok, true);
+
+  // Second "child" process initializes with the same runId and reuseExisting.
+  var second = evidence.initEvidenceIndex(runId, { executionRevision: 'rev-2' }, opts({ reuseExisting: true }));
+  assert.strictEqual(second.ok, true);
+  assert.strictEqual(second.reused, true, 'existing index must be reused, not rewritten');
+
+  var indexPath = path.join(runRoot(runId), 'index.json');
+  var index = JSON.parse(readText(indexPath));
+  assert.ok(index.tasks['CAN-B1-01'], 'first task must still be in index.json after the second init');
+  assert.strictEqual(index.tasks['CAN-B1-01'].length, 1, 'first task entry preserved');
+  assert.strictEqual(index.tasks['CAN-B1-01'][0].path, 'CAN-B1-01/note.txt');
+  // The second init must not have clobbered the execution revision either.
+  assert.strictEqual(index.executionRevision, 'rev-1');
+
+  // verify covers the first task and passes.
+  var verify = evidence.verifyEvidence(runId, opts());
+  assert.strictEqual(verify.ok, true, 'verifyEvidence covers existing tasks after reuse');
+  assert.ok(verify.tasks['CAN-B1-01'], 'verifyEvidence reports the first task');
+
+  // Default behaviour (no reuseExisting) still overwrites an existing index.
+  evidence.writeEvidenceFile(runId, 'CAN-B1-02', 'second.txt', 'second task evidence\n', opts());
+  var overwrite = evidence.initEvidenceIndex(runId, {}, opts());
+  var indexAfterDefault = JSON.parse(readText(indexPath));
+  assert.deepStrictEqual(indexAfterDefault.tasks, {}, 'default init still rewrites a fresh index');
+
+  removeRun(runId);
+  done();
+});
+
 test('evidenceCollector: writeEvidenceFile computes sha256, updates index, redacts secrets', function(t, done) {
   wipeAll();
   var runId = 'run-write-' + Date.now();

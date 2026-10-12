@@ -641,7 +641,7 @@ function hasPipelineDefect(summary) {
 }
 
 function isPassResult(v) {
-  return v === 'PASS' || v === 'RESULT_PASS';
+  return v === 'PASS' || v === 'RESULT_PASS' || v === 'READINESS_PASS';
 }
 
 function firstTaskProblem(summary) {
@@ -800,7 +800,10 @@ function writeAggregatedSummary(cfg, preflight, stages) {
     preflightOk: preflight.ok === true,
     anyPipelineDefect: anyDefect,
     stages: stageRows,
-    tasks: allTasks
+    tasks: allTasks,
+    notes: [
+      'Follow-up: if real staging still returns "invalid input syntax for type integer: undefined" on CAN-B1-03 after the pipeline defect fixes 1-4, the next step is to confirm the real channel tokens with the client (human action, not code).'
+    ]
   };
   const file = path.join(outDir, 'run-summary.json');
   try {

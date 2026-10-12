@@ -25,7 +25,7 @@ function stageOf(args) {
   return 'unknown';
 }
 
-function writeArtifacts(cwd, runId, stageName, classification) {
+function writeArtifacts(cwd, runId, stageName, classification, resultValue) {
   var evDir = path.join(cwd, 'evidence', runId);
   fs.mkdirSync(evDir, { recursive: true });
   fs.writeFileSync(path.join(evDir, 'index.json'),
@@ -35,7 +35,7 @@ function writeArtifacts(cwd, runId, stageName, classification) {
   var uniq = stageName + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
   var tasks = classification
     ? [{ taskId: uniq, result: 'BLOCK', classification: classification, cause: 'TEST' }]
-    : [{ taskId: uniq, result: 'PASS', classification: null, cause: null }];
+    : [{ taskId: uniq, result: resultValue || 'PASS', classification: null, cause: null }];
   fs.writeFileSync(path.join(repDir, 'run-summary.json'),
     JSON.stringify({ schemaVersion: '1.0', runId: runId, counts: {}, tasks: tasks }, null, 2) + '\n', 'utf8');
   fs.writeFileSync(path.join(repDir, 'compliance-report.json'),
@@ -65,7 +65,7 @@ function makeChild(config) {
       var stageName = stageOf(args);
       var stageConfig = results[stageName] ? results[stageName] : {};
       var classification = stageConfig.classification || null;
-      writeArtifacts(cwdVal, runId, stageName, classification);
+      writeArtifacts(cwdVal, runId, stageName, classification, stageConfig.result || null);
       var status = (stageConfig.status === undefined) ? 0 : stageConfig.status;
       return { status: status, stdout: 'pipeline output line\n', stderr: '' };
     }
@@ -694,3 +694,32 @@ test('runStaging: invalid PIPELINE_RUN_ID makes bin/pipeline.js exit 2', async f
   assert.ok(out.stderr.indexOf('../x') === -1, 'stderr must not echo the value');
 });
 
+
+
+test('runStaging: READINESS_PASS task with no classification is not blocked and not PIPELINE_DEFECT', async function() {
+  var mod = await loadModule();
+  var child = makeChild({ results: {
+    'task-CAN-B1-03': { status: 0, classification: null, result: 'READINESS_PASS' },
+    'task-CAN-B1-04': { status: 0, classification: null, result: 'READINESS_PASS' },
+    'task-CAN-B2-16': { status: 0, classification: null, result: 'READINESS_PASS' }
+  } });
+  var deps = makeDeps('readiness-pass', { child: child, taskIds: APPROVED });
+  var result = await mod.runStaging(deps);
+  assert.strictEqual(result.anyPipelineDefect, false, 'READINESS_PASS must not set anyPipelineDefect');
+  assert.strictEqual(result.stages[0].classification, null, 'READINESS_PASS stage is not blocked');
+  assert.strictEqual(result.stages[0].cause, null, 'no cause for a READINESS_PASS stage');
+  assert.strictEqual(result.exitCode, 0, 'run with only READINESS_PASS stages exits 0');
+});
+
+test('runStaging: a real BLOCK stage is still blocked alongside a READINESS_PASS task', async function() {
+  var mod = await loadModule();
+  var child = makeChild({ results: {
+    'task-CAN-B1-03': { status: 4, classification: 'CLIENT_INPUT_SCOPE' },
+    'task-CAN-B1-04': { status: 0, classification: null, result: 'READINESS_PASS' },
+    'task-CAN-B2-16': { status: 0, classification: null, result: 'READINESS_PASS' }
+  } });
+  var deps = makeDeps('readiness-pass-block', { child: child, taskIds: APPROVED });
+  var result = await mod.runStaging(deps);
+  assert.notStrictEqual(result.exitCode, 0, 'a real BLOCK must still make the run exit non-zero');
+  assert.strictEqual(result.stages[0].classification, 'CLIENT_INPUT_SCOPE', 'real BLOCK keeps its classification');
+});

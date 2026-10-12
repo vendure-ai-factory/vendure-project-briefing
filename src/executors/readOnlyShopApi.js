@@ -83,7 +83,7 @@ var B1_03_QUERY = [
 var B1_04_QUERY = [
   'query ReadOnlyCountryVisibility {',
   '  products(options: { take: 100 }) {',
-  '    items { id name slug enabled variants { id sku name enabled price currencyCode } }',
+  '    items { id name slug variants { id sku name price currencyCode } }',
   '  }',
   '}'
 ].join('\n');
@@ -489,6 +489,101 @@ function extractActiveCurrency(body) {
   return null;
 }
 
+/**
+ * Inspect a Shop API response for GraphQL errors and classify them so an
+ * invalid query (our own bug) is never mislabeled as client input or as a
+ * plain environment error.
+ *
+ *   HTTP 400 + GRAPHQL_VALIDATION_FAILED / GRAPHQL_PARSE_FAILED -> QUERY_INVALID
+ *   HTTP 200 + errors (INTERNAL_SERVER_ERROR or no code)          -> STAGING_SERVER_ERROR
+ *   HTTP 200 + errors with any other code                         -> GRAPHQL_ERROR (fallback)
+ *   Anything else (network failure, 5xx, timeout, non-GraphQL)    -> null (caller
+ *     falls back to ENVIRONMENT_ERROR)
+ *
+ * Returns null when there is no GraphQL error to classify. The first error's
+ * message, path and extensions.code are always kept (they are redacted later
+ * via redactDeep when written to evidence).
+ */
+function gqlErrorInfo(result) {
+  var body = result && result.body;
+  if (!body || !Array.isArray(body.errors) || body.errors.length === 0) {
+    return null;
+  }
+  var first = body.errors[0] || {};
+  var extensions = (first.extensions && typeof first.extensions === 'object') ? first.extensions : {};
+  var code = extensions.code || null;
+  var status = result.httpStatus;
+  var info = {
+    message: (first.message || 'unknown').slice(0, 120),
+    path: Array.isArray(first.path) && first.path.length > 0 ? first.path.join('.') : null,
+    extensionsCode: code,
+    httpStatus: status
+  };
+  if (status === 400 && (code === 'GRAPHQL_VALIDATION_FAILED' || code === 'GRAPHQL_PARSE_FAILED')) {
+    return Object.assign(info, { errorCode: 'QUERY_INVALID' });
+  }
+  if (status === 200) {
+    if (code === 'INTERNAL_SERVER_ERROR' || !code) {
+      return Object.assign(info, { errorCode: 'STAGING_SERVER_ERROR' });
+    }
+    return Object.assign(info, { errorCode: 'GRAPHQL_ERROR' });
+  }
+  // Network failure / 5xx / timeout / non-GraphQL body: not a GraphQL-error
+  // classification; the caller keeps the generic ENVIRONMENT_ERROR path.
+  return null;
+}
+
+function gqlErrorMessage(gql) {
+  return 'GraphQL error: ' + gql.message + (gql.path ? ' path:' + gql.path : '');
+}
+
+var ACTIVE_CHANNEL_PROBE_QUERY = [
+  'query ActiveChannelProbe {',
+  '  activeChannel { code currencyCode }',
+  '}'
+].join('\n');
+
+// The frozen registry placeholders from manifest/inputs-registry.json channelTokens.
+// Only booleans about equality are ever written to evidence, never token values.
+var REGISTRY_PLACEHOLDER_TOKENS = Object.keys(COUNTRY_CHANNEL_TOKENS).map(function(k) { return COUNTRY_CHANNEL_TOKENS[k]; });
+
+/**
+ * Build the no-secret token diagnostics for the evidence on failure: per country,
+ * the token source (env|frozen|direct), whether the token is a non-empty
+ * string, its length, and whether it equals one of the registry placeholder
+ * values (boolean only). Token VALUES are never written.
+ */
+function buildTokenDiagnostics(tokensResult) {
+  var source = (tokensResult && tokensResult.source) ? tokensResult.source : null;
+  var tokens = (tokensResult && tokensResult.tokens) || {};
+  var perCountry = {};
+  for (var i = 0; i < COUNTRIES.length; i++) {
+    var country = COUNTRIES[i];
+    var t = tokens[country];
+    perCountry[country] = {
+      source: source,
+      isNonEmptyString: typeof t === 'string' && t.length > 0,
+      length: typeof t === 'string' ? t.length : null,
+      equalsRegistryPlaceholder: typeof t === 'string' && REGISTRY_PLACEHOLDER_TOKENS.indexOf(t) !== -1
+    };
+  }
+  return { source: source, perCountry: perCountry };
+}
+
+/**
+ * Build the executor-error.json evidence entry used on any B1-03/B1-04 failure:
+ * the no-secret token diagnostics plus the per-country probe outcomes so a
+ * "probe: ok, products: failed" split is visible in one run.
+ */
+function executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets) {
+  var payload = {
+    taskId: taskId,
+    tokenDiagnostics: buildTokenDiagnostics(tokensResult),
+    probes: probeChecks || {}
+  };
+  return { name: 'executor-error.json', data: payload, kind: 'executor-error' };
+}
+
 function extractVariants(body) {
   if (!body) return [];
   if (body.errors && body.errors.length > 0) return [];
@@ -514,18 +609,21 @@ function summarizeVisibility(body) {
   if (body.errors && body.errors.length > 0) return { products: [], graphQLErrors: body.errors };
   var data = body.data || body;
   var items = data && data.products && data.products.items ? data.products.items : [];
+  // The Shop API does not expose an `enabled` field: disabled items are simply
+  // not returned. Anything the API returns is visible and purchasable in the
+  // channel, so presence == enabled: true.
   var products = items.map(function(item) {
     return {
       id: item.id,
       name: item.name,
       slug: item.slug,
-      enabled: item.enabled === true,
+      enabled: true,
       variants: (item.variants || []).map(function(v) {
         return {
           id: v.id,
           sku: v.sku,
           name: v.name,
-          enabled: v.enabled === true,
+          enabled: true,
           price: v.price,
           currencyCode: v.currencyCode
         };
@@ -593,6 +691,7 @@ async function handlerB1_03(context) {
       taskId: taskId,
       source: 'CHANNEL_TOKENS',
       checks: { tokenResolution: 'FAILED', error: tokensResult.error },
+      tokenDiagnostics: buildTokenDiagnostics(tokensResult),
       completedAt: timestamp
     };
     writeExecutorEvidence(context, taskId, [
@@ -611,11 +710,65 @@ async function handlerB1_03(context) {
   var table = [];
   var actualByCountry = {};
   var mismatches = [];
+  var probeChecks = {};
 
   for (var i = 0; i < COUNTRIES.length; i++) {
     var country = COUNTRIES[i];
     var token = tokensResult.tokens[country];
     var expectedCurrency = COUNTRY_CURRENCY_MAP[country];
+
+    // Fix 5: cheap activeChannel probe before the products query so a failed
+    // products query can be attributed to the staging resolver (probe ok) vs
+    // a bad channel token (probe itself fails) in a single run.
+    var probeResult = await shopApiRequest(fetchFn, baseUrl, token, ACTIVE_CHANNEL_PROBE_QUERY);
+    var probeGql = gqlErrorInfo(probeResult);
+    var probeOk = probeResult.ok && !probeGql;
+    probeChecks[country] = { probe: probeOk, products: 'not-run', httpStatus: probeResult.httpStatus };
+
+    rawRequests.push({
+      country: country,
+      method: probeResult.request.method,
+      url: probeResult.request.url,
+      headers: probeResult.request.headers,
+      body: probeResult.request.body,
+      timestamp: timestamp
+    });
+    rawResponses.push({
+      country: country,
+      probe: true,
+      httpStatus: probeResult.httpStatus,
+      body: probeResult.body !== null ? probeResult.body : (probeResult.text !== null ? { raw: probeResult.text } : (probeResult.networkError ? { networkError: probeResult.networkError } : null)),
+      timestamp: timestamp
+    });
+
+    if (probeGql || !probeResult.ok) {
+      var probeErr = probeGql ? gqlErrorMessage(probeGql)
+        : ('shop-api probe for ' + country + ' failed with HTTP ' + (probeResult.httpStatus === null ? 'network error' : probeResult.httpStatus));
+      var probeEvidence = {
+        taskId: taskId,
+        shopApiBase: baseUrl,
+        error: probeErr,
+        graphQLError: probeGql ? { code: probeGql.extensionsCode, path: probeGql.path, message: probeGql.message } : null,
+        rawRequests: rawRequests,
+        rawResponses: rawResponses,
+        table: table,
+        expected: { countryCurrencyMap: COUNTRY_CURRENCY_MAP },
+        actual: { countryCurrencyMap: actualByCountry },
+        completedAt: timestamp
+      };
+      writeExecutorEvidence(context, taskId, [
+        { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
+        { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
+        { name: 'country-table.json', data: { table: table }, kind: 'table' },
+        { name: 'expected-vs-actual.json', data: { expected: COUNTRY_CURRENCY_MAP, actual: actualByCountry, error: probeErr }, kind: 'assertion' },
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
+      ], secrets);
+      return finalizeWithCleanup(context, task, failureResult({
+        errorCode: probeGql ? probeGql.errorCode : 'ENVIRONMENT_ERROR',
+        error: probeErr,
+        evidence: probeEvidence
+      }));
+    }
 
     var result = await shopApiRequest(fetchFn, baseUrl, token, B1_03_QUERY);
 
@@ -629,19 +782,30 @@ async function handlerB1_03(context) {
     });
     rawResponses.push({
       country: country,
+      probe: false,
       httpStatus: result.httpStatus,
       body: result.body !== null ? result.body : (result.text !== null ? { raw: result.text } : (result.networkError ? { networkError: result.networkError } : null)),
       timestamp: timestamp
     });
 
+    var resultGql = gqlErrorInfo(result);
+
     if (!result.ok) {
-      var envError = 'shop-api request for ' + country + ' failed with HTTP ' +
-        (result.httpStatus === null ? 'network error' : result.httpStatus) +
-        (result.networkError ? ' (' + result.networkError + ')' : '');
+      // A 400 with a GraphQL validation/parse error is our own bug
+      // (QUERY_INVALID); a runtime resolver error reported over HTTP 200 is a
+      // staging server error. Real network failures / 5xx / timeouts stay
+      // ENVIRONMENT_ERROR.
+      var failureCode = resultGql ? resultGql.errorCode : 'ENVIRONMENT_ERROR';
+      var envError = resultGql ? gqlErrorMessage(resultGql)
+        : ('shop-api request for ' + country + ' failed with HTTP ' +
+          (result.httpStatus === null ? 'network error' : result.httpStatus) +
+          (result.networkError ? ' (' + result.networkError + ')' : ''));
+      probeChecks[country].products = 'failed';
       var envEvidence = {
         taskId: taskId,
         shopApiBase: baseUrl,
         error: envError,
+        graphQLError: resultGql ? { code: resultGql.extensionsCode, path: resultGql.path, message: resultGql.message } : null,
         rawRequests: rawRequests,
         rawResponses: rawResponses,
         table: table,
@@ -653,23 +817,24 @@ async function handlerB1_03(context) {
         { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
         { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
         { name: 'country-table.json', data: { table: table }, kind: 'table' },
-        { name: 'expected-vs-actual.json', data: { expected: COUNTRY_CURRENCY_MAP, actual: actualByCountry, error: envError }, kind: 'assertion' }
+        { name: 'expected-vs-actual.json', data: { expected: COUNTRY_CURRENCY_MAP, actual: actualByCountry, error: envError }, kind: 'assertion' },
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
       ], secrets);
       return finalizeWithCleanup(context, task, failureResult({
-        errorCode: 'ENVIRONMENT_ERROR',
+        errorCode: failureCode,
         error: envError,
         evidence: envEvidence
       }));
     }
 
-    if (result.body && result.body.errors && result.body.errors.length > 0) {
-      var firstErr = result.body.errors[0] || {};
-      var errMsg = (firstErr.message || 'unknown').slice(0, 120);
-      var errPath = firstErr.path ? firstErr.path.join('.') : null;
-      var envEvidence = {
+    if (resultGql) {
+      var errMsg = gqlErrorMessage(resultGql);
+      probeChecks[country].products = 'failed';
+      var graphQLEvidence = {
         taskId: taskId,
         shopApiBase: baseUrl,
-        error: 'GraphQL error: ' + errMsg + (errPath ? ' path:' + errPath : ''),
+        error: errMsg,
+        graphQLError: { code: resultGql.extensionsCode, path: resultGql.path, message: resultGql.message },
         rawRequests: rawRequests,
         rawResponses: rawResponses,
         table: table,
@@ -681,14 +846,17 @@ async function handlerB1_03(context) {
         { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
         { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
         { name: 'country-table.json', data: { table: table }, kind: 'table' },
-        { name: 'expected-vs-actual.json', data: { expected: COUNTRY_CURRENCY_MAP, actual: actualByCountry, error: envEvidence.error }, kind: 'assertion' }
+        { name: 'expected-vs-actual.json', data: { expected: COUNTRY_CURRENCY_MAP, actual: actualByCountry, error: errMsg }, kind: 'assertion' },
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
       ], secrets);
       return finalizeWithCleanup(context, task, failureResult({
-        errorCode: 'GRAPHQL_ERROR',
-        error: 'GraphQL error: ' + errMsg + (errPath ? ' path:' + errPath : ''),
-        evidence: envEvidence
+        errorCode: resultGql.errorCode,
+        error: errMsg,
+        evidence: graphQLEvidence
       }));
     }
+
+    probeChecks[country].products = 'ok';
 
     var activeCurrency = extractActiveCurrency(result.body);
     var variants = extractVariants(result.body);
@@ -799,6 +967,7 @@ async function handlerB1_04(context) {
       taskId: taskId,
       source: 'CHANNEL_TOKENS',
       checks: { tokenResolution: 'FAILED', error: tokensResult.error },
+      tokenDiagnostics: buildTokenDiagnostics(tokensResult),
       completedAt: timestamp
     };
     writeExecutorEvidence(context, taskId, [
@@ -815,10 +984,55 @@ async function handlerB1_04(context) {
   var rawRequests = [];
   var rawResponses = [];
   var actualByCountry = {};
+  var probeChecks = {};
 
   for (var i = 0; i < COUNTRIES.length; i++) {
     var country = COUNTRIES[i];
     var token = tokensResult.tokens[country];
+
+    // Fix 5: cheap activeChannel probe before the per-country products query.
+    var probeResult = await shopApiRequest(fetchFn, baseUrl, token, ACTIVE_CHANNEL_PROBE_QUERY);
+    var probeGql = gqlErrorInfo(probeResult);
+    var probeOk = probeResult.ok && !probeGql;
+    probeChecks[country] = { probe: probeOk, products: 'not-run', httpStatus: probeResult.httpStatus };
+
+    rawRequests.push({
+      country: country,
+      method: probeResult.request.method,
+      url: probeResult.request.url,
+      headers: probeResult.request.headers,
+      body: probeResult.request.body,
+      timestamp: timestamp
+    });
+    rawResponses.push({
+      country: country,
+      probe: true,
+      httpStatus: probeResult.httpStatus,
+      body: probeResult.body !== null ? probeResult.body : (probeResult.text !== null ? { raw: probeResult.text } : (probeResult.networkError ? { networkError: probeResult.networkError } : null)),
+      timestamp: timestamp
+    });
+
+    if (probeGql || !probeResult.ok) {
+      var probeErr = probeGql ? gqlErrorMessage(probeGql)
+        : ('shop-api probe for ' + country + ' failed with HTTP ' + (probeResult.httpStatus === null ? 'network error' : probeResult.httpStatus));
+      writeExecutorEvidence(context, taskId, [
+        { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
+        { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
+      ], secrets);
+      return finalizeWithCleanup(context, task, failureResult({
+        errorCode: probeGql ? probeGql.errorCode : 'ENVIRONMENT_ERROR',
+        error: probeErr,
+        evidence: {
+          taskId: taskId,
+          rawRequests: rawRequests,
+          rawResponses: rawResponses,
+          graphQLError: probeGql ? { code: probeGql.extensionsCode, path: probeGql.path, message: probeGql.message } : null,
+          completedAt: timestamp
+        }
+      }));
+    }
+
     var result = await shopApiRequest(fetchFn, baseUrl, token, B1_04_QUERY);
 
     rawRequests.push({
@@ -831,31 +1045,62 @@ async function handlerB1_04(context) {
     });
     rawResponses.push({
       country: country,
+      probe: false,
       httpStatus: result.httpStatus,
       body: result.body !== null ? result.body : (result.text !== null ? { raw: result.text } : (result.networkError ? { networkError: result.networkError } : null)),
       timestamp: timestamp
     });
 
+    var resultGql = gqlErrorInfo(result);
+
     if (!result.ok) {
-      var envError = 'shop-api request for ' + country + ' failed with HTTP ' +
-        (result.httpStatus === null ? 'network error' : result.httpStatus) +
-        (result.networkError ? ' (' + result.networkError + ')' : '');
+      var failureCode = resultGql ? resultGql.errorCode : 'ENVIRONMENT_ERROR';
+      var envError = resultGql ? gqlErrorMessage(resultGql)
+        : ('shop-api request for ' + country + ' failed with HTTP ' +
+          (result.httpStatus === null ? 'network error' : result.httpStatus) +
+          (result.networkError ? ' (' + result.networkError + ')' : ''));
+      probeChecks[country].products = 'failed';
       writeExecutorEvidence(context, taskId, [
         { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
-        { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' }
+        { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
       ], secrets);
       return finalizeWithCleanup(context, task, failureResult({
-        errorCode: 'ENVIRONMENT_ERROR',
+        errorCode: failureCode,
         error: envError,
         evidence: {
           taskId: taskId,
           rawRequests: rawRequests,
           rawResponses: rawResponses,
+          graphQLError: resultGql ? { code: resultGql.extensionsCode, path: resultGql.path, message: resultGql.message } : null,
           completedAt: timestamp
         }
       }));
     }
 
+    if (resultGql) {
+      // HTTP 200 with GraphQL errors: staging server runtime failure, never a pass.
+      var gqlErrMsg = gqlErrorMessage(resultGql);
+      probeChecks[country].products = 'failed';
+      writeExecutorEvidence(context, taskId, [
+        { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
+        { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
+      ], secrets);
+      return finalizeWithCleanup(context, task, failureResult({
+        errorCode: resultGql.errorCode,
+        error: gqlErrMsg,
+        evidence: {
+          taskId: taskId,
+          rawRequests: rawRequests,
+          rawResponses: rawResponses,
+          graphQLError: { code: resultGql.extensionsCode, path: resultGql.path, message: resultGql.message },
+          completedAt: timestamp
+        }
+      }));
+    }
+
+    probeChecks[country].products = 'ok';
     actualByCountry[country] = summarizeVisibility(result.body);
   }
 
