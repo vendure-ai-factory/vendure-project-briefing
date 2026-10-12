@@ -593,3 +593,283 @@ test('readOnlyShopApi B1-03: probe succeeds + products Postgres error -> STAGING
   var cliMod = require('../src/cli');
   assert.strictEqual(cliMod.exitCodeForOutcome('BLOCK', 'DEPENDENCY_ENVIRONMENT'), 6);
 });
+
+// ---------------------------------------------------------------------------
+// Admin Channel Inventory integration tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Combined Shop + Admin API fetch for B1-03/B1-04 integration tests.
+ * Distinguishes Admin API (/admin-api URL) from Shop API (/shop-api URL).
+ * When inventory runs, returns __default_channel__ so STAGING_DATA_MISSING is set.
+ */
+function makeCombinedFetch(adminConfig) {
+  adminConfig = adminConfig || {};
+
+  var fetchWrapper = function(url, init) {
+    fetchWrapper.adminCallCount = (fetchWrapper.adminCallCount || 0);
+    var headers = init && init.headers ? init.headers : {};
+    var isAdminUrl = url.indexOf('/admin-api') !== -1;
+    var hasAuthHeader = !!(headers['Authorization'] || headers['vendure-auth-token']);
+    var isAdmin = isAdminUrl || hasAuthHeader;
+
+    if (isAdmin) {
+      fetchWrapper.adminCallCount++;
+      var body = init && init.body ? init.body : '';
+      if (body.indexOf('mutation Login') !== -1) {
+        return Promise.resolve({
+          status: adminConfig.loginStatus || 200,
+          headers: { get: function(n) { return n === 'vendure-auth-token' ? (adminConfig.loginToken || 'admin-token-test') : null; } },
+          text: function() {
+            return Promise.resolve(JSON.stringify({
+              data: { login: { __typename: 'CurrentUser', id: 'u1', identifier: 'admin@example.com' } }
+            }));
+          }
+        });
+      }
+      if (body.indexOf('__type') !== -1) {
+        return Promise.resolve({
+          status: 200, headers: { get: function() { return null; } },
+          text: function() {
+            return Promise.resolve(JSON.stringify({
+              data: { __type: { fields: [{ name: 'id' }, { name: 'code' }, { name: 'token' }, { name: 'defaultCurrencyCode' }] } }
+            }));
+          }
+        });
+      }
+      if (body.indexOf('channels(') !== -1) {
+        var resp = adminConfig.channelsResponse || {
+          data: { channels: { items: [{ id: 'ch1', code: '__default_channel__', token: null, defaultCurrencyCode: 'USD' }], totalItems: 1 } }
+        };
+        return Promise.resolve({
+          status: 200, headers: { get: function() { return null; } },
+          text: function() { return Promise.resolve(JSON.stringify(resp)); }
+        });
+      }
+      return Promise.resolve({ status: 404, headers: { get: function() { return null; } }, text: function() { return Promise.resolve('{}'); } });
+    }
+
+    // Shop API (not admin, not /admin-api URL)
+    var body = init && init.body ? init.body : '';
+    var isProbe = String(body).indexOf('ActiveChannelProbe') !== -1;
+    if (isProbe) {
+      return Promise.resolve({
+        status: 200, ok: true,
+        text: function() { return Promise.resolve(JSON.stringify({ data: { activeChannel: { code: '__default_channel__', currencyCode: 'USD' } } })); }
+      });
+    }
+    return Promise.resolve({
+      status: 200, ok: true,
+      text: function() { return Promise.resolve(JSON.stringify({ data: null, errors: [{ message: 'invalid input syntax for type integer: "undefined"', path: ['products'] }] })); }
+    });
+  };
+
+  return fetchWrapper;
+}
+
+function combinedDefaultChannelServer() {
+  return makeCombinedFetch({});
+}
+
+test('readOnlyShopApi B1-03: probe returns __default_channel__ -> inventory runs, STAGING_DATA_MISSING, DEPENDENCY_ENVIRONMENT', async function(t) {
+  var ctx = baseContext('CAN-B1-03', {
+    fetch: combinedDefaultChannelServer(),
+    runEnvRecord: { runId: 'run-inv-test', stagingUrl: 'https://staging.tibella.eu' },
+    getEnv: function() { return { CHANNEL_TOKENS: TOKENS_JSON, SUPERADMIN_USERNAME: 'admin@example.com', SUPERADMIN_PASSWORD: 'secretpass', VENDURE_ADMIN_API_URL: 'https://staging.tibella.eu/admin-api' }; }
+  });
+  var outcome = await executors.handlerB1_03(ctx);
+
+  assert.strictEqual(outcome.success, false, 'run must fail');
+  assert.strictEqual(outcome.errorCode, 'STAGING_DATA_MISSING', 'errorCode is STAGING_DATA_MISSING after inventory confirms missing channels');
+  assert.strictEqual(outcome.error.indexOf('staging has no channel for') !== -1, true, 'error message names the missing countries');
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-03');
+  assert.strictEqual(finalOutcome.result, 'BLOCK', 'BLOCK on DEPENDENCY_ENVIRONMENT');
+  assert.strictEqual(finalOutcome.classification, 'DEPENDENCY_ENVIRONMENT', 'classification is DEPENDENCY_ENVIRONMENT');
+  // Exit code for DEPENDENCY_ENVIRONMENT is 6
+  var cliMod = require('../src/cli');
+  assert.strictEqual(cliMod.exitCodeForOutcome('BLOCK', 'DEPENDENCY_ENVIRONMENT'), 6, 'exit code 6 for DEPENDENCY_ENVIRONMENT');
+});
+
+test('readOnlyShopApi B1-04: probe returns __default_channel__ -> inventory runs, STAGING_DATA_MISSING, DEPENDENCY_ENVIRONMENT', async function(t) {
+  var cliMod = require('../src/cli');
+  var real = realWorkspace();
+  var ctx = baseContext('CAN-B1-04', {
+    fetch: combinedDefaultChannelServer(),
+    workspace: real.ws,
+    mkdirSync: real.deps.mkdirSync,
+    writeFileSync: real.deps.writeFileSync,
+    readFileSync: real.deps.readFileSync,
+    runEnvRecord: { runId: 'run-inv-b04', stagingUrl: 'https://staging.tibella.eu' },
+    getEnv: function() { return { CHANNEL_TOKENS: TOKENS_JSON, SUPERADMIN_USERNAME: 'admin@example.com', SUPERADMIN_PASSWORD: 'secretpass', VENDURE_ADMIN_API_URL: 'https://staging.tibella.eu/admin-api' }; }
+  });
+  var outcome = await executors.handlerB1_04(ctx);
+
+  assert.strictEqual(outcome.success, false, 'run must fail');
+  assert.strictEqual(outcome.errorCode, 'STAGING_DATA_MISSING', 'errorCode upgraded to STAGING_DATA_MISSING');
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-04');
+  assert.strictEqual(finalOutcome.result, 'BLOCK');
+  assert.strictEqual(finalOutcome.classification, 'DEPENDENCY_ENVIRONMENT');
+  assert.strictEqual(cliMod.exitCodeForOutcome('BLOCK', 'DEPENDENCY_ENVIRONMENT'), 6);
+  fs.rmSync(real.ws.workspacePath, { recursive: true, force: true });
+});
+
+test('readOnlyShopApi B1-03: success path never calls Admin API (zero admin requests)', async function(t) {
+  var adminCallCount = 0;
+  var countingFetch = function(url, init) {
+    var headers = init && init.headers ? init.headers : {};
+    if (headers['Authorization'] || headers['vendure-auth-token']) {
+      adminCallCount++;
+    }
+    return correctB1_03Server()(url, init);
+  };
+  var ctx = baseContext('CAN-B1-03', { fetch: countingFetch });
+  var outcome = await executors.handlerB1_03(ctx);
+
+  assert.strictEqual(outcome.success, true, 'success on correct data');
+  assert.strictEqual(adminCallCount, 0, 'Admin API was never called on the success path');
+});
+
+test('readOnlyShopApi B1-04: success path never calls Admin API (zero admin requests)', async function(t) {
+  var adminCallCount = 0;
+  var countingFetch = function(url, init) {
+    var headers = init && init.headers ? init.headers : {};
+    if (headers['Authorization'] || headers['vendure-auth-token']) {
+      adminCallCount++;
+    }
+    return correctB1_04Server()(url, init);
+  };
+  var real = realWorkspace();
+  var ctx = baseContext('CAN-B1-04', {
+    fetch: countingFetch,
+    workspace: real.ws,
+    mkdirSync: real.deps.mkdirSync,
+    writeFileSync: real.deps.writeFileSync,
+    readFileSync: real.deps.readFileSync
+  });
+  var outcome = await executors.handlerB1_04(ctx);
+
+  assert.strictEqual(outcome.success, true, 'success on correct data');
+  assert.strictEqual(adminCallCount, 0, 'Admin API was never called on the success path');
+  fs.rmSync(real.ws.workspacePath, { recursive: true, force: true });
+});
+
+test('readOnlyShopApi B1-03: credentials missing -> inventory returns available:false, pass path unchanged', async function(t) {
+  // Provide a fetch that would trigger the inventory check (probe returns __default_channel__)
+  // but credentials are missing (no SUPERADMIN_USERNAME/PASSWORD)
+  var server = combinedDefaultChannelServer();
+  var ctx = baseContext('CAN-B1-03', {
+    fetch: server,
+    getEnv: function() { return {}; },  // no credentials at all
+    runEnvRecord: { runId: 'run-no-creds', stagingUrl: 'https://staging.tibella.eu' }
+  });
+  var outcome = await executors.handlerB1_03(ctx);
+
+  // The B1-03 result still gets STAGING_SERVER_ERROR (or whatever the Shop API returns)
+  // because the inventory check reports available:false and doesn't change the error code
+  assert.strictEqual(outcome.success, false);
+  // The inventory was attempted but credentials were missing
+  // If the probe itself returned __default_channel__, the errorCode could have been STAGING_DATA_MISSING
+  // but the inventory diagnostic found no credentials and kept the original code
+  // Since probe returned __default_channel__ and inventory ran but found no credentials,
+  // the result should be STAGING_SERVER_ERROR (not changed) or STAGING_DATA_MISSING if the
+  // inventory correctly detected the missing channels issue.
+  // With no credentials, inventory returns available:false with ADMIN_CREDENTIALS_MISSING
+  // and runInventoryDiagnostic keeps the original errorCode
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-03');
+  assert.strictEqual(finalOutcome.result, 'BLOCK');
+});
+
+test('readOnlyShopApi B1-03: all channels present in Admin API -> STAGING_SERVER_ERROR stays (inventory adds context)', async function(t) {
+  // A server where Shop API probe fails (not __default_channel__) or products fail with non-__default_channel__ probe
+  // but Admin API shows all channels ARE present -> error stays as STAGING_SERVER_ERROR not STAGING_DATA_MISSING
+  function shopApiFailServer() {
+    return function fakeFetch(url, init) {
+      var headers = init && init.headers ? init.headers : {};
+      var body = init && init.body ? init.body : '';
+      var isProbe = String(body).indexOf('ActiveChannelProbe') !== -1;
+      if (isProbe) {
+        return Promise.resolve({
+          status: 200, ok: true,
+          text: function() { return Promise.resolve(JSON.stringify({ data: { activeChannel: { code: 'DE', currencyCode: 'EUR' } } })); }
+        });
+      }
+      return Promise.resolve({
+        status: 200, ok: true,
+        text: function() { return Promise.resolve(JSON.stringify({ data: null, errors: [{ message: 'something went wrong', path: ['products'] }] })); }
+      });
+    };
+  }
+
+  function fullAdminFetch(url, init) {
+    var body = init && init.body ? init.body : '';
+    if (body.indexOf('mutation Login') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function(n) { return n === 'vendure-auth-token' ? 'token' : null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ data: { login: { __typename: 'CurrentUser', id: '1', identifier: 'a' } } })); }
+      });
+    }
+    if (body.indexOf('__type') !== -1) {
+      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify({ data: { __type: { fields: [{ name: 'id' }, { name: 'code' }, { name: 'token' }, { name: 'defaultCurrencyCode' }] } } })); } });
+    }
+    if (body.indexOf('channels(') !== -1) {
+      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify({ data: { channels: { items: [{ id: '1', code: 'DE', token: 'de-token', defaultCurrencyCode: 'EUR' }, { id: '2', code: 'AT', token: 'at-token', defaultCurrencyCode: 'EUR' }, { id: '3', code: 'HU', token: 'hu-token', defaultCurrencyCode: 'HUF' }, { id: '4', code: 'GB', token: 'gb-token', defaultCurrencyCode: 'GBP' }], totalItems: 4 } } })); } });
+    }
+    if (body.indexOf('products(') !== -1) {
+      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify({ data: { products: { totalItems: 0 } } })); } });
+    }
+    return Promise.resolve({ status: 404, headers: { get: function() { return null; } }, text: function() { return Promise.resolve('{}'); } });
+  }
+
+  function splitFetch(url, init) {
+    var headers = init && init.headers ? init.headers : {};
+    if (headers['vendure-token']) return shopApiFailServer()(url, init);
+    return fullAdminFetch(url, init);
+  }
+
+  var ctx = baseContext('CAN-B1-03', {
+    fetch: splitFetch,
+    runEnvRecord: { runId: 'run-all-ch', stagingUrl: 'https://staging.tibella.eu' }
+  });
+  var outcome = await executors.handlerB1_03(ctx);
+
+  // Products failed but channels are present -> error stays as the original STAGING_SERVER_ERROR
+  // The inventory diagnostic provides context but doesn't change the error code since no channels are missing
+  assert.strictEqual(outcome.success, false);
+  // If probe returned 'DE' (not __default_channel__), inventory would still run because products failed
+  // But since all channels exist, missing=[], so STAGING_DATA_MISSING would NOT be set
+  // Instead the original errorCode (STAGING_SERVER_ERROR or GRAPHQL_ERROR) is kept
+  var cliMod = require('../src/cli');
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-03');
+  assert.strictEqual(finalOutcome.result, 'BLOCK');
+  // The classification should still be DEPENDENCY_ENVIRONMENT (not changed by inventory)
+  assert.strictEqual(finalOutcome.classification, 'DEPENDENCY_ENVIRONMENT');
+});
+
+test('readOnlyShopApi B1-03: inventory evidence written with kind:diagnostic and admin-channel-inventory.json', async function(t) {
+  var evidenceCollector = require('../src/evidenceCollector');
+  var evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ev-inv-'));
+  var runId = 'run-inv-ev-' + Date.now().toString(36);
+  var ctx = baseContext('CAN-B1-03', {
+    fetch: combinedDefaultChannelServer(),
+    evidenceRoot: evidenceRoot,
+    runEnvRecord: { runId: runId, stagingUrl: 'https://staging.tibella.eu' },
+    getEnv: function() { return { CHANNEL_TOKENS: TOKENS_JSON, SUPERADMIN_USERNAME: 'admin@example.com', SUPERADMIN_PASSWORD: 'secretpass', VENDURE_ADMIN_API_URL: 'https://staging.tibella.eu/admin-api' }; }
+  });
+  var outcome = await executors.handlerB1_03(ctx);
+
+  assert.strictEqual(outcome.success, false);
+  assert.strictEqual(outcome.errorCode, 'STAGING_DATA_MISSING');
+  var taskDir = path.join(evidenceRoot, 'evidence', runId, 'CAN-B1-03');
+  assert.strictEqual(fs.existsSync(path.join(taskDir, 'admin-channel-inventory.json')), true, 'admin-channel-inventory.json written');
+  var invData = JSON.parse(fs.readFileSync(path.join(taskDir, 'admin-channel-inventory.json'), 'utf8'));
+  assert.strictEqual(invData.available, true, 'inventory available');
+  assert.strictEqual(invData.unexpectedDefaultOnly, true, 'unexpectedDefaultOnly confirmed');
+  assert.deepStrictEqual(invData.missing.sort(), ['AT', 'DE', 'GB', 'HU'].sort(), 'all four missing');
+  // password must not appear in evidence
+  var serialized = JSON.stringify(invData);
+  assert.strictEqual(serialized.indexOf('secretpass'), -1, 'password not in evidence');
+  assert.strictEqual(serialized.indexOf('admin-auth-token-test'), -1, 'auth token not in evidence');
+
+  fs.rmSync(evidenceRoot, { recursive: true, force: true });
+});

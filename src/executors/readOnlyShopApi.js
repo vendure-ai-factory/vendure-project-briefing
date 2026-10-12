@@ -45,8 +45,14 @@ var crypto = require('crypto');
 var path = require('path');
 var terminalState = require('../terminalState');
 var evidenceCollector = require('../evidenceCollector');
+var adminChannelInventory = require('./adminChannelInventory');
 
 var RESULT_PASS = terminalState.RESULT_PASS;
+
+// Set by runInventoryDiagnostic whenever the channel inventory diagnostic runs
+// on a failure path, so the executor-error.json entry can include a short
+// summary without touching every evidence write site. Never holds secrets.
+var lastInventorySummary = null;
 
 var COUNTRY_CURRENCY_MAP = {
   DE: 'EUR',
@@ -490,6 +496,157 @@ function extractActiveCurrency(body) {
 }
 
 /**
+ * Extract the activeChannel.code from a probe response body.
+ * Returns null if unavailable.
+ */
+function extractActiveChannelCode(body) {
+  if (!body) return null;
+  if (body.errors && body.errors.length > 0) return null;
+  var data = body.data || body;
+  if (data && data.activeChannel && typeof data.activeChannel.code === 'string') {
+    return data.activeChannel.code;
+  }
+  return null;
+}
+
+/**
+ * Returns true when the Shop API probe returned __default_channel__,
+ * which is the symptom of a staging DB that has only the default channel.
+ * Also returns true if the products failure indicates a staging data problem
+ * (the specific "invalid input syntax for type integer" error that appears
+ * when channels/catalog are missing).
+ */
+function shouldRunInventoryCheck(probeResult, productsResult) {
+  if (!probeResult || !probeResult.body) return false;
+  var channelCode = extractActiveChannelCode(probeResult.body);
+  if (channelCode === '__default_channel__') return true;
+  if (productsResult && productsResult.body) {
+    var body = productsResult.body;
+    if (body && body.errors && Array.isArray(body.errors)) {
+      for (var i = 0; i < body.errors.length; i++) {
+        var msg = body.errors[i] && body.errors[i].message ? body.errors[i].message : '';
+        if (msg.indexOf('invalid input syntax for type integer') !== -1 ||
+            msg.indexOf('undefined') !== -1) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Run the Admin API channel inventory diagnostic and write its evidence.
+ * Returns the inventory result object (never throws).
+ *
+ * On the failure path: updates result.errorCode to STAGING_DATA_MISSING and
+ * augments the error message when channels are actually missing.
+ *
+ * @param {object} context
+ * @param {string} taskId
+ * @param {object} result  - the current failure result to be modified
+ * @param {object} tokensResult - resolved channel tokens from resolveChannelTokens()
+ * @param {string} shopApiBase - resolved Shop API base URL
+ * @param {object} options - {probeResult, productsResult, secrets}
+ * @returns {Promise<object>} updated failure result
+ */
+async function runInventoryDiagnostic(context, taskId, result, tokensResult, shopApiBase, options) {
+  options = options || {};
+  var probeResult = options.probeResult || null;
+  var productsResult = options.productsResult || null;
+  var existingSecrets = options.secrets || [];
+
+  var stagingUrl = shopApiBase ? shopApiBase.replace(/\/shop-api\/?$/, '') : null;
+  var inventoryResult = await adminChannelInventory.collectChannelInventory(context, {
+    stagingUrl: stagingUrl,
+    tokensResult: tokensResult,
+    shopApiBase: shopApiBase
+  });
+
+  // Combine all secrets: existing channel tokens + password + auth token.
+  var allSecrets = existingSecrets.slice();
+  if (inventoryResult.secrets && Array.isArray(inventoryResult.secrets)) {
+    for (var si = 0; si < inventoryResult.secrets.length; si++) {
+      var s = inventoryResult.secrets[si];
+      if (s && allSecrets.indexOf(s) === -1) allSecrets.push(s);
+    }
+  }
+
+  // Write the admin-channel-inventory.json evidence (kind: diagnostic).
+  var inventoryEvidence = {
+    taskId: taskId,
+    available: inventoryResult.available,
+    reason: inventoryResult.reason,
+    channels: inventoryResult.available ? inventoryResult.channels : null,
+    expected: inventoryResult.available ? inventoryResult.expected : null,
+    perCountry: inventoryResult.available ? inventoryResult.perCountry : null,
+    missing: inventoryResult.missing || [],
+    unexpectedDefaultOnly: inventoryResult.unexpectedDefaultOnly || false,
+    perChannelProductCounts: inventoryResult.perChannelProductCounts || [],
+    credentialNames: inventoryResult.credentialNames || null,
+    introspectedFields: inventoryResult.introspectedFields || [],
+    timestamp: inventoryResult.timestamp,
+    callCount: inventoryResult.callCount || 0,
+    adminApiBase: adminChannelInventory.resolveAdminApiBase(context)
+  };
+
+  writeExecutorEvidence(context, taskId, [
+    { name: 'admin-channel-inventory.json', data: inventoryEvidence, kind: 'diagnostic' }
+  ], allSecrets);
+
+  // If the inventory is unavailable or admin login failed, keep the existing
+  // STAGING_SERVER_ERROR behaviour; just record the reason in evidence.
+  if (!inventoryResult.available) {
+    lastInventorySummary = { available: false, reason: inventoryResult.reason };
+    result.evidence = result.evidence || {};
+    result.evidence.adminInventory = {
+      available: false,
+      reason: inventoryResult.reason,
+      error: inventoryResult.error || null
+    };
+    return result;
+  }
+
+  // Inventory is available: check for missing channels.
+  var missing = inventoryResult.missing || [];
+  lastInventorySummary = {
+    available: true,
+    missing: missing,
+    unexpectedDefaultOnly: !!inventoryResult.unexpectedDefaultOnly
+  };
+  if (missing.length > 0 || inventoryResult.unexpectedDefaultOnly) {
+    // Upgrade error code to STAGING_DATA_MISSING so it maps to DEPENDENCY_ENVIRONMENT.
+    result.errorCode = 'STAGING_DATA_MISSING';
+    result.error = 'staging has no channel for: ' + missing.join(', ') + ' (only __default_channel__ found)';
+    result.evidence = result.evidence || {};
+    result.evidence.adminInventory = {
+      available: true,
+      missing: missing,
+      unexpectedDefaultOnly: inventoryResult.unexpectedDefaultOnly,
+      perCountry: inventoryResult.perCountry
+    };
+  } else {
+    // Channels exist but something else failed; record inventory for context.
+    result.evidence = result.evidence || {};
+    result.evidence.adminInventory = {
+      available: true,
+      missing: [],
+      unexpectedDefaultOnly: false,
+      perCountry: inventoryResult.perCountry
+    };
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Evidence helpers
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Evidence helpers
+// ---------------------------------------------------------------------------
+/**
  * Inspect a Shop API response for GraphQL errors and classify them so an
  * invalid query (our own bug) is never mislabeled as client input or as a
  * plain environment error.
@@ -575,12 +732,13 @@ function buildTokenDiagnostics(tokensResult) {
  * the no-secret token diagnostics plus the per-country probe outcomes so a
  * "probe: ok, products: failed" split is visible in one run.
  */
-function executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets) {
+function executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets, inventorySummary) {
   var payload = {
     taskId: taskId,
     tokenDiagnostics: buildTokenDiagnostics(tokensResult),
     probes: probeChecks || {}
   };
+  if (inventorySummary) payload.adminInventorySummary = inventorySummary;
   return { name: 'executor-error.json', data: payload, kind: 'executor-error' };
 }
 
@@ -678,6 +836,7 @@ function isWorkspaceWritable(context) {
  */
 async function handlerB1_03(context) {
   context = context || {};
+  lastInventorySummary = null;
   var task = context.task || {};
   var taskId = task.canonicalId || (context.taskId || 'CAN-B1-03');
   var fetchFn = getFetch(context);
@@ -711,6 +870,7 @@ async function handlerB1_03(context) {
   var actualByCountry = {};
   var mismatches = [];
   var probeChecks = {};
+  var inventoryRan = false;
 
   for (var i = 0; i < COUNTRIES.length; i++) {
     var country = COUNTRIES[i];
@@ -756,12 +916,26 @@ async function handlerB1_03(context) {
         actual: { countryCurrencyMap: actualByCountry },
         completedAt: timestamp
       };
+      if (!inventoryRan && shouldRunInventoryCheck(probeResult, null)) {
+        inventoryRan = true;
+        var probeFailResult = failureResult({
+          errorCode: probeGql ? probeGql.errorCode : 'ENVIRONMENT_ERROR',
+          error: probeErr,
+          evidence: probeEvidence
+        });
+        probeFailResult = await runInventoryDiagnostic(context, taskId, probeFailResult, tokensResult, baseUrl, {
+          probeResult: probeResult,
+          productsResult: null,
+          secrets: secrets
+        });
+        probeEvidence = probeFailResult.evidence;
+      }
       writeExecutorEvidence(context, taskId, [
         { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
         { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
         { name: 'country-table.json', data: { table: table }, kind: 'table' },
         { name: 'expected-vs-actual.json', data: { expected: COUNTRY_CURRENCY_MAP, actual: actualByCountry, error: probeErr }, kind: 'assertion' },
-        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets, lastInventorySummary)
       ], secrets);
       return finalizeWithCleanup(context, task, failureResult({
         errorCode: probeGql ? probeGql.errorCode : 'ENVIRONMENT_ERROR',
@@ -813,12 +987,28 @@ async function handlerB1_03(context) {
         actual: { countryCurrencyMap: actualByCountry },
         completedAt: timestamp
       };
+      if (!inventoryRan && shouldRunInventoryCheck(probeResult, result)) {
+        inventoryRan = true;
+        var productsFailResult = failureResult({
+          errorCode: failureCode,
+          error: envError,
+          evidence: envEvidence
+        });
+        productsFailResult = await runInventoryDiagnostic(context, taskId, productsFailResult, tokensResult, baseUrl, {
+          probeResult: probeResult,
+          productsResult: result,
+          secrets: secrets
+        });
+        envEvidence = productsFailResult.evidence;
+        failureCode = productsFailResult.errorCode;
+        envError = productsFailResult.error;
+      }
       writeExecutorEvidence(context, taskId, [
         { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
         { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
         { name: 'country-table.json', data: { table: table }, kind: 'table' },
         { name: 'expected-vs-actual.json', data: { expected: COUNTRY_CURRENCY_MAP, actual: actualByCountry, error: envError }, kind: 'assertion' },
-        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets, lastInventorySummary)
       ], secrets);
       return finalizeWithCleanup(context, task, failureResult({
         errorCode: failureCode,
@@ -842,16 +1032,32 @@ async function handlerB1_03(context) {
         actual: { countryCurrencyMap: actualByCountry },
         completedAt: timestamp
       };
+      if (!inventoryRan && shouldRunInventoryCheck(probeResult, result)) {
+        inventoryRan = true;
+        var gqlFailResult = failureResult({
+          errorCode: resultGql.errorCode,
+          error: errMsg,
+          evidence: graphQLEvidence
+        });
+        gqlFailResult = await runInventoryDiagnostic(context, taskId, gqlFailResult, tokensResult, baseUrl, {
+          probeResult: probeResult,
+          productsResult: result,
+          secrets: secrets
+        });
+        if (gqlFailResult) {
+          graphQLEvidence = gqlFailResult.evidence;
+        }
+      }
       writeExecutorEvidence(context, taskId, [
         { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
         { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
         { name: 'country-table.json', data: { table: table }, kind: 'table' },
-        { name: 'expected-vs-actual.json', data: { expected: COUNTRY_CURRENCY_MAP, actual: actualByCountry, error: errMsg }, kind: 'assertion' },
-        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
+        { name: 'expected-vs-actual.json', data: { expected: COUNTRY_CURRENCY_MAP, actual: actualByCountry, error: (gqlFailResult && gqlFailResult.error) ? gqlFailResult.error : errMsg }, kind: 'assertion' },
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets, lastInventorySummary)
       ], secrets);
       return finalizeWithCleanup(context, task, failureResult({
-        errorCode: resultGql.errorCode,
-        error: errMsg,
+        errorCode: (gqlFailResult && gqlFailResult.errorCode) ? gqlFailResult.errorCode : resultGql.errorCode,
+        error: (gqlFailResult && gqlFailResult.error) ? gqlFailResult.error : errMsg,
         evidence: graphQLEvidence
       }));
     }
@@ -946,6 +1152,7 @@ async function handlerB1_03(context) {
  */
 async function handlerB1_04(context) {
   context = context || {};
+  lastInventorySummary = null;
   var task = context.task || {};
   var taskId = task.canonicalId || (context.taskId || 'CAN-B1-04');
   var fetchFn = getFetch(context);
@@ -985,6 +1192,7 @@ async function handlerB1_04(context) {
   var rawResponses = [];
   var actualByCountry = {};
   var probeChecks = {};
+  var inventoryRan = false;
 
   for (var i = 0; i < COUNTRIES.length; i++) {
     var country = COUNTRIES[i];
@@ -1015,21 +1223,36 @@ async function handlerB1_04(context) {
     if (probeGql || !probeResult.ok) {
       var probeErr = probeGql ? gqlErrorMessage(probeGql)
         : ('shop-api probe for ' + country + ' failed with HTTP ' + (probeResult.httpStatus === null ? 'network error' : probeResult.httpStatus));
+      var b04ProbeEvidence = {
+        taskId: taskId,
+        rawRequests: rawRequests,
+        rawResponses: rawResponses,
+        graphQLError: probeGql ? { code: probeGql.extensionsCode, path: probeGql.path, message: probeGql.message } : null,
+        completedAt: timestamp
+      };
+      if (!inventoryRan && shouldRunInventoryCheck(probeResult, null)) {
+        inventoryRan = true;
+        var b04ProbeFailResult = failureResult({
+          errorCode: probeGql ? probeGql.errorCode : 'ENVIRONMENT_ERROR',
+          error: probeErr,
+          evidence: b04ProbeEvidence
+        });
+        b04ProbeFailResult = await runInventoryDiagnostic(context, taskId, b04ProbeFailResult, tokensResult, baseUrl, {
+          probeResult: probeResult,
+          productsResult: null,
+          secrets: secrets
+        });
+        b04ProbeEvidence = b04ProbeFailResult.evidence;
+      }
       writeExecutorEvidence(context, taskId, [
         { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
         { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
-        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets, lastInventorySummary)
       ], secrets);
       return finalizeWithCleanup(context, task, failureResult({
         errorCode: probeGql ? probeGql.errorCode : 'ENVIRONMENT_ERROR',
         error: probeErr,
-        evidence: {
-          taskId: taskId,
-          rawRequests: rawRequests,
-          rawResponses: rawResponses,
-          graphQLError: probeGql ? { code: probeGql.extensionsCode, path: probeGql.path, message: probeGql.message } : null,
-          completedAt: timestamp
-        }
+        evidence: b04ProbeEvidence
       }));
     }
 
@@ -1060,21 +1283,38 @@ async function handlerB1_04(context) {
           (result.httpStatus === null ? 'network error' : result.httpStatus) +
           (result.networkError ? ' (' + result.networkError + ')' : ''));
       probeChecks[country].products = 'failed';
+      var b04EnvEvidence = {
+        taskId: taskId,
+        rawRequests: rawRequests,
+        rawResponses: rawResponses,
+        graphQLError: resultGql ? { code: resultGql.extensionsCode, path: resultGql.path, message: resultGql.message } : null,
+        completedAt: timestamp
+      };
+      if (!inventoryRan && shouldRunInventoryCheck(probeResult, result)) {
+        inventoryRan = true;
+        var b04ProductsFailResult = failureResult({
+          errorCode: failureCode,
+          error: envError,
+          evidence: b04EnvEvidence
+        });
+        b04ProductsFailResult = await runInventoryDiagnostic(context, taskId, b04ProductsFailResult, tokensResult, baseUrl, {
+          probeResult: probeResult,
+          productsResult: result,
+          secrets: secrets
+        });
+        b04EnvEvidence = b04ProductsFailResult.evidence;
+        failureCode = b04ProductsFailResult.errorCode;
+        envError = b04ProductsFailResult.error;
+      }
       writeExecutorEvidence(context, taskId, [
         { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
         { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
-        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets, lastInventorySummary)
       ], secrets);
       return finalizeWithCleanup(context, task, failureResult({
         errorCode: failureCode,
         error: envError,
-        evidence: {
-          taskId: taskId,
-          rawRequests: rawRequests,
-          rawResponses: rawResponses,
-          graphQLError: resultGql ? { code: resultGql.extensionsCode, path: resultGql.path, message: resultGql.message } : null,
-          completedAt: timestamp
-        }
+        evidence: b04EnvEvidence
       }));
     }
 
@@ -1082,21 +1322,36 @@ async function handlerB1_04(context) {
       // HTTP 200 with GraphQL errors: staging server runtime failure, never a pass.
       var gqlErrMsg = gqlErrorMessage(resultGql);
       probeChecks[country].products = 'failed';
+      var b04GqlEvidence = {
+        taskId: taskId,
+        rawRequests: rawRequests,
+        rawResponses: rawResponses,
+        graphQLError: { code: resultGql.extensionsCode, path: resultGql.path, message: resultGql.message },
+        completedAt: timestamp
+      };
+      if (!inventoryRan && shouldRunInventoryCheck(probeResult, result)) {
+        inventoryRan = true;
+        var b04GqlFailResult = failureResult({
+          errorCode: resultGql.errorCode,
+          error: gqlErrMsg,
+          evidence: b04GqlEvidence
+        });
+        b04GqlFailResult = await runInventoryDiagnostic(context, taskId, b04GqlFailResult, tokensResult, baseUrl, {
+          probeResult: probeResult,
+          productsResult: result,
+          secrets: secrets
+        });
+        if (b04GqlFailResult) b04GqlEvidence = b04GqlFailResult.evidence;
+      }
       writeExecutorEvidence(context, taskId, [
         { name: 'shop-api-requests.json', data: { rawRequests: redactDeep(rawRequests, secrets) }, kind: 'api-request' },
         { name: 'shop-api-responses.json', data: { rawResponses: redactDeep(rawResponses, secrets) }, kind: 'api-response' },
-        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets)
+        executorErrorEntry(context, taskId, tokensResult, probeChecks, secrets, lastInventorySummary)
       ], secrets);
       return finalizeWithCleanup(context, task, failureResult({
-        errorCode: resultGql.errorCode,
-        error: gqlErrMsg,
-        evidence: {
-          taskId: taskId,
-          rawRequests: rawRequests,
-          rawResponses: rawResponses,
-          graphQLError: { code: resultGql.extensionsCode, path: resultGql.path, message: resultGql.message },
-          completedAt: timestamp
-        }
+        errorCode: (b04GqlFailResult && b04GqlFailResult.errorCode) ? b04GqlFailResult.errorCode : resultGql.errorCode,
+        error: (b04GqlFailResult && b04GqlFailResult.error) ? b04GqlFailResult.error : gqlErrMsg,
+        evidence: b04GqlEvidence
       }));
     }
 

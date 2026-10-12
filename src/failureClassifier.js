@@ -43,6 +43,7 @@ function classifyErrorCode(errorCode) {
       return FAILURE_CATEGORIES.PIPELINE_DEFECT;
     case 'STAGING_SERVER_ERROR':
     case 'GRAPHQL_ERROR':
+    case 'STAGING_DATA_MISSING':
       return FAILURE_CATEGORIES.DEPENDENCY_ENVIRONMENT;
     case 'UNKNOWN_TOOL':
     case 'EXECUTION_ERROR':

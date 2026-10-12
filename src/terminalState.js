@@ -30,6 +30,8 @@
  *                             Shop API schema; e.g. a field that does not exist)
  *     STAGING_SERVER_ERROR -> DEPENDENCY_ENVIRONMENT (HTTP 200 with a resolver
  *                             or runtime GraphQL error from the staging server)
+ *     STAGING_DATA_MISSING -> DEPENDENCY_ENVIRONMENT (staging DB is missing the
+ *                             expected channels, confirmed via Admin API)
  *     GRAPHQL_ERROR        -> DEPENDENCY_ENVIRONMENT (fallback so a code-less
  *                             GraphQL error never falls through to the message
  *                             regex which can mislabel "invalid" as client input)
@@ -147,11 +149,12 @@ function classifyByErrorCode(errorCode, errorMessage) {
       );
     case 'STAGING_SERVER_ERROR':
     case 'GRAPHQL_ERROR':
+    case 'STAGING_DATA_MISSING':
       return buildClassification(
         FAILURE_CLASSES.DEPENDENCY_ENVIRONMENT,
         errorMessage || 'Staging server error: ' + errorCode,
         { errorCode: errorCode },
-        'errorCode:STAGING_SERVER_ERROR|GRAPHQL_ERROR -> DEPENDENCY_ENVIRONMENT'
+        'errorCode:STAGING_SERVER_ERROR|GRAPHQL_ERROR|STAGING_DATA_MISSING -> DEPENDENCY_ENVIRONMENT'
       );
     case 'UNKNOWN_TOOL':
     case 'EXECUTION_ERROR':
