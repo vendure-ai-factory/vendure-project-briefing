@@ -72,15 +72,11 @@ staging 源码仓库和部署凭据由项目方控制。承包商运行公开 de
 
 如果任务依赖 staging 域名、持久化数据、代理、VPS 身份或资源限制，GitHub Actions 通过不能替代 staging 结果。压测和红队工作必须有书面范围、测试窗口、速率限制、清理方案和明确授权，绝不能针对 production。
 
-## 6. 临时访问规则
+## 6. 临时访问规则与当前例外
 
-如果项目方决定让承包商直接操作正式 staging 测试，应分开授予以下临时权限：
+本指南的默认做法仍是按任务授予最低必要权限；但本项目因流水线开发已明显超期，项目方已专门批准 Maleeha 在当前 staging/Runner 沙盒内自主开发、调试和运行测试，以减少逐项审批造成的等待。该例外只适用于 Maleeha 和当前测试沙盒，不是其他承包商的默认权限；准确范围及合作结束后的撤权清单见第 10 节。
 
-1. 只有在确实需要源码时，才授予限于约定仓库和分支或 PR 流程的 GitHub 身份；
-2. 只具有最低必要权限的 staging 测试账号；
-3. 明确的任务卡、测试窗口、速率限制和清理方法。
-
-不得向承包商提供 production 权限、VPS SSH/root、无限制 Docker 或 self-hosted runner、数据库/Redis 权限、仓库 secrets、私钥或部署文件中的凭据。约定工作或验收窗口结束后撤销权限。
+当前 VPS 不承载 production。未来 production 将使用另一台独立 VPS；Maleeha 不获准访问未来 production 主机或 minipc。不要把当前 staging 沙盒权限复制到生产环境。
 
 ## 7. 交付证据要求
 
@@ -119,7 +115,7 @@ staging 源码仓库和部署凭据由项目方控制。承包商运行公开 de
 - `/opt/pipeline-archive` 是受控共享归档/证据目录，所有者为 `root:pipeline-archive`，权限 `2770`。Runner 用户和 staging 非 root `node` 用户都通过写入测试。它挂载到 staging API/worker，但不是数据库卷或 secret 卷。
 - Runner 不加入 `nail-staging-internal`，也不挂载 staging PostgreSQL/Redis 数据卷；访问 staging 必须使用批准的 HTTPS/API 入口或明确批准的适配器。
 
-公开评估工作流仍使用 GitHub 托管的 `ubuntu-latest`。公开 Pull Request 不得把任意代码放到这台 self-hosted Runner 上执行。staging 工作流必须受仓库 Environment 和分支/PR 控制保护。
+公开评估工作流仍使用 GitHub 托管的 `ubuntu-latest`；公开 Pull Request 不会自动在这台 self-hosted Runner 上运行任意代码。当前 staging workflow 通过 `workflow_dispatch` 手动启动，workflow 逻辑只允许 `main` 和 `codex/maleeha-pipeline` 两个 ref。GitHub `staging` Environment 当前没有 Required reviewers，部署分支为 No restriction。`vendure-project-briefing/main` 的公开仓库 PR 规则有效；另外三个私有仓库虽配置了分支规则，但当前 GitHub 方案不强制执行，不能把它们视为有效的审批或禁止直推屏障。Maleeha 另有单独的 VPS 主机管理员身份，详见第 10 节；这不改变 Runner 服务本身以 `gha-runner` 非特权账号运行的事实。
 
 ### 8.3 受控 PostgreSQL gateway
 
@@ -133,10 +129,10 @@ staging 源码仓库和部署凭据由项目方控制。承包商运行公开 de
 
 ### 8.4 可审计运维入口和身份状态
 
-- `/usr/local/sbin/pipeline-debug-status` 是受限只读状态入口，报告主机资源、staging Compose、staging health、Runner 状态和有限的 Runner journal 尾部；
-- `/usr/local/sbin/pipeline-debug-runner-restart` 只能重启指定 Runner 服务，并通过 syslog 记录；
-- 两个 wrapper 只通过空的 `pipeline-debug` 组和 `/etc/sudoers.d/90-pipeline-debug-ops` 提供；
-- `maleeha-debug` Linux 调试身份现已建立，SSH 使用 Maleeha 提供的公钥，并由受限登录入口控制；只允许受控状态/日志查看及重启专用 Runner 服务。其 sudo 仅限两个经审计 wrapper，不属于 rootful `docker` 组，也没有通用 root、数据库、Redis 或 production 权限。该身份与 Vendure 后台账号是两个不同系统层级的身份。
+- `/usr/local/sbin/pipeline-debug-status` 与 `/usr/local/sbin/pipeline-debug-runner-restart` 仍是项目方保留的状态查看/Runner 重启入口；它们不再是 Maleeha 当前权限的上限。
+- 按 2026-10-13 权限变更记录，`maleeha-debug` 使用 Maleeha 提供的个人 SSH 公钥登录，拥有交互式 SSH、无限制 sudo，并加入 rootful `docker` 组。因此其权限实质等同于当前 VPS 沙盒的主机管理员：可管理该机上的 staging、Runner、容器、数据库及系统配置，而非只操作一个隔离容器。
+- 该身份只适用于当前非生产 VPS；不包括未来独立 production VPS 或 minipc。Maleeha 的 Linux/VPS 身份与 Vendure 后台管理员账号属于不同系统层级。
+- 本节对 VPS 权限的描述依据既有实施记录；本次更新只读核验了 GitHub 页面，没有使用 Maleeha 的私钥重新登录 VPS。不得在文档中记录 SSH 私钥、密码或 API key 的值。
 
 ### 8.5 备份、回滚和当前结果
 
@@ -150,7 +146,7 @@ VPS 上保留 root-only 回滚标记：`/root/vps-pre-formal-config-latest.path`
 4. 受控 PostgreSQL gateway 通过允许路径测试，并拒绝负面测试；
 5. 公开工作流边界、production 分离和“不修改 minipc”规则保持不变。
 
-仍待完成、不能报告为 PASS：受保护 staging Environment 的审核人/分支限制、完整出站域名 allowlist、实际定制 Pipeline workflow、业务 E2E、压测和获准红队测试。Maleeha 的 SSH 公钥身份已接入，但不改变上述未完成项。当前基础设施结果为 `STAGING_RUNNER_INFRASTRUCTURE_READY`，不是 Pipeline 最终验收。
+截至 2026-10-13，GitHub 协作者角色、Environment 审核人/分支设置和 workflow 允许的 ref 已按第 10 节核对；这只确认权限/入口配置，不代表任务已通过。仍待完成、不能报告为 PASS：完整出站域名 allowlist 的实际强制验证、流水线正式长链运行、Batch 1/Batch 2 业务验收、压测及获准红队测试。当前基础设施结果为 `STAGING_RUNNER_INFRASTRUCTURE_READY`，不是 Pipeline 最终验收。
 
 ## 9. 2026-10-11 Vendure staging 管理员账号
 
@@ -159,3 +155,45 @@ VPS 上保留 root-only 回滚标记：`/root/vps-pre-formal-config-latest.path`
 - 登录凭据由项目方通过批准的私下渠道另行提供；密码不写入本指南、GitHub 仓库、日志或公开工件。请勿将凭据粘贴到代码或任务报告。
 - 本次验证了新账号的 Admin API 登录、管理员记录和角色；staging health 与 Dashboard 页面也正常。此记录不代表 Pipeline 已完成或业务任务已通过。
 - 如果 GitHub Actions 后续确实需要该账号，需另行由项目方将凭据放入受保护的 GitHub Environment secrets；本次没有创建或更新这些 secrets。
+
+
+## 10. 2026-10-13 Maleeha 权限授权记录与合作结束撤权清单
+
+项目方为减少超期开发中的逐项审批等待，已授权 Maleeha 在指定 GitHub 仓库和当前 staging/Runner 沙盒内自主修改、调试、合并迭代并运行获准测试。以下 GitHub 设置于 2026-10-13 在已登录页面核对；VPS 权限取自此前实施记录，本次没有用 Maleeha 私钥登录复测。本文不包含任何秘密值。
+
+### 10.1 GitHub 仓库与分支操作权限
+
+GitHub 账号 `Maleehaa06` 是直接协作者，不是组织 Owner：
+
+| 仓库 | 当前角色 | 可进行的项目操作 |
+|---|---|---|
+| `vendure-project-briefing` | Write | 修改流水线工作流、代码和项目文档；在有效规则允许下创建 PR、启动 workflow 并迭代 |
+| `pipeline-contract` | Write | 修改流水线代码/契约并提交 |
+| `vendure-staging-baseline` | Write | 修改 staging Vendure 源码并提交 |
+| `vendure-base-reference` | Write | 修改 Vendure 底座参考源码并提交 |
+| `vendure-evaluation-input` | Read | 查看固定验收输入；不能直接改写 |
+
+分支规则的实际生效情况：
+
+- `vendure-project-briefing/main` 是公开仓库：PR、解决讨论、0 个必需审批、禁止强推/删除的规则有效；不需要项目方逐次批准，Maleeha 可以满足规则后自行合并。
+- `pipeline-contract/main`、`vendure-base-reference/main` 和 `vendure-staging-baseline/codex/staging-vendure-3.7.3` 是私有仓库：虽配置了 PR、0 审批、禁止强推/删除，但当前 GitHub 方案不会强制执行这些规则。因此不能声称它们能阻止直推或提供有效保护；Maleeha 的 Write 角色可能允许直接推送/合并。
+- GitHub `staging` Environment 当前没有 Required reviewers，部署分支设为 No restriction。staging workflow 用 `workflow_dispatch` 手动启动，代码只允许 `main` 和 `codex/maleeha-pipeline` 两个 ref。Maleeha 可以在允许的 ref 上启动获准运行，不必先把流水线合并到 `main`。
+- Environment secrets 不会因 Write 角色而在设置页显示为明文，但能修改 workflow 并启动获准 Runner 作业意味着相关测试秘密可能被执行代码使用；只可放 staging/test 凭据，绝不放 production 凭据。
+
+### 10.2 当前 VPS 沙盒权限
+
+当前 VPS 只用于 staging 和 Runner；未来 production 使用另一台独立 VPS，minipc 也不在授权范围内。按既有实施记录，`maleeha-debug` 具有 SSH 登录、无限制 sudo 和 rootful Docker 权限，等同当前这台 VPS 的主机管理员，可以自行检查/改动该机上的 Runner、staging、容器、数据库与系统配置。Runner 服务仍以非特权 `gha-runner` 用户运行，但这不构成对主机管理员账号的隔离。Vendure 后台账号是单独的应用层身份；如需 Maleeha 实际登录后台，仍需确认其凭据是否已另行交付，不能把“账号已创建”误写成“承包商已拿到登录权”。
+
+### 10.3 合作结束后的撤权与核验
+
+先保留已验收代码、PR/commit、workflow run、报告及需要复用的测试夹具，然后按顺序执行：
+
+1. **撤销 GitHub 身份：**移除 `Maleehaa06` 在上述五个仓库的直接角色；检查 team/org 继承授权、待处理邀请、deploy key、临时集成和项目方创建的 token，并一并清理。保存所需 PR、分支、workflow 与证据记录。
+2. **关闭 VPS 登录：**锁定/删除 `maleeha-debug`，移除其 `authorized_keys` 公钥、sudoers 规则、`docker`/其他授权组成员关系和 SSH 配置引用；终止现有 SSH 会话并验证新登录失败。
+3. **检查主机级持久化：**由于该身份有主机管理员权限，仅删账号不足以证明无残留。核查新用户/SSH key、sudoers、systemd service/timer、cron、Runner 注册和配置、启动项、Docker 容器/镜像/卷/网络、监听端口/防火墙规则及 staging 配置差异。若发现无法解释或无法验证的持久化改动，从可信基线重建 staging/Runner 后再恢复所需数据。
+4. **回收 Runner 与工作流控制：**检查是否有新增 Runner 注册、服务、令牌或工作流入口；撤销/轮换 Runner 注册凭据，必要时由项目方身份重新注册；审阅并保留正式交付所需工作流，删除临时权限和不再需要的入口。
+5. **撤销应用账号：**禁用/删除专用 Vendure staging 管理员（例如 `maleeha-staging@invalid.example`，若仍存在），轮换可能暴露的 staging SuperAdmin 密码；按证据保留要求清理临时账号/数据，同时保留需要的固定验收夹具。
+6. **轮换测试凭据：**撤销或轮换 Maleeha/其工作流可使用过的 Stripe test key、OpenRouter key、GitHub Environment secrets、staging 管理员、数据库及其他临时凭据。production 凭据不得复用。
+7. **完成关闭核验：**记录执行人、时间和结果；确认 GitHub 无访问、SSH 被拒、旧凭据失效、Runner 由项目方身份运行、staging health 和必要测试正常。未解释的主机差异不得标记为“已清洁”。
+
+本节记录的是已批准/已实施的权限边界和未来离场步骤；更新文档本身没有改变 GitHub 角色、VPS 账号、SSH key、Runner、secrets 或业务状态。
