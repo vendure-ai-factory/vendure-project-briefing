@@ -99,7 +99,7 @@ function hasText(v) {
  */
 function parseArgs(argv) {
   argv = argv || [];
-  var out = { mode: null, environment: null, stagingUrl: null, shopApiUrl: null, archiveDir: null, taskIds: [] };
+  var out = { mode: null, environment: null, stagingUrl: null, shopApiUrl: null, archiveDir: null, taskIds: [], seedTestData: false, seedDryRun: false };
   var i = 0;
   while (i < argv.length) {
     var a = argv[i];
@@ -116,6 +116,16 @@ function parseArgs(argv) {
       else if (a === '--archive-dir') out.archiveDir = val;
       else if (a === '--shop-api-url') out.shopApiUrl = val;
       else if (a === '--task') out.taskIds.push(val);
+      continue;
+    }
+    if (a === '--seed-test-data') {
+      out.seedTestData = true;
+      i++;
+      continue;
+    }
+    if (a === '--seed-dry-run') {
+      out.seedDryRun = true;
+      i++;
       continue;
     }
     if (String(a).charAt(0) === '-') {
@@ -205,6 +215,8 @@ function resolveConfig(deps) {
     mode: mode,
     task: env.PIPELINE_TASK || DEFAULT_TASK,
     taskIds: Array.isArray(parsed.taskIds) ? parsed.taskIds.slice() : [],
+    seedTestData: !!parsed.seedTestData,
+    seedDryRun: !!parsed.seedDryRun,
     stagingUrl: stagingUrl,
     shopApiUrl: shopApiUrl,
     environment: hasText(parsed.environment) ? parsed.environment : (env.PIPELINE_ENVIRONMENT || null),
@@ -763,7 +775,7 @@ function resolvePipelineRunId(cfg) {
   return { runId: cfg.runId, source: 'injected-unconfirmed' };
 }
 
-function writeAggregatedSummary(cfg, preflight, stages) {
+function writeAggregatedSummary(cfg, preflight, stages, seed) {
   const outDir = path.join(cfg.cwd, 'reports', cfg.runId);
   const stageRows = [];
   const allTasks = [];
@@ -799,6 +811,7 @@ function writeAggregatedSummary(cfg, preflight, stages) {
     completedAt: new Date().toISOString(),
     preflightOk: preflight.ok === true,
     anyPipelineDefect: anyDefect,
+    seed: seed || undefined,
     stages: stageRows,
     tasks: allTasks,
     notes: [
@@ -813,7 +826,7 @@ function writeAggregatedSummary(cfg, preflight, stages) {
   return summary;
 }
 
-function archiveRun(cfg, runId, runIdSource, preflight, stages) {
+function archiveRun(cfg, runId, runIdSource, preflight, stages, seed) {
   const archiveRun = `${cfg.archiveRoot}/${runId}`;
   let archiveOk = true;
   try {
@@ -855,6 +868,7 @@ function archiveRun(cfg, runId, runIdSource, preflight, stages) {
     envVarNames: envNamesOnly(cfg),
     preflightOk: preflight.ok,
     anyPipelineDefect: anyDefect,
+    seed: seed || undefined,
     stages: stages.map(function(s) {
       return { name: s.name, exitCode: s.exitCode, classification: s.classification, cause: s.cause };
     }),
@@ -866,6 +880,57 @@ function archiveRun(cfg, runId, runIdSource, preflight, stages) {
     archiveOk = false;
   }
   return { ok: archiveOk, summary: summary, reviewText: reviewText };
+}
+
+/**
+ * Run the staging seeder in this process (not as a child task). Builds the
+ * same admin env mapping the child tasks receive (never printing values),
+ * calls seedStaging(context, options) once, and reduces the outcome to the
+ * summary counts recorded in run-summary.json / run.json. A seeder failure
+ * must never abort the run.
+ */
+function runSeedStep(cfg, seedModule) {
+  var childEnv = buildChildEnv(cfg);
+  var context = {
+    env: childEnv,
+    runId: cfg.runId,
+    stagingUrl: cfg.stagingUrl,
+    shopApiUrl: cfg.shopApiUrl,
+    cwd: cfg.cwd,
+    deps: {
+      fetch: cfg.fetch,
+      clock: function() { return new Date(); },
+      getEnv: function() { return childEnv; },
+      evidenceOptions: function() {
+        return { root: cfg.cwd, baseDir: 'evidence', reuseExisting: true };
+      }
+    }
+  };
+  return seedModule.seedStaging(context, { dryRun: !!cfg.seedDryRun }).then(function(result) {
+    return {
+      ran: true,
+      dryRun: !!cfg.seedDryRun,
+      ok: !!(result && result.ok),
+      reason: (result && result.reason) || null,
+      created: (result && Array.isArray(result.created)) ? result.created.length : 0,
+      existing: (result && Array.isArray(result.existing)) ? result.existing.length : 0,
+      conflicts: (result && Array.isArray(result.conflicts)) ? result.conflicts.length : 0,
+      failed: (result && Array.isArray(result.failed)) ? result.failed.length : 0,
+      errors: (result && Array.isArray(result.errors)) ? result.errors : []
+    };
+  }, function(err) {
+    return {
+      ran: true,
+      dryRun: !!cfg.seedDryRun,
+      ok: false,
+      reason: 'SEED_THREW',
+      created: 0,
+      existing: 0,
+      conflicts: 0,
+      failed: 0,
+      errors: [(err && err.message) || String(err)]
+    };
+  });
 }
 
 /**
@@ -938,6 +1003,23 @@ async function runStaging(deps) {
   const preflight = await runPreflight(cfg);
   const preflightOk = preflight.ok === true;
 
+  // Optional staging seed: run once after preflight passes and BEFORE the
+  // task stages. Its failure never aborts the run; the tasks then block with
+  // their own evidence. The seed is not a task and does not change the
+  // task-selection checks or stage order.
+  let seed = null;
+  if (cfg.mode === MODE_FULL && preflightOk && cfg.seedTestData) {
+    let seedModule = null;
+    try {
+      seedModule = require('../src/staging/seedStaging.js');
+    } catch (e) {
+      seed = { ran: true, ok: false, reason: 'SEED_MODULE_UNAVAILABLE', created: 0, existing: 0, conflicts: 0, failed: 0, errors: [(e && e.message) || String(e)] };
+    }
+    if (seedModule) {
+      seed = await runSeedStep(cfg, seedModule);
+    }
+  }
+
   let stages = [];
   if (cfg.mode === MODE_FULL && preflightOk) {
     const planned = buildStagesForTaskIds(cfg.taskIds);
@@ -946,10 +1028,10 @@ async function runStaging(deps) {
     }
   }
 
-  writeAggregatedSummary(cfg, preflight, stages);
+  writeAggregatedSummary(cfg, preflight, stages, seed);
 
   const resolved = resolvePipelineRunId(cfg);
-  const archived = archiveRun(cfg, resolved.runId, resolved.source, preflight, stages);
+  const archived = archiveRun(cfg, resolved.runId, resolved.source, preflight, stages, seed);
 
   let exitCode;
   if (cfg.mode === MODE_FULL) {

@@ -1,0 +1,193 @@
+{
+  "version": "1.0.0",
+  "description": "Deterministic staging seed: 4 onboarded countries (DE/EUR, AT/EUR, HU/HUF, GB/GBP) + EU/Non-EU zones + TST catalog + test accounts",
+  "countries": [
+    {
+      "countryCode": "DE",
+      "countryName": "Germany",
+      "currencyCode": "EUR",
+      "channelCode": "de",
+      "channelToken": "de-token",
+      "pricesIncludeTax": true,
+      "defaultLanguageCode": "en",
+      "taxRate": 19,
+      "zoneName": "EU",
+      "catalogAssignments": ["TST-ALL"]
+    },
+    {
+      "countryCode": "AT",
+      "countryName": "Austria",
+      "currencyCode": "EUR",
+      "channelCode": "at",
+      "channelToken": "at-token",
+      "pricesIncludeTax": true,
+      "defaultLanguageCode": "en",
+      "taxRate": 20,
+      "zoneName": "EU",
+      "catalogAssignments": ["TST-ALL", "TST-DE-AT"]
+    },
+    {
+      "countryCode": "HU",
+      "countryName": "Hungary",
+      "currencyCode": "HUF",
+      "channelCode": "hu",
+      "channelToken": "hu-token",
+      "pricesIncludeTax": true,
+      "defaultLanguageCode": "en",
+      "taxRate": 27,
+      "zoneName": "EU",
+      "catalogAssignments": ["TST-ALL", "TST-HU-ONLY"]
+    },
+    {
+      "countryCode": "GB",
+      "countryName": "United Kingdom",
+      "currencyCode": "GBP",
+      "channelCode": "gb",
+      "channelToken": "gb-token",
+      "pricesIncludeTax": true,
+      "defaultLanguageCode": "en",
+      "taxRate": 20,
+      "zoneName": "Non-EU",
+      "catalogAssignments": ["TST-ALL"]
+    }
+  ],
+  "zones": [
+    {
+      "name": "EU",
+      "members": ["DE", "AT", "HU"]
+    },
+    {
+      "name": "Non-EU",
+      "members": ["GB"]
+    }
+  ],
+  "stockLocations": [
+    {
+      "name": "Global"
+    },
+    {
+      "name": "DE Warehouse",
+      "channelCode": "de"
+    },
+    {
+      "name": "AT Warehouse",
+      "channelCode": "at"
+    },
+    {
+      "name": "HU Warehouse",
+      "channelCode": "hu"
+    },
+    {
+      "name": "GB Warehouse",
+      "channelCode": "gb"
+    }
+  ],
+  "testCustomers": [
+    {
+      "emailPrefix": "test-de",
+      "countryCode": "DE"
+    },
+    {
+      "emailPrefix": "test-at",
+      "countryCode": "AT"
+    },
+    {
+      "emailPrefix": "test-hu",
+      "countryCode": "HU"
+    },
+    {
+      "emailPrefix": "test-gb",
+      "countryCode": "GB"
+    }
+  ],
+  "products": [
+    {
+      "slug": "tst-all",
+      "name": "TST-ALL",
+      "sku": "TST-ALL",
+      "enabled": true,
+      "channels": ["de", "at", "hu", "gb"],
+      "variants": [
+        {
+          "sku": "TST-ALL-1",
+          "name": "TST-ALL-1",
+          "enabled": true,
+          "price": {
+            "de": { "currencyCode": "EUR", "decimal": 9.99 },
+            "at": { "currencyCode": "EUR", "decimal": 9.99 },
+            "hu": { "currencyCode": "HUF", "decimal": 2499.00 },
+            "gb": { "currencyCode": "GBP", "decimal": 7.99 }
+          },
+          "stockOnHand": 100,
+          "trackInventory": true,
+          "useGlobalOutOfStockThreshold": false,
+          "outOfStockThreshold": 10
+        }
+      ]
+    },
+    {
+      "slug": "tst-de-only",
+      "name": "TST-DE-ONLY",
+      "sku": "TST-DE-ONLY",
+      "enabled": true,
+      "channels": ["de"],
+      "variants": [
+        {
+          "sku": "TST-DE-ONLY-1",
+          "name": "TST-DE-ONLY-1",
+          "enabled": true,
+          "price": {
+            "de": { "currencyCode": "EUR", "decimal": 12.99 }
+          },
+          "stockOnHand": 100,
+          "trackInventory": true,
+          "useGlobalOutOfStockThreshold": false,
+          "outOfStockThreshold": 10
+        }
+      ]
+    },
+    {
+      "slug": "tst-hu-only",
+      "name": "TST-HU-ONLY",
+      "sku": "TST-HU-ONLY",
+      "enabled": true,
+      "channels": ["hu"],
+      "variants": [
+        {
+          "sku": "TST-HU-ONLY-1",
+          "name": "TST-HU-ONLY-1",
+          "enabled": true,
+          "price": {
+            "hu": { "currencyCode": "HUF", "decimal": 3499.00 }
+          },
+          "stockOnHand": 100,
+          "trackInventory": true,
+          "useGlobalOutOfStockThreshold": false,
+          "outOfStockThreshold": 10
+        }
+      ]
+    },
+    {
+      "slug": "tst-de-at",
+      "name": "TST-DE-AT",
+      "sku": "TST-DE-AT",
+      "enabled": true,
+      "channels": ["de", "at"],
+      "variants": [
+        {
+          "sku": "TST-DE-AT-1",
+          "name": "TST-DE-AT-1",
+          "enabled": true,
+          "price": {
+            "de": { "currencyCode": "EUR", "decimal": 14.99 },
+            "at": { "currencyCode": "EUR", "decimal": 14.99 }
+          },
+          "stockOnHand": 100,
+          "trackInventory": true,
+          "useGlobalOutOfStockThreshold": false,
+          "outOfStockThreshold": 10
+        }
+      ]
+    }
+  ]
+}

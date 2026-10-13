@@ -151,6 +151,7 @@ jobs:
             --environment staging \
             --staging-url "$STAGING_API_URL" \
             --archive-dir "$STAGING_ARCHIVE_DIR" \
+            --seed-test-data \
             --task CAN-B1-03 \
             --task CAN-B1-04 \
             --task CAN-B2-16

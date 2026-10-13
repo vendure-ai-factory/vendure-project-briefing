@@ -723,3 +723,233 @@ test('runStaging: a real BLOCK stage is still blocked alongside a READINESS_PASS
   assert.notStrictEqual(result.exitCode, 0, 'a real BLOCK must still make the run exit non-zero');
   assert.strictEqual(result.stages[0].classification, 'CLIENT_INPUT_SCOPE', 'real BLOCK keeps its classification');
 });
+
+// ------------------------------------------------- seed-test-data wiring
+
+/**
+ * Minimal mocked fetch for run-staging seed integration: keeps preflight
+ * green, satisfies the Admin login, and answers every further seed query with
+ * empty/repopulated data so the seeder runs to a recorded outcome without
+ * aborting the run. Sentinel secret values are used so we can assert they are
+ * never written to any evidence/report/archive file.
+ */
+function makeSeedIntegrationFetch(opts) {
+  opts = opts || {};
+  return function seedFetch(url, init) {
+    var u = String(url);
+    var body = init && init.body ? JSON.parse(init.body) : {};
+    var query = body.query || '';
+    var isShop = u.indexOf('/shop-api') !== -1;
+    if (u.indexOf('/health') !== -1) {
+      return Promise.resolve({ status: 200, json: function() { return Promise.resolve({ status: 'ok' }); } });
+    }
+    if (query.indexOf('__typename') !== -1) {
+      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, json: function() { return Promise.resolve({ data: { __typename: 'Query' } }); } });
+    }
+    // Shop preflight query ({ __typename }) on /shop-api
+    if (!isShop && query.indexOf('mutation Login') !== -1) {
+      if (opts.loginStatus === 500) {
+        return Promise.resolve({ status: 500, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify({})); } });
+      }
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function(n) { return n === 'vendure-auth-token' ? 'seed-auth-token-123' : null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ data: { login: { __typename: 'CurrentUser', id: 'u1', identifier: 'admin@staging.local' } } })); }
+      });
+    }
+    if (query.indexOf('Introspect') !== -1 || query.indexOf('__type') !== -1) {
+      var introspectionData = opts.introspection || defaultIntrospection();
+      return seedResponse(introspectionData);
+    }
+    if (query.indexOf('mutation') !== -1) {
+      return seedResponse(defaultMutationResponse(query));
+    }
+    // Admin read queries -> empty sets unless opts.adminRead provides data
+    return seedResponse(opts.adminRead ? opts.adminRead(query) : emptyAdminRead(query));
+  };
+}
+
+function seedResponse(data) {
+  return Promise.resolve({
+    status: 200,
+    headers: { get: function() { return null; } },
+    json: function() { return Promise.resolve(data); },
+    text: function() { return Promise.resolve(JSON.stringify(data)); }
+  });
+}
+
+function defaultIntrospection() {
+  return {
+    data: {
+      Mutation: {
+        name: 'Mutation',
+        fields: [
+          { name: 'login' },
+          { name: 'createChannel' },
+          { name: 'createCountry' },
+          { name: 'createZone' },
+          { name: 'createTaxCategory' },
+          { name: 'createTaxRate' },
+          { name: 'createStockLocation' },
+          { name: 'createProduct' },
+          { name: 'createProductVariants' },
+          { name: 'assignProductsToChannel' }
+        ]
+      },
+      Channel: {
+        name: 'Channel',
+        fields: [
+          { name: 'id' }, { name: 'code' }, { name: 'token' },
+          { name: 'defaultCurrencyCode' }, { name: 'availableCurrencyCodes' },
+          { name: 'defaultTaxZoneId' }, { name: 'defaultShippingZoneId' }, { name: 'pricesIncludeTax' }
+        ]
+      },
+      CreateChannelInput: {
+        name: 'CreateChannelInput',
+        fields: [
+          { name: 'code' }, { name: 'token' }, { name: 'defaultCurrencyCode' },
+          { name: 'currencyCode' }, { name: 'availableCurrencyCodes' },
+          { name: 'defaultLanguageCode' }, { name: 'defaultTaxZoneId' },
+          { name: 'defaultShippingZoneId' }, { name: 'pricesIncludeTax' }
+        ]
+      },
+      CreateProductInput: { name: 'CreateProductInput', fields: [] }
+    }
+  };
+}
+
+function emptyAdminRead(query) {
+  var data = {
+    activeChannel: null,
+    countries: { items: [], totalItems: 0 },
+    zones: { items: [], totalItems: 0 },
+    taxCategories: { items: [], totalItems: 0 },
+    taxRates: { items: [], totalItems: 0 },
+    stockLocations: { items: [], totalItems: 0 },
+    shippingMethods: { items: [], totalItems: 0 },
+    paymentMethods: { items: [], totalItems: 0 },
+    channels: { items: [], totalItems: 0 },
+    products: { items: [], totalItems: 0 },
+    productVariants: { items: [], totalItems: 0 },
+    customers: { items: [], totalItems: 0 }
+  };
+  if (query.indexOf('activeChannel') !== -1) {
+    data.activeChannel = { code: '__default_channel__', defaultCurrencyCode: 'USD', defaultLanguageCode: 'en', defaultTaxZone: null, defaultShippingZone: null };
+  }
+  // preRead probe does not nest counts under a key; they are top-level totals
+  return { data: data };
+}
+
+function defaultMutationResponse(query) {
+  if (query.indexOf('createCountry') !== -1) {
+    return { data: { createCountry: { __typename: 'Country', id: 'seeded-country' } } };
+  }
+  if (query.indexOf('createZone') !== -1) {
+    return { data: { createZone: { __typename: 'Zone', id: 'seeded-zone' } } };
+  }
+  if (query.indexOf('createTaxCategory') !== -1) {
+    return { data: { createTaxCategory: { id: 'seeded-taxcat' } } };
+  }
+  if (query.indexOf('createTaxRate') !== -1) {
+    return { data: { createTaxRate: { __typename: 'TaxRate', id: 'seeded-taxrate' } } };
+  }
+  if (query.indexOf('createChannel') !== -1) {
+    return { data: { createChannel: { __typename: 'Channel', id: 'seeded-channel' } } };
+  }
+  if (query.indexOf('createStockLocation') !== -1) {
+    return { data: { createStockLocation: { __typename: 'StockLocation', id: 'seeded-loc' } } };
+  }
+  if (query.indexOf('createProductVariants') !== -1) {
+    return { data: { createProductVariants: { __typename: 'ProductVariantItems', items: [{ id: 'seeded-variant' }] } } };
+  }
+  if (query.indexOf('createProduct') !== -1) {
+    return { data: { createProduct: { __typename: 'Product', id: 'seeded-product' } } };
+  }
+  if (query.indexOf('assignProductsToChannel') !== -1 || query.indexOf('assignProductVariantsToChannel') !== -1) {
+    return { data: { assignProductsToChannel: [{ id: 'seeded-product' }], assignProductVariantsToChannel: [{ id: 'seeded-variant' }] } };
+  }
+  if (query.indexOf('updateProductVariants') !== -1) {
+    return { data: { updateProductVariants: { items: [{ id: 'seeded-variant', sku: 'TST-ALL-1' }] } } };
+  }
+  if (query.indexOf('createCustomer') !== -1) {
+    return { data: { createCustomer: { __typename: 'Customer', id: 'seeded-customer', emailAddress: 'test-de@example.invalid' } } };
+  }
+  return { data: {} };
+}
+
+test('runStaging: --seed-test-data runs the seeder once before the stages and never prints values', async function() {
+  var mod = await loadModule();
+  var child = makeChild({ results: {} });
+  var deps = makeDeps('seed-runs', {
+    child: child,
+    taskIds: APPROVED,
+    fetch: makeSeedIntegrationFetch({})
+  });
+  deps.args.stagingUrl = 'https://staging.tibella.eu';
+  deps.args.seedTestData = true;
+
+  var result = await mod.runStaging(deps);
+  assert.strictEqual(result.exitCode, 0, 'a successful seed and passing stages exit 0');
+  assert.strictEqual(child.spawnCalls.length, 3, 'all three stages still run after the seed');
+
+  // run-summary.json records the seed outcome (aggregated)
+  var summaryFile = path.join(deps.cwd, 'reports', deps.runId, 'run-summary.json');
+  assert.strictEqual(fs.existsSync(summaryFile), true);
+  var summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'));
+  assert.ok(summary.seed, 'run-summary must include a seed field');
+  assert.strictEqual(summary.seed.ran, true);
+  assert.strictEqual(summary.seed.dryRun, false);
+  assert.ok(typeof summary.seed.created === 'number');
+
+  // archived run.json records it too
+  var archiveRun = path.join(deps.archiveRoot, result.runId);
+  var runJson = JSON.parse(fs.readFileSync(path.join(archiveRun, 'run.json'), 'utf8'));
+  assert.ok(runJson.seed, 'archived run.json must include the seed outcome');
+  assert.strictEqual(runJson.seed.ran, true);
+});
+
+test('runStaging: a seeder failure does not stop the stages', async function() {
+  var mod = await loadModule();
+  var child = makeChild({ results: {} });
+  var deps = makeDeps('seed-fails', {
+    child: child,
+    taskIds: APPROVED,
+    fetch: makeSeedIntegrationFetch({ loginStatus: 500 })
+  });
+  deps.args.stagingUrl = 'https://staging.tibella.eu';
+  deps.args.seedTestData = true;
+
+  var result = await mod.runStaging(deps);
+  assert.strictEqual(child.spawnCalls.length, 3, 'stages must still run after a seeder failure');
+  assert.ok(result.stages.length === 3);
+
+  var summary = JSON.parse(fs.readFileSync(path.join(deps.cwd, 'reports', deps.runId, 'run-summary.json'), 'utf8'));
+  assert.ok(summary.seed);
+  assert.strictEqual(summary.seed.ran, true);
+  assert.strictEqual(summary.seed.ok, false, 'login failure makes the seeder fail');
+  assert.strictEqual(summary.seed.reason, 'ADMIN_LOGIN_FAILED');
+  // failed seed must not make the run exit non-zero by itself (stages define exit)
+  assert.strictEqual(result.exitCode, 0, 'the seed never aborts the run; only stages affect the exit code');
+});
+
+test('runStaging: without --seed-test-data the seeder never runs', async function() {
+  var mod = await loadModule();
+  var child = makeChild({ results: {} });
+  // A fetch that would fail loudly if the seed ever called it: no login route,
+  // so any seeder invocation would record ADMIN_LOGIN_FAILED. Absence of the
+  // seed field proves it never ran.
+  var deps = makeDeps('seed-absent', {
+    child: child,
+    taskIds: APPROVED,
+    fetch: makeSeedIntegrationFetch({ loginStatus: 500 })
+  });
+  deps.args.stagingUrl = 'https://staging.tibella.eu';
+  deps.args.seedTestData = false;
+
+  var result = await mod.runStaging(deps);
+  assert.strictEqual(result.exitCode, 0);
+  var summary = JSON.parse(fs.readFileSync(path.join(deps.cwd, 'reports', deps.runId, 'run-summary.json'), 'utf8'));
+  assert.strictEqual(summary.seed, undefined, 'seed must never run without --seed-test-data');
+  var runJson = JSON.parse(fs.readFileSync(path.join(deps.archiveRoot, result.runId, 'run.json'), 'utf8'));
+  assert.strictEqual(runJson.seed, undefined);
+});
