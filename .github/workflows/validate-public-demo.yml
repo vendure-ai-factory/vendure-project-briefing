@@ -1,0 +1,24 @@
+name: Validate public demo
+on:
+  push:
+    branches:
+      - main
+      - codex/github-refactor-20260904
+  pull_request:
+    branches:
+      - main
+      - codex/github-refactor-20260904
+permissions:
+  contents: read
+jobs:
+  public-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Verify expected starter boundary
+        run: bash evaluation-demo/scripts/verify.sh --baseline
+      - name: Run known-good reference demonstration
+        run: node evaluation-demo/scripts/run-demo.mjs

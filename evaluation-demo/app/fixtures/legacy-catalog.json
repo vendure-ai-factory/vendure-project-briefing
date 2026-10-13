@@ -1,0 +1,28 @@
+{
+  "items": [
+    {
+      "legacySku": "NAIL-002",
+      "name": "Rose Gold French",
+      "price": "18.50",
+      "active": true,
+      "imagePaths": ["rose-gold-1.png", "rose-gold-2.png"],
+      "internalNote": "supplier contact is private"
+    },
+    {
+      "legacySku": "NAIL-001",
+      "name": "Soft Pink Almond",
+      "price": "16.00",
+      "active": true,
+      "imagePaths": ["soft-pink-1.png"],
+      "internalNote": "legacy pricing note"
+    },
+    {
+      "legacySku": "NAIL-003",
+      "name": "Archived Sample",
+      "price": "9.00",
+      "active": false,
+      "imagePaths": [],
+      "internalNote": "must not be published"
+    }
+  ]
+}

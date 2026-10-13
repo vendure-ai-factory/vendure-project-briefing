@@ -1,0 +1,40 @@
+{
+  "name": "vendure-store",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev:server": "ts-node ./src/index.ts",
+    "dev:worker": "ts-node ./src/index-worker.ts",
+    "dev:dashboard": "vite --clearScreen false",
+    "dev": "concurrently --kill-others npm:dev:*",
+    "build": "tsc",
+    "build:dashboard": "vite build",
+    "start:server": "node ./dist/index.js",
+    "start:worker": "node ./dist/index-worker.js",
+    "start": "concurrently npm:start:*"
+  },
+  "dependencies": {
+    "@avendure/vendure-plugin-store-credit": "^1.0.24",
+    "@pinelab/vendure-plugin-stripe-subscription": "^2.10.0",
+    "@pinelab/vendure-plugin-variant-bulk-update": "^1.1.0",
+    "@vendure/asset-server-plugin": "3.5.3",
+    "@vendure/core": "3.5.3",
+    "@vendure/dashboard": "3.5.3",
+    "@vendure/email-plugin": "3.5.3",
+    "@vendure/graphiql-plugin": "3.5.3",
+    "@vendure/payments-plugin": "^3.5.3",
+    "axios": "^1.13.5",
+    "better-sqlite3": "12.6.2",
+    "dotenv": "17.2.4",
+    "stripe": "13.11.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@vendure/cli": "3.5.3",
+    "concurrently": "9.2.1",
+    "fs-extra": "^11.3.3",
+    "pagedjs-cli": "^0.4.3",
+    "puppeteer": "^24.37.2",
+    "typescript": "5.8.2"
+  }
+}
