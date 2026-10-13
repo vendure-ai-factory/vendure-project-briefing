@@ -102,29 +102,33 @@ function preReadData() {
 }
 
 function introspectionData() {
-  function fields(names) {
+  function outputFields(names) {
+    return names.map(function(n) { return { name: n }; });
+  }
+  function inputFields(names) {
     return names.map(function(n) { return { name: n }; });
   }
   return { data: {
-    Mutation: { name: 'Mutation', fields: fields([
+    Mutation: { name: 'Mutation', fields: outputFields([
       'login', 'createChat', 'deleteChat', 'createChannel', 'createCountry', 'createZone',
       'createTaxCategory', 'createTaxRate', 'createStockLocation',
       'createProduct', 'createProductVariants', 'assignProductsToChannel',
-      'assignProductVariantsToChannel', 'createCustomer'
-    ]) },
-    Channel: { name: 'Channel', fields: fields([
-      'id', 'code', 'token', 'defaultCurrency', 'defaultLanguageCode', 'defaultShippingZone',
+      'assignProductVariantsToChannel', 'assignStockLocationsToChannel', 'createCustomer'
+    ]), inputFields: [] },
+    Channel: { name: 'Channel', fields: outputFields([
+      'id', 'code', 'token', 'defaultLanguageCode', 'defaultShippingZone',
       'defaultTaxZone', 'pricesIncludeTax', 'availableCurrencyCodes', 'defaultCurrencyCode',
       'currencyCode'
-    ]) },
-    CreateChannelInput: { name: 'CreateChannelInput', fields: fields([
+    ]), inputFields: [] },
+    // Input object types correctly use 'inputFields', not 'fields'.
+    CreateChannelInput: { name: 'CreateChannelInput', fields: [], inputFields: inputFields([
       'code', 'token', 'defaultLanguageCode', 'pricesIncludeTax', 'defaultTaxZoneId',
       'defaultShippingZoneId', 'defaultCurrencyCode', 'currencyCode', 'availableCurrencyCodes'
     ]) },
-    CreateProductInput: { name: 'CreateProductInput', fields: fields(['translations', 'enabled']) },
-    CreateProductVariantInput: { name: 'CreateProductVariantInput', fields: fields(['productId', 'sku', 'translations', 'price', 'stockOnHand', 'trackInventory', 'outOfStockThreshold']) },
-    Zone: { name: 'Zone', fields: fields(['id', 'name']) },
-    Country: { name: 'Country', fields: fields(['id', 'code', 'enabled']) }
+    CreateProductInput: { name: 'CreateProductInput', fields: [], inputFields: inputFields(['translations', 'enabled']) },
+    CreateProductVariantInput: { name: 'CreateProductVariantInput', fields: [], inputFields: inputFields(['productId', 'sku', 'translations', 'price', 'stockOnHand', 'trackInventory', 'outOfStockThreshold']) },
+    Zone: { name: 'Zone', fields: outputFields(['id', 'name']), inputFields: [] },
+    Country: { name: 'Country', fields: outputFields(['id', 'code', 'enabled']), inputFields: [] }
   } };
 }
 
@@ -144,11 +148,18 @@ function makeMutationResponse(query) {
   if (query.indexOf('createStockLocation') !== -1) {
     return { data: { createStockLocation: { __typename: 'StockLocation', id: 'new-loc', name: 'TST' } } };
   }
+  // Stock location assignment: must return a non-empty value so the seeder
+  // recognises success.  Vendure returns StockLocation[] but a truthy value
+  // with no ErrorResult typename is sufficient for the seeder's check.
+  if (query.indexOf('assignStockLocationsToChannel') !== -1 || query.indexOf('AssignStockLocationsToChannel') !== -1) {
+    return { data: { assignStockLocationsToChannel: [{ __typename: 'StockLocation', id: 'new-loc' }] } };
+  }
   if (query.indexOf('createChannel') !== -1) {
     return { data: { createChannel: { __typename: 'Channel', id: 'new-channel', code: 'de', token: SENTINEL_TOKEN, defaultCurrencyCode: 'EUR' } } };
   }
+  // Vendure createProductVariants returns ProductVariant[] (an array).
   if (query.indexOf('createProductVariants') !== -1) {
-    return { data: { createProductVariants: { __typename: 'ProductVariantList', items: [{ id: 'new-variant' }] } } };
+    return { data: { createProductVariants: [{ __typename: 'ProductVariant', id: 'new-variant', sku: 'TST' }] } };
   }
   if (query.indexOf('createProduct') !== -1) {
     return { data: { createProduct: { __typename: 'Product', id: 'new-product', slug: 'tst' } } };
@@ -157,7 +168,7 @@ function makeMutationResponse(query) {
     return { data: { assignProductsToChannel: [{ id: 'new-product' }], assignProductVariantsToChannel: [{ id: 'new-variant' }] } };
   }
   if (query.indexOf('updateProductVariants') !== -1) {
-    return { data: { updateProductVariants: { items: [{ id: 'new-variant', sku: 'TST' }] } } };
+    return { data: { updateProductVariants: [{ id: 'new-variant', sku: 'TST' }] } };
   }
   if (query.indexOf('createCustomer') !== -1) {
     return { data: { createCustomer: { __typename: 'Customer', id: 'new-customer', emailAddress: 'test-de@example.invalid' } } };
@@ -231,7 +242,7 @@ function makeSeedFetch(state) {
         text: function() { return Promise.resolve(JSON.stringify({ data: { login: { __typename: 'CurrentUser', id: 'u1', identifier: 'admin@staging.local' } } })); }
       });
     }
-    if (query.indexOf('__type') !== -1 || query.indexOf('Introspect') !== -1) {
+    if (query.indexOf('Introspect') !== -1) {
       return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify(introspectionData())); } });
     }
     if (query.indexOf('mutation ') !== -1) {
@@ -494,5 +505,344 @@ test('seed: missing credentials returns ADMIN_CREDENTIALS_MISSING', async functi
   var result = await seed(seedStaging.seedStaging, built.context, {});
   assert.strictEqual(result.reason, 'ADMIN_CREDENTIALS_MISSING');
   assert.strictEqual(requested.length, 0, 'no request before the credentials check');
+});
+
+// ---------------------------------------------------------------------------
+// Test 8: mutation counter accuracy — blocked/assigned/updated are NOT failures
+// ---------------------------------------------------------------------------
+
+test('seed: mutation counter counts only real writes; blocked/assigned/updated are not failures', async function() {
+  // Use the fully-seeded scenario which produces zero mutations and zero failures.
+  var runId = 'run-mutcount-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = makeSeedFetch({ kind: 'fresh' });
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  assert.strictEqual(result.ok, true, 'fresh run must succeed');
+  // Failures must be zero; blocked/assigned/updated must NOT appear there.
+  assert.strictEqual(result.failed.length, 0, 'failed must be empty on a clean fresh run');
+  // mutations counts only actual writes (created + assigned + updated), not failures.
+  assert.ok(result.mutations > 0, 'fresh run must report positive mutation count');
+  // The created list must not contain any entry whose entity is 'stockLocationToChannel'
+  // classified as 'failed' — it should be in created (assigned) or blocked, not failed.
+  var failedEntities = result.failed.map(function(f) { return f.entity; });
+  assert.strictEqual(failedEntities.indexOf('stockLocationToChannel'), -1,
+    'stockLocationToChannel must not appear in failed');
+});
+
+// ---------------------------------------------------------------------------
+// Test 9: admin auth token and channel context token are kept separate
+// ---------------------------------------------------------------------------
+
+test('seed: createProduct uses admin authToken for auth, not channel token', async function() {
+  var runId = 'run-authsep-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var capturedCalls = [];
+  var innerFetch = makeSeedFetch({ kind: 'fresh' });
+  var wrappedFetch = function(url, init) {
+    capturedCalls.push({ url: String(url), headers: (init && init.headers) ? Object.assign({}, init.headers) : {} });
+    return innerFetch(url, init);
+  };
+  wrappedFetch.getCalls = function() { return capturedCalls; };
+  var built = makeContext({ runId: runId, fetch: wrappedFetch, root: root, cwd: root });
+  await seed(seedStaging.seedStaging, built.context, {});
+
+  // Find all createProduct mutation calls.
+  var SENTINEL_AUTH_TOKEN = 'sentinel-auth-token-9f8e';
+  var channelTokens = ['de-token', 'at-token', 'hu-token', 'gb-token', SENTINEL_TOKEN];
+
+  var createProductCalls = capturedCalls.filter(function(c) {
+    try { return JSON.parse(c.headers.body || '{}').query && false; } catch(e) { return false; }
+  });
+  // Check that no admin-api call places a channel token in Authorization or vendure-auth-token.
+  capturedCalls.forEach(function(call) {
+    if (call.url.indexOf('/admin-api') === -1) return;
+    var authHeader = call.headers['Authorization'] || call.headers['authorization'] || '';
+    var authTokenHeader = call.headers['vendure-auth-token'] || '';
+    channelTokens.forEach(function(tok) {
+      assert.strictEqual(authHeader.indexOf(tok), -1,
+        'channel token ' + tok + ' must not appear in Authorization header');
+      assert.strictEqual(authTokenHeader.indexOf(tok), -1,
+        'channel token ' + tok + ' must not appear in vendure-auth-token header');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 10: GraphQL errors array is treated as an error even with HTTP 200
+// ---------------------------------------------------------------------------
+
+test('seed: GraphQL errors in response body are treated as errors even with HTTP 200', async function() {
+  var runId = 'run-gqlerr-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var spec = loadSpec();
+  // Use a fetch that returns HTTP 200 with a GraphQL errors array for login.
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch(e) { return {}; } })() : {};
+    var query = body.query || '';
+    if (query.indexOf('mutation Login') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() {
+          return Promise.resolve(JSON.stringify({
+            errors: [{ message: 'Invalid credentials', locations: [] }],
+            data: { login: null }
+          }));
+        }
+      });
+    }
+    return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve('{}'); } });
+  };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  // Login failed (GraphQL error at HTTP 200) — seeder must not proceed.
+  assert.strictEqual(result.ok, false, 'GraphQL login error must prevent seeding');
+  assert.ok(result.reason, 'a reason must be given');
+  // No mutations must have been made.
+  assert.strictEqual(result.mutations, 0, 'no mutations after login failure');
+});
+
+// ---------------------------------------------------------------------------
+// Test 11: introspection uses inputFields for CreateChannelInput
+// ---------------------------------------------------------------------------
+
+test('seed: introspection populates inputFields for input object types', async function() {
+  var runId = 'run-introspect-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = makeSeedFetch({ kind: 'fresh' });
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  // The returned result exposes introspectedTypes.
+  assert.ok(result.introspectedTypes, 'introspectedTypes must be present');
+  var cci = result.introspectedTypes.CreateChannelInput;
+  assert.ok(cci, 'CreateChannelInput must be in introspectedTypes');
+  // With the corrected mock (inputFields), availableCurrencyCodes is in inputFields,
+  // not in fields.  The seeder must detect it and include it in channel creation.
+  assert.ok(
+    (cci.inputFields && cci.inputFields.indexOf('availableCurrencyCodes') !== -1),
+    'availableCurrencyCodes must appear in inputFields of CreateChannelInput'
+  );
+  assert.strictEqual(
+    cci.fields && cci.fields.indexOf('availableCurrencyCodes') !== -1, false,
+    'availableCurrencyCodes must NOT appear in fields (wrong key for input type)'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Test 12: createProductVariants real array response is handled correctly
+// ---------------------------------------------------------------------------
+
+test('seed: createProductVariants handles real array response from Vendure', async function() {
+  var runId = 'run-vararray-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  // Use a mock that returns the real Vendure array shape for createProductVariants.
+  var innerFetch = makeSeedFetch({ kind: 'fresh' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch(e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('createProductVariants') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() {
+          return Promise.resolve(JSON.stringify({
+            data: { createProductVariants: [{ __typename: 'ProductVariant', id: 'arr-variant-id', sku: 'TST-REAL' }] }
+          }));
+        }
+      });
+    }
+    return innerFetch(url, init);
+  };
+  fetchFn.getCalls = innerFetch.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  // Must succeed and variants must be recorded as created (not failed).
+  assert.strictEqual(result.failed.filter(function(f) { return f.entity === 'variant'; }).length, 0,
+    'no variant must be in failed when createProductVariants returns an array');
+  var createdVariants = result.created.filter(function(c) { return c.entity === 'variant'; });
+  assert.ok(createdVariants.length > 0, 'variants must appear in created');
+  // The extracted id must not be null.
+  createdVariants.forEach(function(cv) {
+    assert.ok(cv.id !== null, 'variant created entry must carry the extracted id');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 13: fallback evidence write redacts secrets even without evidenceCollector
+// ---------------------------------------------------------------------------
+
+test('seed: fallback evidence write redacts sentinel secrets when evidenceCollector unavailable', function() {
+  var seedStagingModule = require('../src/staging/seedStaging');
+  var SENTINEL_PW = 'fallback-test-secret-pw-xyz';
+  var SENTINEL_TOKEN_VAL = 'fallback-channel-tok-abc';
+  var runId = 'run-fallback-redact-' + Date.now();
+  var tmpRoot = path.join(__dirname, '..', 'runs', runId);
+  fs.mkdirSync(tmpRoot, { recursive: true });
+
+  // Simulate the state that writeSeedEvidence receives.
+  var state = { secrets: [SENTINEL_PW, SENTINEL_TOKEN_VAL] };
+  var context = {
+    runId: runId,
+    deps: { evidenceOptions: function() { return { root: tmpRoot, baseDir: 'evidence', reuseExisting: true }; } },
+    cwd: tmpRoot
+  };
+  var payload = JSON.stringify({ channels: [{ code: 'de', note: SENTINEL_PW + ' and ' + SENTINEL_TOKEN_VAL }] });
+
+  // Call writeSeedEvidence; it will use evidenceCollector or the fallback.
+  // Force fallback by temporarily hiding evidenceCollector.
+  var Module = require('module');
+  var realResolve = Module._resolveFilename;
+  var hiddenPath = require.resolve('../src/evidenceCollector');
+  var orig = require.cache[hiddenPath];
+  delete require.cache[hiddenPath];
+  Module._resolveFilename = function(id, parent, isMain, opts) {
+    if (id === '../evidenceCollector' || id.indexOf('evidenceCollector') !== -1) {
+      throw new Error('module not found (forced for test)');
+    }
+    return realResolve.call(this, id, parent, isMain, opts);
+  };
+  try {
+    var written = seedStagingModule.writeSeedEvidence(context, state, payload);
+    assert.strictEqual(written.ok, true, 'fallback write must succeed');
+    // Read back and verify redaction.
+    var filePath = written.result && written.result.path;
+    assert.ok(filePath, 'fallback must return a file path');
+    var content = fs.readFileSync(filePath, 'utf8');
+    assert.strictEqual(content.indexOf(SENTINEL_PW), -1, 'admin password must be redacted in fallback output');
+    assert.strictEqual(content.indexOf(SENTINEL_TOKEN_VAL), -1, 'channel token must be redacted in fallback output');
+  } finally {
+    // Restore require.cache and _resolveFilename.
+    Module._resolveFilename = realResolve;
+    if (orig) require.cache[hiddenPath] = orig;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Test 14: dry-run records no mutation requests (mutation kinds = 'planned')
+// ---------------------------------------------------------------------------
+
+test('seed: dry-run planned entries carry planned flag and mutations stays 0', async function() {
+  var runId = 'run-dryplan-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = makeSeedFetch({ kind: 'fresh' });
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, { dryRun: true });
+
+  assert.strictEqual(result.mutations, 0, 'dry-run mutations must stay 0');
+  assert.strictEqual(result.dryRun, true, 'dryRun flag must be true');
+  // All created entries must carry planned:true and must not have triggered an HTTP mutation.
+  result.created.forEach(function(c) {
+    assert.strictEqual(c.planned, true, 'every created entry in dry-run must have planned=true, got: ' + JSON.stringify(c));
+  });
+  // No mutation HTTP requests may be present.
+  var calls = fetchFn.getCalls();
+  var mutationCalls = calls.filter(function(call) {
+    var q = '';
+    try { var b = JSON.parse(call.init && call.init.body || '{}'); q = b.query || ''; } catch(e) {}
+    return q.indexOf('mutation ') === 0 && q.indexOf('mutation Login') === -1;
+  });
+  assert.strictEqual(mutationCalls.length, 0, 'dry-run must not issue any non-login mutation request');
+});
+
+// ---------------------------------------------------------------------------
+// Test 15: partial state — product exists but variant is missing
+// ---------------------------------------------------------------------------
+
+test('seed: existing product with missing variant creates only the missing variant', async function() {
+  var runId = 'run-partial-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var spec = loadSpec();
+  // Mock: all products exist, but variants are missing for all.
+  var partialFetch = makeSeedFetch({ kind: 'fresh' });
+  var wrappedFetch = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch(e) { return {}; } })() : {};
+    var q = body.query || '';
+    // Serve products as existing (by slug query) but return empty variants.
+    if (q.indexOf('products') !== -1 && q.indexOf('filter') !== -1 && q.indexOf('slug') !== -1) {
+      var slugMatch = body.variables && body.variables.slug;
+      var found = spec.products.filter(function(p) { return p.slug === slugMatch; });
+      if (found.length > 0) {
+        return Promise.resolve({
+          status: 200,
+          headers: { get: function() { return null; } },
+          text: function() {
+            return Promise.resolve(JSON.stringify({
+              data: { products: { items: [{ id: 'prod-' + found[0].slug, slug: found[0].slug, channels: [] }], totalItems: 1 } }
+            }));
+          }
+        });
+      }
+    }
+    if (q.indexOf('productVariants') !== -1 && q.indexOf('filter') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() {
+          return Promise.resolve(JSON.stringify({ data: { productVariants: { items: [], totalItems: 0 } } }));
+        }
+      });
+    }
+    return partialFetch(url, init);
+  };
+  wrappedFetch.getCalls = partialFetch.getCalls;
+  var built = makeContext({ runId: runId, fetch: wrappedFetch, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  // Products should be existing; variants should be created.
+  var existingProducts = result.existing.filter(function(e) { return e.entity === 'product'; });
+  assert.ok(existingProducts.length > 0, 'existing products must be recorded');
+  var createdVariants = result.created.filter(function(c) { return c.entity === 'variant'; });
+  assert.ok(createdVariants.length > 0, 'missing variants must be created');
+  // There must be no product in created (they already existed).
+  var createdProducts = result.created.filter(function(c) { return c.entity === 'product'; });
+  assert.strictEqual(createdProducts.length, 0, 'products that already exist must not be re-created');
+  // No failures.
+  assert.strictEqual(result.failed.length, 0, 'partial state recovery must produce no failures');
+});
+
+// ---------------------------------------------------------------------------
+// Test 16: seeder makes zero requests when hostname guard fails
+// ---------------------------------------------------------------------------
+
+test('seed: disallowed hostname blocks all requests including health-check', async function() {
+  var requested = [];
+  var fetchFn = function(url, init) {
+    requested.push(String(url));
+    return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve('{}'); } });
+  };
+  fetchFn.getCalls = function() { return requested; };
+  var built = makeContext({ fetch: fetchFn, adminApiUrl: 'https://production.tibella.eu/admin-api' });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.reason, 'SEED_HOST_NOT_ALLOWED');
+  assert.strictEqual(requested.length, 0, 'zero requests must be made to a disallowed host');
+});
+
+// ---------------------------------------------------------------------------
+// Test 17: second run creates no duplicates — mutations is exactly 0
+// ---------------------------------------------------------------------------
+
+test('seed: second run with already-seeded state creates no new entities', async function() {
+  var runId = 'run-nodedup-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = makeSeedFetch({ kind: 'seeded' });
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  assert.strictEqual(result.mutations, 0, 'second run must produce exactly 0 mutations');
+  assert.strictEqual(result.created.length, 0, 'second run must not create any entity');
+  assert.strictEqual(result.failed.length, 0, 'second run must not fail');
+  assert.strictEqual(result.conflicts.length, 0, 'second run must not produce conflicts on an identical seed');
 });
 

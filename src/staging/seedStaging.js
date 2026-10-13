@@ -4,7 +4,9 @@
  * Idempotent staging seeder for the staging readiness run (CAN-B1-03 / CAN-B1-04 /
  * CAN-B2-16). Seeds channels, zones, tax, minimal catalog and per-country test
  * customers in the isolated staging environment via the Admin API. Reads first,
- * never deletes, never updates. Never throws; returns a structured record.
+ * never deletes. Creates missing entities; assigns products to additional channels;
+ * updates per-channel variant prices (updateProductVariants). Never throws;
+ * returns a structured record.
  */
 
 var path = require('path');
@@ -125,7 +127,13 @@ function introspectionDoc(typeNames) {
   var parts = ['query Introspect {'];
   for (var i = 0; i < typeNames.length; i++) {
     var t = typeNames[i];
-    parts.push('  ' + t + ': __type(name: "' + t + '") { name fields { name type { name kind ofType { name kind } } } }');
+    // Request both fields (output types) and inputFields (input object types) so
+    // that CreateChannelInput, CreateProductInput, etc. are introspected correctly.
+    parts.push('  ' + t + ': __type(name: "' + t + '") {' +
+      ' name' +
+      ' fields { name type { name kind ofType { name kind } } }' +
+      ' inputFields { name type { name kind ofType { name kind } } }' +
+      ' }');
   }
   parts.push('}');
   return parts.join('\n');
@@ -135,7 +143,7 @@ function introspectionDoc(typeNames) {
 // Low-level request helper (bearer or cookie sessions)
 // ---------------------------------------------------------------------------
 
-function adminGraphqlRequest(fetchFn, url, body, token, extraSecrets) {
+function adminGraphqlRequest(fetchFn, url, body, token, extraSecrets, channelToken) {
   if (!fetchFn) {
     return Promise.resolve({
       request: null,
@@ -151,6 +159,14 @@ function adminGraphqlRequest(fetchFn, url, body, token, extraSecrets) {
     headers['vendure-auth-token'] = token;
     headers['Authorization'] = 'Bearer ' + token;
     secrets.push(token);
+  }
+  // Channel-context header: Vendure resolves the active channel from the
+  // `vendure-token` header (channelTokenKey), for both the Admin and Shop
+  // APIs. A channel token must NEVER be passed as vendure-auth-token - that
+  // header only carries the auth session token.
+  if (channelToken) {
+    headers['vendure-token'] = channelToken;
+    secrets.push(channelToken);
   }
   var bodyStr = typeof body === 'string' ? body : JSON.stringify(body);
   var requestRecord = { method: 'POST', url: url, headers: headers, body: bodyStr };
@@ -225,17 +241,18 @@ async function introspectTypes(fetchFn, adminUrl, token, typeNames) {
         var tdata = data[tn];
         if (tdata && tdata.name) {
           result.types[tn].present = true;
+          // Output-type fields (non-input types)
           var fields = tdata.fields || [];
           for (var k = 0; k < fields.length; k++) {
             var f = fields[k];
-            if (f && f.name) {
-              var isArg = (f.type && f.type.kind === 'INPUT_OBJECT') || f.name.indexOf('Input') !== -1;
-              if (f.name.indexOf('Input') !== -1) {
-                result.types[tn].inputFields.push(f.name);
-              } else {
-                result.types[tn].fields.push(f.name);
-              }
-            }
+            if (f && f.name) result.types[tn].fields.push(f.name);
+          }
+          // Input-type fields — GraphQL input object types expose 'inputFields',
+          // not 'fields'. Populate result.inputFields from the correct source.
+          var inputFields = tdata.inputFields || [];
+          for (var m = 0; m < inputFields.length; m++) {
+            var inf = inputFields[m];
+            if (inf && inf.name) result.types[tn].inputFields.push(inf.name);
           }
         }
       }
@@ -279,8 +296,24 @@ function createState() {
   };
 }
 
+/**
+ * Record the outcome of one seeding operation.
+ *
+ * Supported kinds and their meaning:
+ *   'created'  — entity was newly created (counts as a mutation)
+ *   'existing' — entity already existed and was verified
+ *   'conflict' — entity exists but its state conflicts with the spec
+ *   'assigned' — entity was successfully assigned to a channel/location
+ *   'updated'  — entity was successfully updated (e.g. per-channel pricing)
+ *   'blocked'  — operation was skipped because a prerequisite was missing
+ *   'failed'   — operation was attempted and failed (does NOT count as a
+ *                successful mutation; recorded in state.failed for visibility)
+ *   'planned'  (via created with details.planned) — dry-run plan entry only
+ *
+ * Mutations (state.mutations) count only successful creations, assignments
+ * and updates that actually wrote data, not failures or dry-run plan entries.
+ */
 function recordMutation(state, kind, entity, details) {
-  if (!state.dryRun && (kind === 'created' || kind === 'failed')) state.mutations += 1;
   var entry = { entity: entity };
   if (details && details.id) entry.id = details.id;
   if (details && details.code) entry.code = details.code;
@@ -292,12 +325,25 @@ function recordMutation(state, kind, entity, details) {
     }
   }
   if (kind === 'created') {
+    // Dry-run plan entries (details.planned === true) do not increment the
+    // mutation counter because no data was actually written.
+    if (!state.dryRun && !entry.planned) state.mutations += 1;
     state.created.push(entry);
   } else if (kind === 'existing') {
     state.existing.push(entry);
   } else if (kind === 'conflict') {
     state.conflicts.push(entry);
+  } else if (kind === 'assigned' || kind === 'updated') {
+    // Successful assignments and updates are real mutations but are reported
+    // in state.created (they are write operations that succeeded).
+    if (!state.dryRun) state.mutations += 1;
+    state.created.push(entry);
+  } else if (kind === 'blocked') {
+    // Blocked operations are not failures; they are skipped because a
+    // prerequisite was absent.  Recorded separately for diagnostics.
+    state.blocked.push(entry);
   } else {
+    // 'failed' and any unrecognised kind.
     state.failed.push(entry);
   }
   return entry;
@@ -774,16 +820,16 @@ async function ensureTax(context, state, fetchFn, adminUrl, authToken, secrets, 
 }
 
 async function ensureChannels(context, state, fetchFn, adminUrl, authToken, secrets, spec, introspection, zoneIds) {
-  var query = '{ channels { items { id code token defaultCurrencyCode availableCurrencyCodes defaultTaxZoneId defaultShippingZoneId pricesIncludeTax } totalItems } }';
-  // currency field name from introspection
-  var currencyField = 'defaultCurrencyCode';
-  if (introspection && introspection.types && introspection.types.Channel &&
-      introspection.types.Channel.fields.indexOf('defaultCurrencyCode') === -1 &&
-      introspection.types.Channel.fields.indexOf('currencyCode') !== -1) {
-    currencyField = 'currencyCode';
+  var currencyField = introspection && introspection.types && introspection.types.Channel &&
+    introspection.types.Channel.fields.indexOf('defaultCurrencyCode') !== -1 ? 'defaultCurrencyCode' : 'currencyCode';
+  var channelFields = ['id', 'code', 'token', currencyField];
+  if (introspection && introspection.types && introspection.types.Channel) {
+    var chFields = introspection.types.Channel.fields;
+    if (chFields.indexOf('availableCurrencyCodes') !== -1) channelFields.push('availableCurrencyCodes');
+    if (chFields.indexOf('pricesIncludeTax') !== -1) channelFields.push('pricesIncludeTax');
   }
-  var currencySelector = '{ ' + currencyField + ' }';
-  query = query.replace('defaultCurrencyCode', currencyField);
+  var query = '{ channels(options: { take: 100 }) { items { ' + channelFields.join(' ') + ' } totalItems } }';
+
   var channelsList = [];
   try {
     var r = await adminGraphqlRequest(fetchFn, adminUrl, { query: query, variables: { options: { take: 100 } } }, authToken, secrets);
@@ -872,10 +918,15 @@ async function ensureChannels(context, state, fetchFn, adminUrl, authToken, secr
       pricesIncludeTax: country.pricesIncludeTax
     };
     chanInput[currencyField] = expectedCurrency;
-    var ac = ['availableCurrencyCodes'];
-    if (introspection && introspection.types && introspection.types.CreateChannelInput &&
-        introspection.types.CreateChannelInput.fields.indexOf('availableCurrencyCodes') !== -1) {
-      chanInput.availableCurrencyCodes = [expectedCurrency];
+    // Check inputFields (the correct GraphQL field for input object types).
+    // Also fall back to fields for backwards-compatibility with mocks that
+    // were written before the introspection query was corrected.
+    if (introspection && introspection.types && introspection.types.CreateChannelInput) {
+      var ciType = introspection.types.CreateChannelInput;
+      if ((ciType.inputFields && ciType.inputFields.indexOf('availableCurrencyCodes') !== -1) ||
+          (ciType.fields && ciType.fields.indexOf('availableCurrencyCodes') !== -1)) {
+        chanInput.availableCurrencyCodes = [expectedCurrency];
+      }
     }
     if (zoneId) {
       chanInput.defaultTaxZoneId = zoneId;
@@ -890,7 +941,9 @@ async function ensureChannels(context, state, fetchFn, adminUrl, authToken, secr
     if (data && data.__typename === 'Channel') {
       channelIds[code] = data.id;
       recordMutation(state, 'created', 'channel', { code: code, id: data.id, currency: expectedCurrency });
-      state.channels.push({ code: code, currency: expectedCurrency, token: token });
+      // Do NOT store the raw channel token here — it is a secret and would
+      // be serialised into evidence.  Only code and currency are diagnostic.
+      state.channels.push({ code: code, currency: expectedCurrency });
     } else {
       var cmsg = (data && (data.message || data.errorCode)) || 'createChannel failed';
       recordMutation(state, 'failed', 'channel', { code: code, error: cmsg });
@@ -900,7 +953,7 @@ async function ensureChannels(context, state, fetchFn, adminUrl, authToken, secr
 }
 
 async function ensureStockLocations(context, state, fetchFn, adminUrl, authToken, secrets, spec, channelIds) {
-  var query = '{ stockLocations { items { id name type } totalItems } }';
+  var query = '{ stockLocations { items { id name } totalItems } }';
   var existingByName = {};
   try {
     var r = await adminGraphqlRequest(fetchFn, adminUrl, { query: query, variables: {} }, authToken, secrets);
@@ -917,6 +970,7 @@ async function ensureStockLocations(context, state, fetchFn, adminUrl, authToken
     return {};
   }
   var locIds = {};
+  var justCreated = {};
   for (var l = 0; l < spec.stockLocations.length; l++) {
     var loc = spec.stockLocations[l];
     var name = loc.name;
@@ -951,10 +1005,46 @@ async function ensureStockLocations(context, state, fetchFn, adminUrl, authToken
     var data = res.response && res.response.body && res.response.body.data && res.response.body.data.createStockLocation;
     if (data && data.__typename === 'StockLocation') {
       locIds[name] = data.id;
+      justCreated[name] = true;
       recordMutation(state, 'created', 'stockLocation', { name: name, id: data.id });
     } else {
       var msg = (data && (data.message || data.errorCode)) || 'createStockLocation failed';
       recordMutation(state, 'failed', 'stockLocation', { name: name, error: msg });
+    }
+  }
+  // Assign each newly-created stock location to its channel (existing
+  // locations were already assigned in a prior run so we never re-assign).
+  for (var sl = 0; sl < spec.stockLocations.length; sl++) {
+    var loc = spec.stockLocations[sl];
+    var locId = locIds[loc.name];
+    if (!justCreated[loc.name]) continue;
+    if (!loc.channelCode) continue;
+    var targetChannelId = channelIds[loc.channelCode];
+    if (!targetChannelId) {
+      recordMutation(state, 'blocked', 'stockLocation', { name: loc.name, error: 'channel ' + loc.channelCode + ' not found' });
+      continue;
+    }
+    if (state.dryRun) continue;
+    var assignMutation = [
+      'mutation AssignStockLocationsToChannel($input: AssignStockLocationsToChannelInput!) {',
+      '  assignStockLocationsToChannel(input: $input) { __typename }',
+      '}'
+    ].join('\n');
+    var assignRes = await adminGraphqlRequest(fetchFn, adminUrl, {
+      query: assignMutation,
+      variables: { input: { stockLocationIds: [locId], channelId: targetChannelId } }
+    }, authToken, secrets);
+    bumpRequests(state);
+    var assignData = assignRes.response && assignRes.response.body && assignRes.response.body.data && assignRes.response.body.data.assignStockLocationsToChannel;
+    var assignResultObj = (assignData && assignData.result) ? assignData.result : assignData;
+    var failedAssignment = false;
+    if (!assignResultObj) failedAssignment = true;
+    else if (Array.isArray(assignResultObj)) failedAssignment = assignResultObj.length === 0;
+    else if (assignResultObj.__typename === 'ErrorResult') failedAssignment = true;
+    if (failedAssignment) {
+      recordMutation(state, 'blocked', 'stockLocationToChannel', { name: loc.name, channel: loc.channelCode, error: 'assignment failed' });
+    } else {
+      recordMutation(state, 'assigned', 'stockLocationToChannel', { name: loc.name, channel: loc.channelCode });
     }
   }
   return locIds;
@@ -1013,6 +1103,149 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
 
     if (existingProduct) {
       recordMutation(state, 'existing', 'product', { slug: slug, id: existingProduct.id });
+      var productId = existingProduct.id;
+      var primaryCode = product.channels[0];
+      var primaryToken = channelTokenById[primaryCode] || channelTokenById[product.channels[0]] ||
+        channelTokenByCode(spec, primaryCode);
+      var primaryCurrency = null;
+      for (var cc = 0; cc < spec.countries.length; cc++) {
+        if (spec.countries[cc].channelCode === primaryCode) {
+          primaryCurrency = spec.countries[cc].currencyCode;
+          break;
+        }
+      }
+      for (var v = 0; v < product.variants.length; v++) {
+        var variant = product.variants[v];
+        var sku = variant.sku;
+        var existingVariant = null;
+        var variantQuery = [
+          'query VariantBySku($sku: String) {',
+          '  productVariants(options: { filter: { sku: { eq: $sku } } }) { items { id sku } }',
+          '}'
+        ].join('\n');
+        try {
+          var vr = await adminGraphqlRequest(fetchFn, adminUrl, {
+            query: variantQuery,
+            variables: { sku: sku }
+          }, authToken, secrets);
+          bumpRequests(state);
+          if (vr.response && vr.response.ok && vr.response.body && vr.response.body.data &&
+              vr.response.body.data.productVariants && vr.response.body.data.productVariants.items &&
+              vr.response.body.data.productVariants.items.length > 0) {
+            existingVariant = vr.response.body.data.productVariants.items[0];
+          }
+        } catch (e) {
+          state.errors.push('variant read failed for ' + sku + ': ' + ((e && e.message) || String(e)));
+        }
+        if (existingVariant) {
+          recordMutation(state, 'existing', 'variant', { sku: sku, id: existingVariant.id });
+          continue;
+        }
+        if (state.dryRun) {
+          recordMutation(state, 'created', 'variant', { sku: sku, planned: true });
+          continue;
+        }
+        if (requestBudgetExceeded(state)) {
+          state.errors.push('request budget exhausted');
+          return;
+        }
+        var priceInfo = variant.price[primaryCode];
+        var primaryPriceMinor = priceInfo ? priceToMinorUnits(priceInfo.decimal, priceInfo.currencyCode || primaryCurrency) : null;
+        var createVariants = [
+          'mutation CreateProductVariants($input: [CreateProductVariantInput!]!) {',
+          '  createProductVariants(input: $input) {',
+          '    ... on ProductVariant { id sku priceWithTax price }',
+          '    ... on ErrorResult { errorCode message }',
+          '  }',
+          '}'
+        ].join('\n');
+        var variantInput = [{
+          productId: productId,
+          sku: sku,
+          translations: [{ languageCode: 'en', name: variant.name }],
+          price: primaryPriceMinor,
+          stockOnHand: variant.stockOnHand,
+          trackInventory: variant.trackInventory,
+          useGlobalOutOfStockThreshold: variant.useGlobalOutOfStockThreshold || false,
+          outOfStockThreshold: variant.outOfStockThreshold
+        }];
+        var resVar = await adminGraphqlRequest(fetchFn, adminUrl, {
+          query: createVariants,
+          variables: { input: variantInput }
+        }, authToken, secrets, primaryToken);
+        bumpRequests(state);
+        var varData = resVar.response && resVar.response.body && resVar.response.body.data && resVar.response.body.data.createProductVariants;
+        if (!varData || (varData.__typename === 'ErrorResult')) {
+          var vmsg = (varData && (varData.message || varData.errorCode)) || 'createProductVariants failed';
+          recordMutation(state, 'failed', 'variant', { sku: sku, error: vmsg });
+          continue;
+        }
+        // Vendure createProductVariants returns ProductVariant[] (an array).
+        // Guard against both the real array shape and legacy/test object shapes.
+        var variantId = null;
+        if (Array.isArray(varData)) {
+          variantId = (varData[0] && varData[0].id) || null;
+        } else if (varData.items && varData.items[0]) {
+          variantId = varData.items[0].id || null;
+        } else if (varData.id) {
+          variantId = varData.id;
+        }
+        recordMutation(state, 'created', 'variant', { sku: sku, id: variantId, priceMinor: primaryPriceMinor, currency: primaryCurrency });
+        for (var a = 1; a < product.channels.length; a++) {
+          var addCode = product.channels[a];
+          var addToken = channelTokenById[addCode] || channelTokenByCode(spec, addCode);
+          var addCurrency = null;
+          for (var c2 = 0; c2 < spec.countries.length; c2++) {
+            if (spec.countries[c2].channelCode === addCode) {
+              addCurrency = spec.countries[c2].currencyCode;
+              break;
+            }
+          }
+          var addPriceInfo = variant.price[addCode];
+          var addPriceMinor = addPriceInfo ? priceToMinorUnits(addPriceInfo.decimal, addPriceInfo.currencyCode || addCurrency) : null;
+          var assignQuery = [
+            'mutation AssignToChannel($input: AssignProductsToChannelInput!) {',
+            '  assignProductsToChannel(input: $input) { id }',
+            '  assignProductVariantsToChannel(input: { productVariantIds: $variantIds, channelId: $channelId }) { id }',
+            '}'
+          ].join('\n');
+          var assignRes = await adminGraphqlRequest(fetchFn, adminUrl, {
+            query: assignQuery,
+            variables: {
+              input: { productIds: [productId], channelId: state.channelIdsByCode[addCode] },
+              variantIds: [variantId],
+              channelId: state.channelIdsByCode[addCode]
+            }
+          }, authToken, secrets, addToken);
+          bumpRequests(state);
+          var assignData = assignRes.response && assignRes.response.body && assignRes.response.body.data;
+          if (!assignData || !assignData.assignProductsToChannel) {
+            recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: 'assignProductsToChannel returned no data' });
+          }
+          if (addPriceMinor !== null && state.channelIdsByCode[addCode]) {
+            var setPrice = [
+              'mutation UpdateVariantPrice($input: [UpdateProductVariantInput!]!) {',
+              '  updateProductVariants(input: $input) {',
+              '    ... on ProductVariant { id sku price priceWithTax }',
+              '  }',
+              '}'
+            ].join('\n');
+            var setPriceRes = await adminGraphqlRequest(fetchFn, adminUrl, {
+              query: setPrice,
+              variables: {
+                input: [{ id: variantId, price: addPriceMinor }]
+              }
+            }, authToken, secrets, addToken);
+            bumpRequests(state);
+            var spData = setPriceRes.response && setPriceRes.response.body && setPriceRes.response.body.data && setPriceRes.response.body.data.updateProductVariants;
+            if (!spData) {
+              recordMutation(state, 'blocked', 'variantPrice', { sku: sku, channel: addCode, error: 'could not write price in channel context' });
+            } else {
+              recordMutation(state, 'updated', 'variantPrice', { sku: sku, channel: addCode, priceMinor: addPriceMinor });
+            }
+          }
+        }
+      }
       continue;
     }
 
@@ -1046,10 +1279,13 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
       translations: [{ languageCode: 'en', name: product.name, slug: product.slug, description: 'TST synthetic test product' }],
       enabled: product.enabled
     };
+    // Use authToken for the admin session credential.  primaryToken is a
+    // channel context token (vendure-token header) and must NOT be placed in
+    // the Authorization / vendure-auth-token headers.
     var resProd = await adminGraphqlRequest(fetchFn, adminUrl, {
       query: createProduct,
       variables: { input: productInput }
-    }, primaryToken || authToken, secrets);
+    }, authToken, secrets, primaryToken);
     bumpRequests(state);
     var prodData = resProd.response && resProd.response.body && resProd.response.body.data && resProd.response.body.data.createProduct;
     if (!prodData || prodData.__typename === 'ErrorResult') {
@@ -1123,15 +1359,24 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
       var resVar = await adminGraphqlRequest(fetchFn, adminUrl, {
         query: createVariants,
         variables: { input: variantInput }
-      }, primaryToken || authToken, secrets);
+      }, authToken, secrets, primaryToken);
       bumpRequests(state);
       var varData = resVar.response && resVar.response.body && resVar.response.body.data && resVar.response.body.data.createProductVariants;
-      if (!varData || varData.__typename === 'ErrorResult') {
+      if (!varData || (varData.__typename === 'ErrorResult')) {
         var vmsg = (varData && (varData.message || varData.errorCode)) || 'createProductVariants failed';
         recordMutation(state, 'failed', 'variant', { sku: sku, error: vmsg });
         continue;
       }
-      var variantId = (varData.items && varData.items[0]) ? varData.items[0].id : (varData.id || null);
+      // Vendure createProductVariants returns ProductVariant[] (an array).
+      // Guard against both the real array shape and legacy/test object shapes.
+      var variantId = null;
+      if (Array.isArray(varData)) {
+        variantId = (varData[0] && varData[0].id) || null;
+      } else if (varData.items && varData.items[0]) {
+        variantId = varData.items[0].id || null;
+      } else if (varData.id) {
+        variantId = varData.id;
+      }
       recordMutation(state, 'created', 'variant', { sku: sku, id: variantId, priceMinor: primaryPriceMinor, currency: primaryCurrency });
 
       // Assign to additional channels, then price in each channel's context.
@@ -1150,25 +1395,29 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
 
         // Assign product + variant to the channel
         var assignQuery = [
-          'mutation AssignToChannel($productIds: [ID!]!, $variantIds: [ID!]!, $channelId: ID!) {',
-          '  assignProductsToChannel(productIds: $productIds, channelId: $channelId) { id }',
-          '  assignProductVariantsToChannel(productVariantIds: $variantIds, channelId: $channelId) { id }',
+          'mutation AssignToChannel($input: AssignProductsToChannelInput!) {',
+          '  assignProductsToChannel(input: $input) { id }',
+          '  assignProductVariantsToChannel(input: { productVariantIds: $variantIds, channelId: $channelId }) { id }',
           '}'
         ].join('\n');
         var assignRes = await adminGraphqlRequest(fetchFn, adminUrl, {
           query: assignQuery,
           variables: {
-            productIds: [productId],
+            input: { productIds: [productId], channelId: state.channelIdsByCode[addCode] },
             variantIds: [variantId],
             channelId: state.channelIdsByCode[addCode]
           }
-        }, authToken, secrets);
+        }, authToken, secrets, addToken);
         bumpRequests(state);
+        var assignData = assignRes.response && assignRes.response.body && assignRes.response.body.data;
+        if (!assignData || !assignData.assignProductsToChannel) {
+          recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: 'assignProductsToChannel returned no data' });
+        }
 
         // Set the price in the additional channel's context.
         if (addPriceMinor !== null && state.channelIdsByCode[addCode]) {
           var setPrice = [
-            'mutation UpdateVariantPrice($input: [UpdateProductVariantInput!]!, $id: ID!) {',
+            'mutation UpdateVariantPrice($input: [UpdateProductVariantInput!]!) {',
             '  updateProductVariants(input: $input) {',
             '    ... on ProductVariant { id sku price priceWithTax }',
             '  }',
@@ -1177,14 +1426,15 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
           var setPriceRes = await adminGraphqlRequest(fetchFn, adminUrl, {
             query: setPrice,
             variables: {
-              input: [{ id: variantId, price: addPriceMinor }],
-              id: variantId
+              input: [{ id: variantId, price: addPriceMinor }]
             }
-          }, addToken || authToken, secrets);
+          }, authToken, secrets, addToken);
           bumpRequests(state);
           var spData = setPriceRes.response && setPriceRes.response.body && setPriceRes.response.body.data && setPriceRes.response.body.data.updateProductVariants;
-          if (!spData || spData.items === undefined) {
+          if (!spData) {
             recordMutation(state, 'blocked', 'variantPrice', { sku: sku, channel: addCode, error: 'could not write price in channel context' });
+          } else {
+            recordMutation(state, 'updated', 'variantPrice', { sku: sku, channel: addCode, priceMinor: addPriceMinor });
           }
         }
       }
@@ -1301,7 +1551,7 @@ async function verifyReadback(context, state, fetchFn, adminUrl, authToken, secr
       var result = await adminGraphqlRequest(fetchFn, shopBase, {
         query: query,
         variables: {}
-      }, token, callSecrets);
+      }, authToken, callSecrets, token);
       bumpRequests(state);
       var entry = { code: country.channelCode };
       var body = result.response && result.response.body;
@@ -1366,13 +1616,32 @@ function writeSeedEvidence(context, state, evidencePayload) {
       return { ok: false, reason: (e && e.message) || String(e) };
     }
   }
-  // Direct fallback write to evidence/<runId>/seed/seed-record.json
+  // Direct fallback write to evidence/<runId>/seed/seed-record.json.
+  // Apply the same redaction that the evidenceCollector would use so that
+  // secrets do not reach disk even when the collector is unavailable.
   try {
     var baseDir = (opts && opts.baseDir) || 'evidence';
     var root = (opts && opts.root) || process.cwd();
     var fullPath = path.join(root, baseDir, runId, 'seed', SEED_EVIDENCE_FILENAME);
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    fs.writeFileSync(fullPath, content, 'utf8');
+    // Collect all secret values from state.secrets and opts.secrets and redact.
+    var fallbackSecrets = [];
+    if (state && Array.isArray(state.secrets)) {
+      for (var si = 0; si < state.secrets.length; si++) {
+        if (typeof state.secrets[si] === 'string' && state.secrets[si].length > 0) {
+          fallbackSecrets.push(state.secrets[si]);
+        }
+      }
+    }
+    if (opts && opts.secrets && typeof opts.secrets === 'object') {
+      var skeys = Object.keys(opts.secrets);
+      for (var sk = 0; sk < skeys.length; sk++) {
+        var sv = opts.secrets[skeys[sk]];
+        if (typeof sv === 'string' && sv.length > 0) fallbackSecrets.push(sv);
+      }
+    }
+    var safeContent = fallbackSecrets.length > 0 ? redactValue(content, fallbackSecrets) : content;
+    fs.writeFileSync(fullPath, safeContent, 'utf8');
     return { ok: true, result: { path: fullPath } };
   } catch (e) {
     return { ok: false, reason: (e && e.message) || String(e) };
@@ -1420,7 +1689,8 @@ async function seedStaging(context, options) {
 
   var username = adminUsername(context);
   var password = adminPassword(context);
-  var allSecrets = uniqueSecrets([password]);
+  var customerPassword = String(envValue(context, 'SEED_TEST_CUSTOMER_PASSWORD') || '').trim();
+  var allSecrets = uniqueSecrets([password, customerPassword]);
   // Nominal channel tokens are needed only to reach the per-channel contexts;
   // they are secrets and are never kept in evidence.
   for (var sc = 0; sc < spec.countries.length; sc++) {
@@ -1500,6 +1770,32 @@ async function seedStaging(context, options) {
   // 4. Channels
   var channelIds = await ensureChannels(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, introspectResult, zoneIds);
   state.channelIdsByCode = channelIds || {};
+
+  // Re-read channel inventory with verified-safe field list so channelIdsByCode
+  // reflects live data and not a potentially-stale introspection guess.
+  var cField = state.introspectedTypes && state.introspectedTypes.Channel &&
+    state.introspectedTypes.Channel.fields.indexOf('defaultCurrencyCode') !== -1 ? 'defaultCurrencyCode' : 'currencyCode';
+  var cFields = ['id', 'code', cField];
+  if (state.introspectedTypes && state.introspectedTypes.Channel) {
+    if (state.introspectedTypes.Channel.fields.indexOf('availableCurrencyCodes') !== -1) cFields.push('availableCurrencyCodes');
+    if (state.introspectedTypes.Channel.fields.indexOf('pricesIncludeTax') !== -1) cFields.push('pricesIncludeTax');
+  }
+  var channelReQuery = '{ channels(options: { take: 100 }) { items { ' + cFields.join(' ') + ' } totalItems } }';
+  try {
+    var crr = await adminGraphqlRequest(fetchFn, adminUrl, { query: channelReQuery, variables: { options: { take: 100 } } }, authToken, allSecrets);
+    bumpRequests(state);
+    if (crr.response && crr.response.ok && crr.response.body && crr.response.body.data &&
+        crr.response.body.data.channels && crr.response.body.data.channels.items &&
+        crr.response.body.data.channels.items.length > 0) {
+      var freshChannels = crr.response.body.data.channels.items;
+      for (var ci = 0; ci < freshChannels.length; ci++) {
+        var ch = freshChannels[ci];
+        if (ch.code) state.channelIdsByCode[String(ch.code).toLowerCase()] = ch.id;
+      }
+    }
+  } catch (e) {
+    state.errors.push('channel re-read failed: ' + ((e && e.message) || String(e)));
+  }
 
   // 5. Stock locations
   await ensureStockLocations(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, channelIds);
