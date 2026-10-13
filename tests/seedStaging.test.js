@@ -846,3 +846,119 @@ test('seed: second run with already-seeded state creates no new entities', async
   assert.strictEqual(result.conflicts.length, 0, 'second run must not produce conflicts on an identical seed');
 });
 
+// ---------------------------------------------------------------------------
+// Failure-diagnostic tests for ensureCountries / ensureZones creates
+// ---------------------------------------------------------------------------
+
+function createMutationOverrideFetch(kind, payloadFn) {
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var fn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('mutation Create' + kind) !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify(payloadFn(q, body))); }
+      });
+    }
+    return inner(url, init);
+  };
+  fn.getCalls = inner.getCalls || function() { return []; };
+  return fn;
+}
+
+test('seed: createCountry failure surfaces top-level GraphQL errors with secrets redacted', async function() {
+  var runId = 'run-country-gql-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = createMutationOverrideFetch('Country', function() {
+    return { errors: [{ message: 'DUPLICATE for ' + SENTINEL_AUTH }], data: { createCountry: null } };
+  });
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  var countryFailures = result.failed.filter(function(f) { return f.entity === 'country'; });
+  assert.ok(countryFailures.length > 0, 'a country creation failure must be recorded');
+  assert.strictEqual(countryFailures[0].error.indexOf('graphql:'), 0, 'diagnostic must start with the top-level error');
+  assert.strictEqual(countryFailures[0].error.indexOf('DUPLICATE') !== -1, true, 'useful message preserved');
+  assert.strictEqual(countryFailures[0].error.indexOf(SENTINEL_AUTH), -1, 'auth token must be redacted from the diagnostic');
+});
+
+test('seed: createZone failure surfaces top-level GraphQL errors', async function() {
+  var runId = 'run-zone-gql-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = createMutationOverrideFetch('Zone', function() {
+    return { errors: [{ message: 'zone limit reached' }], data: { createZone: null } };
+  });
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  var zoneFailures = result.failed.filter(function(f) { return f.entity === 'zone'; });
+  assert.ok(zoneFailures.length > 0, 'a zone creation failure must be recorded');
+  assert.strictEqual(zoneFailures[0].error.indexOf('graphql:'), 0, 'diagnostic must start with the top-level error');
+  assert.strictEqual(zoneFailures[0].error.indexOf('zone limit reached') !== -1, true, 'useful message preserved');
+});
+
+test('seed: createCountry ErrorResult message and top-level errors both captured, secrets redacted', async function() {
+  var runId = 'run-country-result-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = createMutationOverrideFetch('Country', function() {
+    return {
+      errors: [{ message: 'top-level ' + SENTINEL_PASSWORD }],
+      data: { createCountry: { __typename: 'IllegalOperationError', message: 'cannot create country', errorCode: 'ILLEGAL_OPERATION' } }
+    };
+  });
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  var countryFailures = result.failed.filter(function(f) { return f.entity === 'country'; });
+  assert.ok(countryFailures.length > 0, 'a country creation failure must be recorded');
+  assert.strictEqual(countryFailures[0].error.indexOf('graphql: top-level') !== -1, true, 'top-level error must be present');
+  assert.strictEqual(countryFailures[0].error.indexOf('result: cannot create country') !== -1, true, 'ErrorResult message must be present');
+  assert.strictEqual(countryFailures[0].error.indexOf('ILLEGAL_OPERATION') !== -1, true, 'ErrorResult errorCode must be present');
+  assert.strictEqual(countryFailures[0].error.indexOf(SENTINEL_PASSWORD), -1, 'password must be redacted from the diagnostic');
+});
+
+test('seed: createZone ErrorResult message captured and secrets redacted', async function() {
+  var runId = 'run-zone-result-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = createMutationOverrideFetch('Zone', function() {
+    return { data: { createZone: { __typename: 'NativeAuthStrategyError', message: 'zone denied for ' + SENTINEL_CUSTOMER_PASSWORD, errorCode: 'UNAUTHORIZED' } } };
+  });
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  var zoneFailures = result.failed.filter(function(f) { return f.entity === 'zone'; });
+  assert.ok(zoneFailures.length > 0, 'a zone creation failure must be recorded');
+  assert.strictEqual(zoneFailures[0].error.indexOf('result: zone denied') !== -1, true, 'ErrorResult message must be present');
+  assert.strictEqual(zoneFailures[0].error.indexOf('UNAUTHORIZED') !== -1, true, 'ErrorResult errorCode must be present');
+  assert.strictEqual(zoneFailures[0].error.indexOf(SENTINEL_CUSTOMER_PASSWORD), -1, 'customer password must be redacted');
+});
+
+test('seed: createCountry failure falls back to HTTP status and networkError when no message exists', async function() {
+  var runId = 'run-country-fb-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('mutation CreateCountry') !== -1) {
+      // No useful message anywhere: neither errors nor ErrorResult.
+      return Promise.resolve({ status: 418, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify({ data: { createCountry: { __typename: 'CountryError', id: null } } })); } });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  var countryFailures = result.failed.filter(function(f) { return f.entity === 'country'; });
+  assert.ok(countryFailures.length > 0, 'a country creation failure must be recorded');
+  assert.strictEqual(countryFailures[0].error.indexOf('http 418') !== -1, true,
+    'HTTP status must appear in the fallback diagnostic, got: ' + countryFailures[0].error);
+});
+

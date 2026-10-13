@@ -545,6 +545,43 @@ async function preReadAdmin(context, fetchFn, adminUrl, authToken, secrets) {
 // Ensure helpers (read first, create if missing)
 // ---------------------------------------------------------------------------
 
+/**
+ * Build a safe failure diagnostic for a failed create mutation. Inspects the
+ * top-level GraphQL `errors` array and the mutation result's ErrorResult fields
+ * (`message` / `errorCode`); neither yields anything useful, falls back to the
+ * HTTP status plus any `networkError`. Only message-shaped strings are copied,
+ * never request headers, tokens or raw response bodies, and the assembled text
+ * is run through redactValue() with the request's known secrets.
+ */
+function buildCreateDiagnostic(res, data, defaultMsg, secrets) {
+  var parts = [];
+  var topErrors = res && res.response && res.response.body && Array.isArray(res.response.body.errors)
+    ? res.response.body.errors : [];
+  if (topErrors.length > 0 && topErrors[0]) {
+    var firstError = topErrors[0];
+    var topMsgs = [];
+    if (firstError.message) topMsgs.push(String(firstError.message));
+    if (firstError.errorCode) topMsgs.push(String(firstError.errorCode));
+    if (topMsgs.length > 0) parts.push('graphql: ' + topMsgs.join(' | '));
+  }
+  var resultMsgs = [];
+  if (data) {
+    if (data.message) resultMsgs.push(String(data.message));
+    if (data.errorCode) resultMsgs.push(String(data.errorCode));
+  }
+  if (resultMsgs.length > 0) parts.push('result: ' + resultMsgs.join(' | '));
+  if (parts.length > 0) {
+    return redactValue(parts.join(' | '), secrets);
+  }
+  var fallback = [];
+  var httpStatus = res && res.response ? res.response.httpStatus : null;
+  if (httpStatus !== null && httpStatus !== undefined) fallback.push('http ' + httpStatus);
+  var networkErr = res && res.networkError ? String(res.networkError) : '';
+  if (networkErr) fallback.push('network: ' + networkErr);
+  if (fallback.length === 0) fallback.push(defaultMsg);
+  return redactValue(fallback.join(' | '), secrets);
+}
+
 async function ensureCountries(context, state, fetchFn, adminUrl, authToken, secrets) {
   var countries = [
     { code: 'DE', name: 'Germany' },
@@ -620,7 +657,7 @@ async function ensureCountries(context, state, fetchFn, adminUrl, authToken, sec
     if (data && data.__typename === 'Country') {
       recordMutation(state, 'created', 'country', { code: country.code, id: data.id });
     } else {
-      var msg = (data && (data.message || data.errorCode)) || 'createCountry failed';
+      var msg = buildCreateDiagnostic(res, data, 'createCountry failed', secrets);
       recordMutation(state, 'failed', 'country', { code: country.code, error: msg });
     }
   }
@@ -685,7 +722,7 @@ async function ensureZones(context, state, fetchFn, adminUrl, authToken, secrets
       zoneIds[name] = data.id;
       recordMutation(state, 'created', 'zone', { name: name, id: data.id });
     } else {
-      var msg = (data && (data.message || data.errorCode)) || 'createZone failed';
+      var msg = buildCreateDiagnostic(res, data, 'createZone failed', secrets);
       recordMutation(state, 'failed', 'zone', { name: name, error: msg });
     }
   }
