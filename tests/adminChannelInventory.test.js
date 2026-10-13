@@ -512,7 +512,117 @@ test('adminChannelInventory: works when shopApiBase not provided (product counts
     SUPERADMIN_PASSWORD: 'secretpass'
   });
   var result = await adminChannelInventory.collectChannelInventory(ctx, {});
+  var result = await adminChannelInventory.collectChannelInventory(ctx, {});
 
   assert.strictEqual(result.available, true);
   assert.strictEqual(result.perChannelProductCounts.length, 0, 'no product counts when shopApiBase not set');
+});
+
+// ---------------------------------------------------------------------------
+// Redaction tests: secret VALUES must never be serialized by the module.
+// ---------------------------------------------------------------------------
+
+var REDACTION_TOKEN = 'TESTCHANNELTOKEN123';
+var REDACTION_PASSWORD = 'TESTPASS!42';
+var REDACTION_AUTH = 'TESTAUTHTOKEN999';
+
+test('adminChannelInventory: discovered channel token is redacted in channels[] and perCountry', async function(t) {
+  var fetch = fakeAdminFetch({
+    loginStatus: 200,
+    loginTokenHeader: REDACTION_AUTH,
+    channelsResponse: {
+      data: {
+        channels: {
+          items: [
+            { id: 'ch-default', code: '__default_channel__', token: REDACTION_TOKEN, defaultCurrencyCode: 'USD' }
+          ],
+          totalItems: 1
+        }
+      }
+    },
+    productCounts: {}
+  });
+  var ctx = makeContext(fetch, {
+    VENDURE_ADMIN_API_URL: 'https://staging.tibella.eu/admin-api',
+    SUPERADMIN_USERNAME: 'admin@example.com',
+    SUPERADMIN_PASSWORD: REDACTION_PASSWORD
+  });
+  var result = await adminChannelInventory.collectChannelInventory(ctx, {
+    shopApiBase: 'https://staging.tibella.eu/shop-api'
+  });
+
+  assert.strictEqual(result.available, true);
+  assert.strictEqual(result.channels.length, 1, 'one channel reported');
+  // The channel token value must be redacted; id/code/currency stay visible.
+  assert.notStrictEqual(result.channels[0].token, REDACTION_TOKEN, 'raw channel token never returned');
+  assert.strictEqual(result.channels[0].token, '[REDACTED]', 'channel token replaced by [REDACTED]');
+  assert.strictEqual(result.channels[0].code, '__default_channel__', 'code stays visible');
+  assert.strictEqual(result.channels[0].id, 'ch-default', 'id stays visible');
+  assert.strictEqual(result.channels[0].currency, 'USD', 'currency stays visible');
+
+  var serialized = JSON.stringify(result);
+  assert.strictEqual(serialized.indexOf(REDACTION_TOKEN), -1, 'channel token not present anywhere in serialized result');
+  assert.strictEqual(serialized.indexOf(REDACTION_PASSWORD), -1, 'admin password not present in serialized result');
+  assert.strictEqual(serialized.indexOf(REDACTION_AUTH), -1, 'admin auth token not present in serialized result');
+  // No key named "secrets" may hold values (deep check on the return object).
+  var secretsKeyless = true;
+  (function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    Object.keys(node).forEach(function(k) {
+      if (k === 'secrets') secretsKeyless = false;
+      walk(node[k]);
+    });
+  })(result);
+  assert.strictEqual(secretsKeyless, true, 'no key named secrets anywhere in serializable result');
+});
+
+test('adminChannelInventory: product-count call records never carry secrets and redact the vendure-token header', async function(t) {
+  var fetch = fakeAdminFetch({
+    loginStatus: 200,
+    loginTokenHeader: REDACTION_AUTH,
+    channelsResponse: {
+      data: {
+        channels: {
+          items: [
+            { id: 'ch-default', code: '__default_channel__', token: REDACTION_TOKEN, defaultCurrencyCode: 'USD' }
+          ],
+          totalItems: 1
+        }
+      }
+    },
+    productCounts: { [REDACTION_TOKEN]: 3 }
+  });
+  var ctx = makeContext(fetch, {
+    VENDURE_ADMIN_API_URL: 'https://staging.tibella.eu/admin-api',
+    SUPERADMIN_USERNAME: 'admin@example.com',
+    SUPERADMIN_PASSWORD: REDACTION_PASSWORD
+  });
+  var result = await adminChannelInventory.collectChannelInventory(ctx, {
+    shopApiBase: 'https://staging.tibella.eu/shop-api'
+  });
+
+  // The channel token is used as the vendure-token header for the product probe.
+  assert.strictEqual(result.perChannelProductCounts.length, 1, 'product count collected for the channel');
+  var record = result.perChannelProductCounts[0];
+  assert.strictEqual(record.totalItems, 3, 'product count returned');
+  assert.strictEqual(record.channelCode, '__default_channel__', 'channelCode stays visible');
+
+  var serialized = JSON.stringify(result);
+  assert.strictEqual(serialized.indexOf(REDACTION_TOKEN), -1, 'channel token not present in serialized result');
+  assert.strictEqual(serialized.indexOf(REDACTION_PASSWORD), -1, 'admin password not present in serialized result');
+  assert.strictEqual(serialized.indexOf(REDACTION_AUTH), -1, 'admin auth token not present in serialized result');
+  // Deep check: no "secrets" key holds values in the returned object.
+  var secretsKeyless = true;
+  (function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    Object.keys(node).forEach(function(k) {
+      if (k === 'secrets') secretsKeyless = false;
+      walk(node[k]);
+    });
+  })(result);
+  assert.strictEqual(secretsKeyless, true, 'no key named secrets anywhere in serializable result');
+  // The vendure-token header value in the recorded call must be redacted.
+  if (record.call && record.call.request && record.call.request.headers) {
+    assert.notStrictEqual(record.call.request.headers['vendure-token'], REDACTION_TOKEN, 'vendure-token header value redacted');
+  }
 });

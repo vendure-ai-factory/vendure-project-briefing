@@ -18,6 +18,57 @@
 
 var path = require('path');
 
+var REDACTED_MARKER = '[REDACTED]';
+
+// ---------------------------------------------------------------------------
+// Redaction helpers (self-contained; the readOnlyShopApi executor also has
+// redactDeep/redactValue but importing it would create a dependency cycle).
+// ---------------------------------------------------------------------------
+
+function redactValue(value, secrets) {
+  if (typeof value !== 'string' || !secrets || secrets.length === 0) {
+    return value;
+  }
+  var out = value;
+  for (var i = 0; i < secrets.length; i++) {
+    out = out.split(secrets[i]).join(REDACTED_MARKER);
+  }
+  return out;
+}
+
+function redactDeep(value, secrets) {
+  if (Array.isArray(value)) {
+    return value.map(function(item) { return redactDeep(item, secrets); });
+  }
+  if (value !== null && typeof value === 'object') {
+    var out = {};
+    var keys = Object.keys(value);
+    for (var i = 0; i < keys.length; i++) {
+      out[keys[i]] = redactDeep(value[keys[i]], secrets);
+    }
+    return out;
+  }
+  return redactValue(value, secrets);
+}
+
+/**
+ * Deduplicate a list of secret values, dropping falsy entries.
+ */
+function uniqueSecrets(values) {
+  var seen = {};
+  var out = [];
+  if (!Array.isArray(values)) return out;
+  for (var i = 0; i < values.length; i++) {
+    var v = values[i];
+    if (typeof v !== 'string' || v.length === 0) continue;
+    if (!seen[v]) {
+      seen[v] = true;
+      out.push(v);
+    }
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Env var NAMES (never values) that this module is sensitive to.
 // ---------------------------------------------------------------------------
@@ -326,10 +377,13 @@ function buildChannelsQuery(introspectedFields) {
  * using the vendure-token header and record totalItems. Failures here are
  * non-fatal (recorded, not thrown).
  *
+ * Channel tokens are used only in memory (for the header and for redaction),
+ * never returned or written; every returned record has no `secrets` key.
+ *
  * @param {Function} fetchFn
  * @param {string} shopApiBase  - the /shop-api base URL (same host as admin-api)
  * @param {Array} channels      - array of {code, token}
- * @returns {Promise<Array>}  [{channelCode, totalItems, error}, ...]
+ * @returns {Promise<Array>}  [{channelCode, totalItems, error, call}, ...]
  */
 async function collectProductCounts(fetchFn, shopApiBase, channels) {
   if (!fetchFn || !channels || channels.length === 0) {
@@ -342,9 +396,10 @@ async function collectProductCounts(fetchFn, shopApiBase, channels) {
   for (var i = 0; i < channels.length; i++) {
     var channel = channels[i];
     var token = channel.token;
+    var code = channel.code;
 
     if (!token || typeof token !== 'string' || token.length === 0) {
-      results.push({ channelCode: channel.code, totalItems: null, error: 'no token' });
+      results.push({ channelCode: code, totalItems: null, error: 'no token' });
       continue;
     }
 
@@ -354,13 +409,18 @@ async function collectProductCounts(fetchFn, shopApiBase, channels) {
       variables: { options: { take: 0 } }
     });
 
-    var secrets = [token];
+    // Token stays in memory only: used for the header and for redaction, and
+    // is never added to a result record that can be written to evidence.
+    var tokenSecrets = [token];
     var requestRecord = {
       method: 'POST',
       url: url,
       headers: { 'content-type': 'application/json', 'vendure-token': token },
       body: bodyStr
     };
+    // Redact the recorded request as it is built so no token ever reaches the
+    // evidence object (covers headers["vendure-token"] and any echoed body).
+    requestRecord = redactDeep(requestRecord, tokenSecrets);
 
     try {
       var resp = await fetchFn(url, {
@@ -372,36 +432,40 @@ async function collectProductCounts(fetchFn, shopApiBase, channels) {
       var text = await resp.text();
       var parsed = null;
       try { parsed = JSON.parse(text); } catch (e) { parsed = { raw: text }; }
+      parsed = redactDeep(parsed, tokenSecrets);
 
       var httpStatus = (resp && typeof resp.status === 'number') ? resp.status : null;
       var respOk = httpStatus !== null ? (httpStatus >= 200 && httpStatus < 300) : !!resp.ok;
 
+      var callRecord = {
+        request: requestRecord,
+        response: { httpStatus: httpStatus, ok: respOk, body: parsed }
+      };
+      var error = null;
+
       if (!respOk || (parsed && parsed.errors && parsed.errors.length > 0)) {
-        results.push({
-          channelCode: channel.code,
-          totalItems: null,
-          error: 'shop-api error: HTTP ' + (httpStatus === null ? 'unknown' : httpStatus),
-          call: { request: requestRecord, response: { httpStatus: httpStatus, ok: respOk, body: parsed } },
-          secrets: secrets
-        });
-      } else {
-        var totalItems = (parsed && parsed.data && parsed.data.products && parsed.data.products.totalItems != null)
-          ? parsed.data.products.totalItems
-          : null;
-        results.push({
-          channelCode: channel.code,
-          totalItems: totalItems,
-          error: null,
-          call: { request: requestRecord, response: { httpStatus: resp.status, ok: resp.ok, body: parsed } },
-          secrets: secrets
-        });
+        error = 'shop-api error: HTTP ' + (httpStatus === null ? 'unknown' : httpStatus);
       }
+
+      results.push({
+        channelCode: code,
+        totalItems: respOk && !(parsed && parsed.errors && parsed.errors.length > 0)
+          ? ((parsed && parsed.data && parsed.data.products && parsed.data.products.totalItems != null)
+              ? parsed.data.products.totalItems : null)
+          : null,
+        error: error,
+        call: respOk ? callRecord : callRecord
+      });
     } catch (err) {
       results.push({
-        channelCode: channel.code,
+        channelCode: code,
         totalItems: null,
-        error: 'network: ' + (err && err.message ? err.message : String(err)),
-        secrets: secrets
+        error: redactValue('network: ' + (err && err.message ? err.message : String(err)), tokenSecrets),
+        call: {
+          request: requestRecord,
+          response: { httpStatus: null, ok: false, body: null },
+          error: redactValue(err && err.message ? err.message : String(err), tokenSecrets)
+        }
       });
     }
   }
@@ -624,6 +688,15 @@ async function collectChannelInventory(context, options) {
     };
   });
 
+  // Every channel token discovered here (including __default_channel__) is a
+  // secret value and must be redacted from any written evidence. Raw tokens
+  // are still needed below for matching and per-channel probes, so they are
+  // only added to the secret list now and redacted when the result is built.
+  for (var ct = 0; ct < channels.length; ct++) {
+    if (channels[ct].token) allSecrets.push(channels[ct].token);
+  }
+  allSecrets = uniqueSecrets(allSecrets);
+
   // ------------------------------------------------------------------
   // Compare against expected
   // ------------------------------------------------------------------
@@ -650,6 +723,16 @@ async function collectChannelInventory(context, options) {
     var exists = foundChannel !== null;
     var currencyMatches = exists && foundChannel.currency === expectedCurrency;
 
+    // Count every channel whose token equals the expected nominal token so a
+    // duplicated token (two channels racing for the same token) can be flagged
+    // without ever exposing raw token values.
+    var tokenMatchCount = 0;
+    for (var dc = 0; dc < channels.length; dc++) {
+      if (channels[dc].token && String(channels[dc].token).toLowerCase() === String(nominalToken).toLowerCase()) {
+        tokenMatchCount++;
+      }
+    }
+
     perCountry[country] = {
       expectedToken: nominalToken,
       expectedCurrency: expectedCurrency,
@@ -657,13 +740,37 @@ async function collectChannelInventory(context, options) {
       channelCode: foundChannel ? foundChannel.code : null,
       channelToken: foundChannel ? foundChannel.token : null,
       currency: foundChannel ? foundChannel.currency : null,
-      currencyMatches: currencyMatches
+      currencyMatches: currencyMatches,
+      tokenDuplicated: tokenMatchCount > 1,
+      tokenMatchCount: tokenMatchCount
     };
 
     if (!exists) {
       missing.push(country);
     }
   }
+
+  // Duplicate channel codes (public values) and expected countries whose token
+  // is claimed by more than one channel. Both are reported without exposing
+  // any discovered channel token value.
+  var seenCode = {};
+  var duplicateCodes = [];
+  for (var dl = 0; dl < channels.length; dl++) {
+    var chanCode = channels[dl].code;
+    if (chanCode && chanCode !== '__default_channel__') {
+      var ncode = String(chanCode).toLowerCase();
+      if (seenCode[ncode]) {
+        if (duplicateCodes.indexOf(chanCode) === -1) duplicateCodes.push(chanCode);
+      } else {
+        seenCode[ncode] = true;
+      }
+    }
+  }
+  var duplicateTokenCountries = [];
+  for (var dk in perCountry) {
+    if (perCountry[dk].tokenDuplicated) duplicateTokenCountries.push(dk);
+  }
+  duplicateTokenCountries.sort();
 
   var unexpectedDefaultOnly = false;
   if (channels.length === 1 && channels[0].code === '__default_channel__') {
@@ -689,7 +796,10 @@ async function collectChannelInventory(context, options) {
   // ------------------------------------------------------------------
   // Assemble result
   // ------------------------------------------------------------------
-  return {
+  // Redact every evidence-bound field with the full secret list (password,
+  // admin auth token, and every discovered channel token) so no secret value
+  // can reach written evidence. Channel id, code and currency stay visible.
+  var result = {
     available: true,
     reason: null,
     channels: channels,
@@ -706,9 +816,29 @@ async function collectChannelInventory(context, options) {
     credentialNames: credInfo,
     introspectedFields: introspectedFields,
     timestamp: timestamp,
-    callCount: callCount,
-    secrets: allSecrets  // password + authToken; used for redaction in caller
+    callCount: callCount
   };
+
+  // channels[].token, perCountry[].channelToken, product-count call headers
+  // and any echoed body are redacted as a whole so the resulting object is
+  // safe to write to evidence.
+  result.channels = redactDeep(channels, allSecrets);
+  result.perCountry = redactDeep(perCountry, allSecrets);
+  result.perChannelProductCounts = redactDeep(perChannelProductCounts, allSecrets);
+  result.expected = redactDeep(result.expected, allSecrets);
+
+  // The secret VALUES themselves are carried only in memory for the caller to
+  // redact any additional writes (e.g. executor-error.json). It is defined as a
+  // non-enumerable property so JSON.stringify / Object.keys deep checks never
+  // serialize it into evidence.
+  Object.defineProperty(result, 'secrets', {
+    value: allSecrets,
+    enumerable: false,
+    writable: true,
+    configurable: true
+  });
+
+  return result;
 }
 
 module.exports = {

@@ -590,6 +590,11 @@ async function runInventoryDiagnostic(context, taskId, result, tokensResult, sho
     adminApiBase: adminChannelInventory.resolveAdminApiBase(context)
   };
 
+  // Redact the complete object before it is written so no secret value
+  // (password, admin auth token, or any discovered channel token) can appear
+  // anywhere in admin-channel-inventory.json.
+  inventoryEvidence = redactDeep(inventoryEvidence, allSecrets);
+
   writeExecutorEvidence(context, taskId, [
     { name: 'admin-channel-inventory.json', data: inventoryEvidence, kind: 'diagnostic' }
   ], allSecrets);

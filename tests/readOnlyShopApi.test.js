@@ -873,3 +873,239 @@ test('readOnlyShopApi B1-03: inventory evidence written with kind:diagnostic and
 
   fs.rmSync(evidenceRoot, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// Redaction end-to-end tests: full B1-03 / B1-04 failure runs must not leak
+// secret VALUES into any written evidence file, and no JSON key "secrets" may
+// exist anywhere under the evidence dir.
+// ---------------------------------------------------------------------------
+
+var REDACT_TOKEN = 'TESTCHANNELTOKEN123';
+var REDACT_PASSWORD = 'TESTPASS!42';
+var REDACT_AUTH = 'TESTAUTHTOKEN999';
+
+/**
+ * Combined Shop + Admin API fetch where the Admin API reports a single
+ * __default_channel__ whose token is REDACT_TOKEN. Login returns REDACT_AUTH
+ * as the admin auth token. Used to prove secrets never reach evidence.
+ */
+function makeRedactionFetch() {
+  var fetchWrapper = function(url, init) {
+    var headers = (init && init.headers) ? init.headers : {};
+    var isAdmin = url.indexOf('/admin-api') !== -1 || !!(headers['Authorization'] || headers['vendure-auth-token']);
+
+    if (isAdmin) {
+      var body = init && init.body ? init.body : '';
+      if (body.indexOf('mutation Login') !== -1) {
+        return Promise.resolve({
+          status: 200,
+          headers: { get: function(n) { return n === 'vendure-auth-token' ? REDACT_AUTH : null; } },
+          text: function() {
+            return Promise.resolve(JSON.stringify({
+              data: { login: { __typename: 'CurrentUser', id: 'u1', identifier: 'admin@example.com' } }
+            }));
+          }
+        });
+      }
+      if (body.indexOf('__type') !== -1) {
+        return Promise.resolve({
+          status: 200, headers: { get: function() { return null; } },
+          text: function() {
+            return Promise.resolve(JSON.stringify({
+              data: { __type: { fields: [{ name: 'id' }, { name: 'code' }, { name: 'token' }, { name: 'defaultCurrencyCode' }] } }
+            }));
+          }
+        });
+      }
+      if (body.indexOf('channels(') !== -1) {
+        return Promise.resolve({
+          status: 200, headers: { get: function() { return null; } },
+          text: function() {
+            return Promise.resolve(JSON.stringify({
+              data: { channels: { items: [{ id: 'ch-default', code: '__default_channel__', token: REDACT_TOKEN, defaultCurrencyCode: 'USD' }], totalItems: 1 } }
+            }));
+          }
+        });
+      }
+      return Promise.resolve({ status: 404, headers: { get: function() { return null; } }, text: function() { return Promise.resolve('{}'); } });
+    }
+
+    // Shop API
+    var body = init && init.body ? init.body : '';
+    if (String(body).indexOf('ActiveChannelProbe') !== -1) {
+      return Promise.resolve({
+        status: 200, ok: true,
+        text: function() { return Promise.resolve(JSON.stringify({ data: { activeChannel: { code: '__default_channel__', currencyCode: 'USD' } } })); }
+      });
+    }
+    return Promise.resolve({
+      status: 200, ok: true,
+      text: function() { return Promise.resolve(JSON.stringify({ data: null, errors: [{ message: 'invalid input syntax for type integer: "undefined"', path: ['products'] }] })); }
+    });
+  };
+  return fetchWrapper;
+}
+
+function collectAllEvidenceFiles(rootDir) {
+  var files = [];
+  (function walk(dir) {
+    if (!fs.existsSync(dir)) return;
+    fs.readdirSync(dir, { withFileTypes: true }).forEach(function(entry) {
+      var full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) files.push(full);
+    });
+  })(rootDir);
+  return files;
+}
+
+function assertNoSecretsInTree(rootDir, secretValues) {
+  var j = 0;
+  (function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    Object.keys(node).forEach(function(k) {
+      if (k === 'secrets' && Array.isArray(node[k])) {
+        // The key itself may only exist if non-enumerable/in-memory; a
+        // serialized evidence object must not contain a serializable "secrets".
+        j++;
+      }
+      walk(node[k]);
+    });
+  })({ __root: null });
+  // Re-read every file and scan its bytes.
+  var files = collectAllEvidenceFiles(rootDir);
+  for (var i = 0; i < files.length; i++) {
+    var content = fs.readFileSync(files[i], 'utf8');
+    for (var s = 0; s < secretValues.length; s++) {
+      assert.strictEqual(content.indexOf(secretValues[s]), -1,
+        'secret value must not appear in ' + files[i]);
+    }
+  }
+}
+
+test('readOnlyShopApi B1-03: full failure run writes no secret token/password/auth into any evidence file', async function(t) {
+  var evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ev-redact-'));
+  var runId = 'run-redact-' + Date.now().toString(36);
+  var ctx = baseContext('CAN-B1-03', {
+    fetch: makeRedactionFetch(),
+    evidenceRoot: evidenceRoot,
+    runEnvRecord: { runId: runId, stagingUrl: 'https://staging.tibella.eu' },
+    getEnv: function() { return { CHANNEL_TOKENS: TOKENS_JSON, SUPERADMIN_USERNAME: 'admin@example.com', SUPERADMIN_PASSWORD: REDACT_PASSWORD, VENDURE_ADMIN_API_URL: 'https://staging.tibella.eu/admin-api' }; }
+  });
+  var outcome = await executors.handlerB1_03(ctx);
+
+  assert.strictEqual(outcome.success, false);
+  assert.strictEqual(outcome.errorCode, 'STAGING_DATA_MISSING', 'errorCode preserved (no behaviour change)');
+
+  var files = collectAllEvidenceFiles(evidenceRoot);
+  assert.ok(files.length > 0, 'evidence files were written');
+
+  // 1) No secret string appears in any byte of any written file.
+  for (var i = 0; i < files.length; i++) {
+    var content = fs.readFileSync(files[i], 'utf8');
+    assert.strictEqual(content.indexOf(REDACT_TOKEN), -1, 'channel token not in ' + files[i]);
+    assert.strictEqual(content.indexOf(REDACT_PASSWORD), -1, 'admin password not in ' + files[i]);
+    assert.strictEqual(content.indexOf(REDACT_AUTH), -1, 'admin auth token not in ' + files[i]);
+  }
+
+  // 2) No serializable key named "secrets" in any written JSON (deep check).
+  files.forEach(function(file) {
+    if (path.extname(file) !== '.json') return;
+    var data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    var found = [];
+    (function walk(node) {
+      if (!node || typeof node !== 'object') return;
+      Object.keys(node).forEach(function(k) {
+        if (k === 'secrets') found.push(k);
+        walk(node[k]);
+      });
+    })(data);
+    assert.deepStrictEqual(found, [], 'no secret VALUES array key "secrets" in ' + file);
+  });
+
+  // 3) Evidence content preserved: code/id/currency/missing/unexpectedDefaultOnly.
+  var invFile = files.filter(function(f) { return f.indexOf('admin-channel-inventory.json') !== -1; })[0];
+  assert.ok(invFile, 'admin-channel-inventory.json written');
+  var inv = JSON.parse(fs.readFileSync(invFile, 'utf8'));
+  assert.strictEqual(inv.available, true);
+  assert.strictEqual(inv.unexpectedDefaultOnly, true, 'unexpectedDefaultOnly preserved');
+  assert.deepStrictEqual(inv.missing.sort(), ['AT', 'DE', 'GB', 'HU'].sort(), 'missing preserved');
+  var ch = inv.channels && inv.channels[0];
+  assert.ok(ch, 'channels list present');
+  assert.strictEqual(ch.code, '__default_channel__', 'channel code visible');
+  assert.strictEqual(ch.id, 'ch-default', 'channel id visible');
+  assert.strictEqual(ch.currency, 'USD', 'channel currency visible');
+  assert.notStrictEqual(ch.token, REDACT_TOKEN, 'channel token value redacted');
+  assert.ok(String(ch.token).indexOf(REDACT_TOKEN) === -1, 'no token bytes in channel token field');
+
+  // 4) Canonical record still written and redacted.
+  var recordFile = files.filter(function(f) { return f.indexOf('record.json') !== -1; })[0];
+  if (recordFile) {
+    var recordContent = fs.readFileSync(recordFile, 'utf8');
+    assert.strictEqual(recordContent.indexOf(REDACT_TOKEN), -1, 'token not in record.json');
+    assert.strictEqual(recordContent.indexOf(REDACT_PASSWORD), -1, 'password not in record.json');
+  }
+
+  fs.rmSync(evidenceRoot, { recursive: true, force: true });
+});
+
+test('readOnlyShopApi B1-04: full failure run writes no secret token/password/auth into any evidence file', async function(t) {
+  var real = realWorkspace();
+  var evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ev-redact-b04-'));
+  var runId = 'run-redact-b04-' + Date.now().toString(36);
+  var ctx = baseContext('CAN-B1-04', {
+    fetch: makeRedactionFetch(),
+    workspace: real.ws,
+    mkdirSync: real.deps.mkdirSync,
+    writeFileSync: real.deps.writeFileSync,
+    readFileSync: real.deps.readFileSync,
+    evidenceRoot: evidenceRoot,
+    runEnvRecord: { runId: runId, stagingUrl: 'https://staging.tibella.eu' },
+    getEnv: function() { return { CHANNEL_TOKENS: TOKENS_JSON, SUPERADMIN_USERNAME: 'admin@example.com', SUPERADMIN_PASSWORD: REDACT_PASSWORD, VENDURE_ADMIN_API_URL: 'https://staging.tibella.eu/admin-api' }; }
+  });
+  var outcome = await executors.handlerB1_04(ctx);
+
+  assert.strictEqual(outcome.success, false);
+  assert.strictEqual(outcome.errorCode, 'STAGING_DATA_MISSING', 'errorCode preserved (no behaviour change)');
+
+  var files = collectAllEvidenceFiles(evidenceRoot);
+  assert.ok(files.length > 0, 'evidence files were written');
+
+  for (var i = 0; i < files.length; i++) {
+    var content = fs.readFileSync(files[i], 'utf8');
+    assert.strictEqual(content.indexOf(REDACT_TOKEN), -1, 'channel token not in ' + files[i]);
+    assert.strictEqual(content.indexOf(REDACT_PASSWORD), -1, 'admin password not in ' + files[i]);
+    assert.strictEqual(content.indexOf(REDACT_AUTH), -1, 'admin auth token not in ' + files[i]);
+  }
+
+  files.forEach(function(file) {
+    if (path.extname(file) !== '.json') return;
+    var data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    var found = [];
+    (function walk(node) {
+      if (!node || typeof node !== 'object') return;
+      Object.keys(node).forEach(function(k) {
+        if (k === 'secrets') found.push(k);
+        walk(node[k]);
+      });
+    })(data);
+    assert.deepStrictEqual(found, [], 'no secret VALUES array key "secrets" in ' + file);
+  });
+
+  var invFile = files.filter(function(f) { return f.indexOf('admin-channel-inventory.json') !== -1; })[0];
+  assert.ok(invFile, 'admin-channel-inventory.json written');
+  var inv = JSON.parse(fs.readFileSync(invFile, 'utf8'));
+  assert.strictEqual(inv.available, true);
+  assert.strictEqual(inv.unexpectedDefaultOnly, true, 'unexpectedDefaultOnly preserved');
+  assert.deepStrictEqual(inv.missing.sort(), ['AT', 'DE', 'GB', 'HU'].sort(), 'missing preserved');
+  var ch = inv.channels && inv.channels[0];
+  assert.ok(ch, 'channels list present');
+  assert.strictEqual(ch.code, '__default_channel__', 'channel code visible');
+  assert.strictEqual(ch.id, 'ch-default', 'channel id visible');
+  assert.strictEqual(ch.currency, 'USD', 'channel currency visible');
+  assert.ok(String(ch.token).indexOf(REDACT_TOKEN) === -1, 'no token bytes in channel token field');
+
+  fs.rmSync(evidenceRoot, { recursive: true, force: true });
+  fs.rmSync(real.ws.workspacePath, { recursive: true, force: true });
+});
+
