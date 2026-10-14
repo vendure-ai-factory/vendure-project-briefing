@@ -156,6 +156,31 @@ function initEvidenceIndex(runId, meta, options) {
   if (options.reuseExisting === true) {
     var existing = loadIndex(root, runId);
     if (existing.exists && existing.index && existing.index.runId === runId) {
+      // Even when reusing an existing index, update top-level metadata fields
+      // if the new meta provides non-null values for fields that are currently null.
+      // This ensures that when a later caller (e.g. seedStaging) has proper metadata
+      // but an earlier caller (e.g. cli.js) created the index with null metadata,
+      // the fields get populated correctly.
+      var changed = false;
+      var idx = existing.index;
+      if (meta.executionRevision != null && idx.executionRevision == null) {
+        idx.executionRevision = meta.executionRevision;
+        changed = true;
+      }
+      if (meta.referenceCommit != null && idx.referenceCommit == null) {
+        idx.referenceCommit = meta.referenceCommit;
+        changed = true;
+      }
+      if (meta.protectedPathsHash != null && idx.protectedPathsHash == null) {
+        idx.protectedPathsHash = meta.protectedPathsHash;
+        changed = true;
+      }
+      if (changed) {
+        var serialized = JSON.stringify(idx, null, 2) + '\n';
+        var finalContent = redactContent(serialized, collectSecrets(options).values);
+        fs.writeFileSync(indexFile(root, runId), finalContent, 'utf8');
+        return { ok: true, index: JSON.parse(finalContent), reused: true };
+      }
       return { ok: true, index: existing.index, reused: true };
     }
   }

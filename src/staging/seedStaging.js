@@ -2088,18 +2088,17 @@ function writeSeedEvidence(context, state, evidencePayload) {
       // The evidence collector requires the run index to exist before
       // writeEvidenceFile appends to it; initialise it at the same resolved
       // root+baseDir so the file lands at evidence/<runId>/seed/seed-record.json.
-      // The index is created with the run metadata (git HEAD, manifest
+      // The index is created/updated with the run metadata (git HEAD, manifest
       // reference commit, protected-path hash at start) so the compliance
       // report can read index.json top-level fields instead of n/a.
+      // Even if the index was already created (e.g. by cli.js with null metadata),
+      // initEvidenceIndex with reuseExisting:true will update null fields.
       var initOpts = { root: (opts.root || process.cwd()), baseDir: (opts.baseDir || 'evidence'), reuseExisting: true };
-      var loaded = evidenceCollector.loadIndex(path.resolve(initOpts.root, initOpts.baseDir), runId);
-      if (!loaded.exists) {
-        evidenceCollector.initEvidenceIndex(runId, {
-          executionRevision: gitHeadOf(context),
-          referenceCommit: referenceCommitOf(context),
-          protectedPathsHash: protectedPathsHashOf(context)
-        }, initOpts);
-      }
+      evidenceCollector.initEvidenceIndex(runId, {
+        executionRevision: gitHeadOf(context),
+        referenceCommit: referenceCommitOf(context),
+        protectedPathsHash: protectedPathsHashOf(context)
+      }, initOpts);
       var res = evidenceCollector.writeEvidenceFile(runId, 'seed', SEED_EVIDENCE_FILENAME, content, opts);
       return { ok: true, result: res };
     } catch (e) {

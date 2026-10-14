@@ -131,6 +131,54 @@ test('evidenceCollector: initEvidenceIndex reuseExisting keeps earlier tasks and
   done();
 });
 
+test('evidenceCollector: initEvidenceIndex reuseExisting:true updates null metadata fields', function(t, done) {
+  wipeAll();
+  var runId = 'run-reuse-meta-' + Date.now();
+
+  // First "child" process initializes the index without metadata (e.g. cli.js
+  // with null runEnvRecord). The index exists but has null top-level fields.
+  var first = evidence.initEvidenceIndex(runId, {}, opts({ reuseExisting: true }));
+  assert.strictEqual(first.ok, true);
+  assert.strictEqual(first.reused, false);
+  assert.strictEqual(first.index.executionRevision, null);
+  assert.strictEqual(first.index.referenceCommit, null);
+  assert.strictEqual(first.index.protectedPathsHash, null);
+
+  // A later "child" (e.g. seedStaging) calls initEvidenceIndex with actual
+  // metadata. With reuseExisting:true the existing index is reused BUT null
+  // fields must be populated from the new meta.
+  var second = evidence.initEvidenceIndex(runId, {
+    executionRevision: 'git-head-abc123',
+    referenceCommit: 'ref-commit-xyz',
+    protectedPathsHash: 'protected-hash-789'
+  }, opts({ reuseExisting: true }));
+
+  assert.strictEqual(second.ok, true);
+  assert.strictEqual(second.reused, true, 'existing index must be reused');
+  assert.strictEqual(second.index.executionRevision, 'git-head-abc123', 'null executionRevision must be updated');
+  assert.strictEqual(second.index.referenceCommit, 'ref-commit-xyz', 'null referenceCommit must be updated');
+  assert.strictEqual(second.index.protectedPathsHash, 'protected-hash-789', 'null protectedPathsHash must be updated');
+
+  // Verify the file on disk also has the updated metadata.
+  var indexPath = path.join(runRoot(runId), 'index.json');
+  var indexOnDisk = JSON.parse(readText(indexPath));
+  assert.strictEqual(indexOnDisk.executionRevision, 'git-head-abc123');
+  assert.strictEqual(indexOnDisk.referenceCommit, 'ref-commit-xyz');
+  assert.strictEqual(indexOnDisk.protectedPathsHash, 'protected-hash-789');
+
+  // A third call with more null fields in existing index should not overwrite
+  // already-set values.
+  var third = evidence.initEvidenceIndex(runId, {
+    executionRevision: 'different-head',
+    referenceCommit: 'different-ref'
+  }, opts({ reuseExisting: true }));
+  assert.strictEqual(third.index.executionRevision, 'git-head-abc123', 'non-null field must not be overwritten');
+  assert.strictEqual(third.index.referenceCommit, 'ref-commit-xyz', 'non-null field must not be overwritten');
+
+  removeRun(runId);
+  done();
+});
+
 test('evidenceCollector: writeEvidenceFile computes sha256, updates index, redacts secrets', function(t, done) {
   wipeAll();
   var runId = 'run-write-' + Date.now();
