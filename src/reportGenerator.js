@@ -104,6 +104,60 @@ function readTaskRecordFor(options, runId, taskId) {
 }
 
 /**
+ * True when the task id is the reserved seeding step ("seed"). Its evidence is
+ * a kind "seed" entry (seed/seed-record.json), not a canonical record.json.
+ */
+function isSeedTaskId(taskId) {
+  return taskId === 'seed';
+}
+
+/**
+ * Read the seed evidence file (the kind "seed" entry's path) from the run
+ * index. Returns the parsed JSON or null when missing/unreadable.
+ */
+function readSeedEvidence(options, index, taskId) {
+  if (!index || !index.tasks || !index.tasks[taskId]) return null;
+  var entries = index.tasks[taskId] || [];
+  var seedPath = null;
+  for (var i = 0; i < entries.length; i++) {
+    if (entries[i] && entries[i].kind === 'seed' && entries[i].path) {
+      seedPath = entries[i].path;
+      break;
+    }
+  }
+  if (!seedPath) return null;
+  var root = resolveRoot(options);
+  var absPath = path.join(root, index.runId, seedPath);
+  try {
+    return JSON.parse(require('fs').readFileSync(absPath, 'utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Derive an outcome for seed evidence. A seed with ok:true is a passing seed
+ * (RESULT_PASS); any other seed evidence is BLOCK (never a passing outcome),
+ * with the seed reason surfaced as cause. A null / unreadable seed evidence
+ * returns null so the task shows MISSING_EVIDENCE.
+ */
+function seedOutcome(seedEvidence) {
+  if (!seedEvidence || typeof seedEvidence !== 'object') return null;
+  if (seedEvidence.ok === true) {
+    return {
+      result: RESULT_PASS,
+      classification: 'SEED_OK',
+      cause: null
+    };
+  }
+  return {
+    result: RESULT_BLOCK,
+    classification: 'SEED_FAILED',
+    cause: seedEvidence.reason || seedEvidence.error || 'SEED_FAILED'
+  };
+}
+
+/**
  * Build an acceptance report from evidence for a single run.
  *
  * Evidence is read strictly through evidenceCollector.verifyEvidence(runId)
@@ -164,6 +218,22 @@ function generateReport(runId, options) {
     var resultValue = record.result !== undefined ? record.result : null;
     var startHash = record.protectedStartHash !== undefined ? record.protectedStartHash : null;
     var endHash = record.protectedEndHash !== undefined ? record.protectedEndHash : null;
+
+    // Seed evidence (kind "seed") is accepted directly: ok:true -> the
+    // passing outcome; any other seed evidence -> BLOCK (never a passing
+    // outcome). The seed record does not carry the canonical record result
+    // field, so the outcome is derived here instead of falling through to
+    // MISSING_EVIDENCE.
+    if (isSeedTaskId(taskId)) {
+      var seedValue = readSeedEvidence(options, index, taskId);
+      var seedDecision = seedOutcome(seedValue);
+      if (seedDecision && vTask.ok) {
+        resultValue = seedDecision.result;
+        record = Object.assign({}, record, { classification: seedDecision.classification, cause: seedDecision.cause });
+      } else {
+        resultValue = null;
+      }
+    }
 
     // A task is MISSING_EVIDENCE (never a passing outcome) when its record has
     // no result field, or when evidence verification fails.

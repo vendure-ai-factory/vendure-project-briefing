@@ -239,3 +239,57 @@ test('reportGenerator: run-level protectedEndHash is never flagged as a mismatch
   removeRun(runId);
   done();
 });
+
+test('reportGenerator: a passing seed (kind seed, ok:true) reports the passing outcome not MISSING_EVIDENCE', function(t, done) {
+  wipeAll();
+  var runId = 'rg-seedpass-' + Date.now();
+  evidenceCollector.initEvidenceIndex(runId, {}, opts());
+  evidenceCollector.writeEvidenceFile(runId, 'seed', 'seed-record.json',
+    JSON.stringify({ ok: true, reason: null, host: 'staging.tibella.eu' }, null, 2),
+    Object.assign({ kind: 'seed' }, opts()));
+
+  var report = reportModule.generateReport(runId, opts());
+  var entry = report.tasks['seed'];
+  assert.ok(entry, 'seed task must be present');
+  assert.strictEqual(entry.ok, true);
+  assert.strictEqual(entry.outcome, reportModule.RESULT_PASS);
+  assert.strictEqual(entry.result, reportModule.RESULT_PASS);
+  removeRun(runId);
+  done();
+});
+
+test('reportGenerator: a failed seed (kind seed, ok:false) reports BLOCK, never a passing outcome', function(t, done) {
+  wipeAll();
+  var runId = 'rg-seedblock-' + Date.now();
+  evidenceCollector.initEvidenceIndex(runId, {}, opts());
+  evidenceCollector.writeEvidenceFile(runId, 'seed', 'seed-record.json',
+    JSON.stringify({ ok: false, reason: 'SEED_HOST_NOT_ALLOWED', host: 'evil.example.com' }, null, 2),
+    Object.assign({ kind: 'seed' }, opts()));
+
+  var report = reportModule.generateReport(runId, opts());
+  var entry = report.tasks['seed'];
+  assert.ok(entry, 'seed task must be present');
+  assert.strictEqual(entry.ok, true, 'seed evidence file verified -> task ok');
+  assert.strictEqual(entry.outcome, reportModule.RESULT_BLOCK);
+  assert.strictEqual(entry.outcome === reportModule.RESULT_PASS, false, 'a failed seed must never be a passing outcome');
+  assert.strictEqual(entry.classification, 'SEED_FAILED');
+  assert.strictEqual(entry.cause, 'SEED_HOST_NOT_ALLOWED');
+  removeRun(runId);
+  done();
+});
+
+test('reportGenerator: tampered seed evidence stays MISSING_EVIDENCE', function(t, done) {
+  wipeAll();
+  var runId = 'rg-seedmissing-' + Date.now();
+  evidenceCollector.initEvidenceIndex(runId, {}, opts());
+  evidenceCollector.writeEvidenceFile(runId, 'seed', 'seed-record.json',
+    JSON.stringify({ ok: true }, null, 2),
+    Object.assign({ kind: 'seed' }, opts()));
+  fs.writeFileSync(path.join(runRoot(runId), 'seed', 'seed-record.json'), JSON.stringify({ ok: true, tampered: 1 }), 'utf8');
+  var report = reportModule.generateReport(runId, opts());
+  var entry = report.tasks['seed'];
+  assert.strictEqual(entry.ok, false);
+  assert.strictEqual(entry.outcome, evidenceCollector.MISSING_EVIDENCE);
+  removeRun(runId);
+  done();
+});

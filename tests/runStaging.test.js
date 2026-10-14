@@ -10,6 +10,9 @@ var assert = require('node:assert');
 var TEST_BASE = path.resolve(__dirname, '..', 'runs', 'run-staging-test-' + Date.now());
 var APPROVED = ['CAN-B1-03', 'CAN-B1-04', 'CAN-B2-16'];
 var MANIFEST = 'manifest/acceptance-manifest.v0.4.json';
+// Real-shaped (non-placeholder) channel tokens the seeded mock DB and the
+// CHANNEL_TOKENS env both use. The runtime seeder rejects placeholder tokens.
+var TEST_CHANNEL_TOKENS = { DE: 'tok-de-real-9f', AT: 'tok-at-real-8e', HU: 'tok-hu-real-7d', GB: 'tok-gb-real-6c' };
 
 function freshDir(label) {
   var d = path.join(TEST_BASE, label);
@@ -743,10 +746,9 @@ function makeSeedIntegrationFetch(opts) {
     if (u.indexOf('/health') !== -1) {
       return Promise.resolve({ status: 200, json: function() { return Promise.resolve({ status: 'ok' }); } });
     }
-    if (query.indexOf('__typename') !== -1) {
-      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, json: function() { return Promise.resolve({ data: { __typename: 'Query' } }); } });
-    }
-    // Shop preflight query ({ __typename }) on /shop-api
+    // Admin login query before the generic __typename probe: the login mutation
+    // itself contains `__typename` and must hit the login handler (with a .text
+    // body reader), not the JSON-only probe response.
     if (!isShop && query.indexOf('mutation Login') !== -1) {
       if (opts.loginStatus === 500) {
         return Promise.resolve({ status: 500, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify({})); } });
@@ -757,12 +759,23 @@ function makeSeedIntegrationFetch(opts) {
         text: function() { return Promise.resolve(JSON.stringify({ data: { login: { __typename: 'CurrentUser', id: 'u1', identifier: 'admin@staging.local' } } })); }
       });
     }
+    // Admin mutations (which themselves contain `__typename`) before the probe:
+    // they must hit the mutation branch with a .text body reader.
+    if (!isShop && query.indexOf('mutation') !== -1) {
+      if (opts.mutationFail && query.indexOf(opts.mutationFail) !== -1) {
+        return seedResponse({
+          errors: [{ message: opts.mutationErrorMessage || "Expected value of type 'GlobalFlag'." }],
+          data: null
+        });
+      }
+      return seedResponse(defaultMutationResponse(query));
+    }
+    if (query.indexOf('__typename') !== -1) {
+      return { status: 200, headers: { get: function() { return null; } }, json: function() { return Promise.resolve({ data: { __typename: 'Query' } }); } };
+    }
     if (query.indexOf('Introspect') !== -1 || query.indexOf('__type') !== -1) {
       var introspectionData = opts.introspection || defaultIntrospection();
       return seedResponse(introspectionData);
-    }
-    if (query.indexOf('mutation') !== -1) {
-      return seedResponse(defaultMutationResponse(query));
     }
     // Admin read queries -> empty sets unless opts.adminRead provides data
     return seedResponse(opts.adminRead ? opts.adminRead(query) : emptyAdminRead(query));
@@ -841,6 +854,9 @@ function emptyAdminRead(query) {
 }
 
 function defaultMutationResponse(query) {
+  if (query.indexOf('updateGlobalSettings') !== -1) {
+    return { data: { updateGlobalSettings: { availableLanguages: ['de', 'en'] } } };
+  }
   if (query.indexOf('createCountry') !== -1) {
     return { data: { createCountry: { __typename: 'Country', id: 'seeded-country' } } };
   }
@@ -877,13 +893,62 @@ function defaultMutationResponse(query) {
   return { data: {} };
 }
 
+function seedReadyAdminRead(query) {
+  var data = emptyAdminRead(query).data;
+  if (query.indexOf('globalSettings') !== -1) {
+    data.globalSettings = { availableLanguages: ['en'] };
+  }
+  if (query.indexOf('countries') !== -1) {
+    data.countries = { items: [{ id: 'cnt-de', code: 'DE', enabled: true }], totalItems: 1 };
+  }
+  if (query.indexOf('zones') !== -1) {
+    data.zones = { items: [{ id: 'zone-eu', name: 'EU' }, { id: 'zone-noneu', name: 'Non-EU' }], totalItems: 2 };
+  }
+  if (query.indexOf('stockLocations') !== -1) {
+    data.stockLocations = { items: [
+      { id: 'loc-global', name: 'Global', type: 'default' },
+      { id: 'loc-de', name: 'DE Warehouse', type: 'default' },
+      { id: 'loc-at', name: 'AT Warehouse', type: 'default' },
+      { id: 'loc-hu', name: 'HU Warehouse', type: 'default' },
+      { id: 'loc-gb', name: 'GB Warehouse', type: 'default' }
+    ], totalItems: 5 };
+  }
+  if (query.indexOf('products') !== -1) {
+    data.products = { items: [], totalItems: 0 };
+  }
+  if (query.indexOf('customers') !== -1) {
+    data.customers = { items: [], totalItems: 0 };
+  }
+  return { data: data };
+}
+
+function seedReadyEnv() {
+  return {
+    'STAGING_ADMIN_EMAIL': 'admin@staging.local',
+    'STAGING_ADMIN_PASSWORD': 'staging-admin-pw-1',
+    'STRIPE_SECRET_KEY': 'dummy-stripe-secret',
+    'OPENROUTER_API_KEY': 'dummy-openrouter-secret',
+    'SEED_TEST_CUSTOMER_PASSWORD': 'test-customer-pw-zz9',
+    'CHANNEL_TOKENS': JSON.stringify(TEST_CHANNEL_TOKENS)
+  };
+}
+
+function globalSettingsAdminRead(query) {
+  var data = emptyAdminRead(query).data;
+  if (query.indexOf('globalSettings') !== -1) {
+    data.globalSettings = { availableLanguages: ['en'] };
+  }
+  return { data: data };
+}
+
 test('runStaging: --seed-test-data runs the seeder once before the stages and never prints values', async function() {
   var mod = await loadModule();
   var child = makeChild({ results: {} });
   var deps = makeDeps('seed-runs', {
     child: child,
     taskIds: APPROVED,
-    fetch: makeSeedIntegrationFetch({})
+    env: seedReadyEnv(),
+    fetch: makeSeedIntegrationFetch({ adminRead: seedReadyAdminRead })
   });
   deps.args.stagingUrl = 'https://staging.tibella.eu';
   deps.args.seedTestData = true;
@@ -899,6 +964,8 @@ test('runStaging: --seed-test-data runs the seeder once before the stages and ne
   assert.ok(summary.seed, 'run-summary must include a seed field');
   assert.strictEqual(summary.seed.ran, true);
   assert.strictEqual(summary.seed.dryRun, false);
+  assert.strictEqual(summary.seed.ok, true, 'with client secrets supplied the seed succeeds');
+  assert.strictEqual(summary.seed.classification, null, 'a passing seed carries no classification');
   assert.ok(typeof summary.seed.created === 'number');
 
   // archived run.json records it too
@@ -908,28 +975,146 @@ test('runStaging: --seed-test-data runs the seeder once before the stages and ne
   assert.strictEqual(runJson.seed.ran, true);
 });
 
-test('runStaging: a seeder failure does not stop the stages', async function() {
+test('runStaging: a network seeder failure is DEPENDENCY_ENVIRONMENT and does not spawn the dependent tasks', async function() {
   var mod = await loadModule();
   var child = makeChild({ results: {} });
   var deps = makeDeps('seed-fails', {
     child: child,
     taskIds: APPROVED,
+    env: seedReadyEnv(),
     fetch: makeSeedIntegrationFetch({ loginStatus: 500 })
   });
   deps.args.stagingUrl = 'https://staging.tibella.eu';
   deps.args.seedTestData = true;
 
   var result = await mod.runStaging(deps);
-  assert.strictEqual(child.spawnCalls.length, 3, 'stages must still run after a seeder failure');
+  // Only CAN-B2-16 (dry run, no staging dependency) may still run; the two
+  // dependent tasks are surfaced as BLOCK stages, never spawned.
+  assert.strictEqual(child.spawnCalls.length, 1, 'only the dry-run task may spawn after a failed seed');
   assert.ok(result.stages.length === 3);
+  assert.strictEqual(result.exitCode, mod.PIPELINE_DEFECT_EXIT, 'a seed failure plus blocked dependents exits non-zero');
 
   var summary = JSON.parse(fs.readFileSync(path.join(deps.cwd, 'reports', deps.runId, 'run-summary.json'), 'utf8'));
   assert.ok(summary.seed);
   assert.strictEqual(summary.seed.ran, true);
   assert.strictEqual(summary.seed.ok, false, 'login failure makes the seeder fail');
   assert.strictEqual(summary.seed.reason, 'ADMIN_LOGIN_FAILED');
-  // failed seed must not make the run exit non-zero by itself (stages define exit)
-  assert.strictEqual(result.exitCode, 0, 'the seed never aborts the run; only stages affect the exit code');
+  // A login failure (network level, HTTP 500) is an environment problem.
+  assert.strictEqual(summary.seed.classification, 'DEPENDENCY_ENVIRONMENT', 'network login failure is an environment dependency');
+
+  // Each dependent readiness task must appear as a BLOCK carrying the seed
+  // classification and the not-executed note, never PASS.
+  var bl = result.stages.filter(function(s) { return s.cause === 'not executed: seed failed'; });
+  assert.strictEqual(bl.length, 2, 'two dependent readiness tasks are blocked');
+  for (var i = 0; i < bl.length; i++) {
+    assert.strictEqual(bl[i].classification, 'DEPENDENCY_ENVIRONMENT', 'blocked task carries the seed classification');
+    assert.strictEqual(bl[i].summary.tasks[0].result, 'BLOCK', 'blocked task result is BLOCK, never PASS');
+  }
+  // The dry-run stage is a real spawn, not a block.
+  var dry = result.stages.find(function(s) { return s.name === 'task-CAN-B2-16'; });
+  assert.ok(dry, 'CAN-B2-16 still exists as a stage');
+});
+
+test('runStaging: a seed spec/GraphQL failure is PIPELINE_DEFECT and blocks the dependent tasks', async function() {
+  var mod = await loadModule();
+  var child = makeChild({ results: {} });
+  var deps = makeDeps('seed-defect', {
+    child: child,
+    taskIds: APPROVED,
+    env: seedReadyEnv(),
+    fetch: makeSeedIntegrationFetch({
+      adminRead: globalSettingsAdminRead,
+      mutationFail: 'updateGlobalSettings',
+      mutationErrorMessage: "Language 'en' is not available in the schema; cannot enable language"
+    })
+  });
+  deps.args.stagingUrl = 'https://staging.tibella.eu';
+  deps.args.seedTestData = true;
+
+  var result = await mod.runStaging(deps);
+  assert.strictEqual(child.spawnCalls.length, 1, 'only the dry-run task may spawn after a failed seed');
+  assert.ok(result.stages.length === 3);
+
+  var summary = JSON.parse(fs.readFileSync(path.join(deps.cwd, 'reports', deps.runId, 'run-summary.json'), 'utf8'));
+  assert.ok(summary.seed);
+  assert.strictEqual(summary.seed.ok, false);
+  assert.strictEqual(summary.seed.classification, 'PIPELINE_DEFECT', 'language availability from the seed spec is a Pipeline defect');
+  assert.strictEqual(summary.anyPipelineDefect, true, 'a seed Pipeline defect surfaces anyPipelineDefect');
+
+  var bl = result.stages.filter(function(s) { return s.cause === 'not executed: seed failed'; });
+  assert.strictEqual(bl.length, 2);
+  for (var i = 0; i < bl.length; i++) {
+    assert.strictEqual(bl[i].classification, 'PIPELINE_DEFECT', 'blocked task carries the seed classification');
+    assert.strictEqual(bl[i].summary.tasks[0].result, 'BLOCK', 'blocked task result is BLOCK, never PASS');
+  }
+  assert.strictEqual(result.exitCode, mod.PIPELINE_DEFECT_EXIT, 'any blocked dependent exits non-zero');
+});
+
+test('runStaging: a missing client secret is CLIENT_INPUT_SCOPE and blocks the dependent tasks naming only the variable', async function() {
+  var mod = await loadModule();
+  var child = makeChild({ results: {} });
+  var env = baseEnv();
+  delete env.SEED_TEST_CUSTOMER_PASSWORD;
+  env.SEED_TEST_CUSTOMER_PASSWORD = '';
+  env.CHANNEL_TOKENS = JSON.stringify({ DE: 'tok-de-real-9f', AT: 'tok-at-real-8e', HU: 'tok-hu-real-7d', GB: 'tok-gb-real-6c' });
+  var deps = makeDeps('seed-client', {
+    child: child,
+    taskIds: APPROVED,
+    env: env,
+    fetch: makeSeedIntegrationFetch({})
+  });
+  deps.args.stagingUrl = 'https://staging.tibella.eu';
+  deps.args.seedTestData = true;
+
+  var result = await mod.runStaging(deps);
+  assert.strictEqual(child.spawnCalls.length, 1, 'only the dry-run task may spawn after a failed seed');
+  assert.ok(result.stages.length === 3);
+
+  var summary = JSON.parse(fs.readFileSync(path.join(deps.cwd, 'reports', deps.runId, 'run-summary.json'), 'utf8'));
+  assert.ok(summary.seed);
+  assert.strictEqual(summary.seed.ok, false);
+  assert.strictEqual(summary.seed.classification, 'CLIENT_INPUT_SCOPE', 'missing client secret is a client input scope problem');
+  assert.ok(summary.seed.variableNames && summary.seed.variableNames.indexOf('SEED_TEST_CUSTOMER_PASSWORD') !== -1,
+    'the missing variable NAME is reported, never its value');
+  assert.strictEqual(summary.anyPipelineDefect, false, 'a client input is not a Pipeline defect');
+
+  var bl = result.stages.filter(function(s) { return s.cause === 'not executed: seed failed'; });
+  assert.strictEqual(bl.length, 2);
+  for (var i = 0; i < bl.length; i++) {
+    assert.strictEqual(bl[i].classification, 'CLIENT_INPUT_SCOPE', 'blocked task carries the seed classification');
+    assert.strictEqual(bl[i].summary.tasks[0].result, 'BLOCK', 'blocked task result is BLOCK, never PASS');
+  }
+});
+
+test('runStaging: wrong-enum GraphQL validation in the seed is a PIPELINE_DEFECT', async function() {
+  var mod = await loadModule();
+  var child = makeChild({ results: {} });
+  var deps = makeDeps('seed-enum', {
+    child: child,
+    taskIds: APPROVED,
+    env: seedReadyEnv(),
+    fetch: makeSeedIntegrationFetch({
+      adminRead: globalSettingsAdminRead,
+      mutationFail: 'createChannel',
+      mutationErrorMessage: "Variable '$input' got invalid value: Expected value of type 'GlobalFlag'."
+    })
+  });
+  deps.args.stagingUrl = 'https://staging.tibella.eu';
+  deps.args.seedTestData = true;
+
+  var result = await mod.runStaging(deps);
+  var summary = JSON.parse(fs.readFileSync(path.join(deps.cwd, 'reports', deps.runId, 'run-summary.json'), 'utf8'));
+  assert.strictEqual(summary.seed.ok, false);
+  assert.strictEqual(summary.seed.classification, 'PIPELINE_DEFECT', 'wrong-type / enum validation error is a Pipeline defect');
+});
+
+test('runStaging: a seed Pipeline defect keeps approved-task-id checks intact and never weakens exit codes', async function() {
+  var mod = await loadModule();
+  // The task-selection gate still binds: even with a seed defect the approved
+  // set must be respected and zero tasks spawn for an unapproved selection.
+  var bad = mod.checkTaskSelection({ mode: 'full', taskIds: ['CAN-B1-03', 'CAN-B1-04', 'CAN-B1-01'] });
+  assert.strictEqual(bad.ok, false, 'unapproved selection is still rejected');
+  assert.strictEqual(mod.AUTHORIZED_TASK_IDS.join(','), APPROVED.join(','), 'approved set is unchanged');
 });
 
 test('runStaging: without --seed-test-data the seeder never runs', async function() {

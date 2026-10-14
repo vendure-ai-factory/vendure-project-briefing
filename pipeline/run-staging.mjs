@@ -698,6 +698,222 @@ function classifyStage(outcome) {
 }
 
 /**
+ * Gather every diagnostic string from a seed result so the classifier can
+ * inspect all of them together. Values are read in-memory only; never written
+ * or returned as secrets.
+ */
+function collectSeedFailureText(seed) {
+  var out = [];
+  function push(v) {
+    if (typeof v === 'string' && v !== '') out.push(v);
+    else if (v !== undefined && v !== null && typeof v === 'object' && typeof v.message === 'string' && v.message !== '') out.push(v.message);
+  }
+  if (!seed || typeof seed !== 'object') return out;
+  push(seed.reason);
+  push(seed.error);
+  if (Array.isArray(seed.errors)) {
+    for (var i = 0; i < seed.errors.length; i++) push(seed.errors[i]);
+  }
+  ['failed', 'blocked', 'conflicts'].forEach(function(arrName) {
+    var arr = seed[arrName];
+    if (!Array.isArray(arr)) return;
+    for (var j = 0; j < arr.length; j++) {
+      var entry = arr[j];
+      if (!entry) continue;
+      push(entry.error);
+      push(entry.reason);
+      push(entry.detail);
+      push(entry.message);
+    }
+  });
+  return out;
+}
+
+/**
+ * Classify a failed seed by its cause so a missing Pipeline-owned input never
+ * masquerades as an environment failure. Categories:
+ *   - CLIENT_INPUT_SCOPE: missing or rejected client-supplied secrets/config
+ *     (SEED_TEST_CUSTOMER_PASSWORD, CHANNEL_TOKENS, admin credentials,
+ *     non-allowed staging host). Only variable NAMES are ever produced.
+ *   - DEPENDENCY_ENVIRONMENT: network / HTTP 5xx / health failures.
+ *   - PIPELINE_DEFECT: GraphQL validation/schema errors, wrong-type errors,
+ *     missing Pipeline-owned inputs (enum/variable errors, "Language ... not
+ *     available" caused by the seed spec), or any unclassifiable failure
+ *     (default: per client rules seed mutation failures are Pipeline defects,
+ *     never environment failures).
+ * Returns null when the seed passed.
+ */
+function classifySeedFailure(seed) {
+  if (!seed || seed.ok === true) return null;
+  var text = collectSeedFailureText(seed);
+  var joined = text.join(' | ');
+  var reason = seed.reason || null;
+
+  // Pipeline code could not even load the seeder module.
+  if (reason === 'SEED_MODULE_UNAVAILABLE') {
+    return { classification: CLASS_PIPELINE_DEFECT, cause: 'seed failed: SEED_MODULE_UNAVAILABLE' };
+  }
+
+  // Missing / rejected client-supplied secrets or client-pointed config.
+  if (reason === 'ADMIN_CREDENTIALS_MISSING') {
+    var absent = (seed.credentialNames && Array.isArray(seed.credentialNames.absent))
+      ? seed.credentialNames.absent.slice() : [];
+    return {
+      classification: CLASS_CLIENT_INPUT,
+      cause: 'seed failed: ADMIN_CREDENTIALS_MISSING' + (absent.length > 0 ? '; missing ' + absent.join(', ') : ''),
+      variableNames: absent
+    };
+  }
+  if (reason === 'SEED_CONFIG_BLOCKED') {
+    var names = clientSecretNamesInText(joined);
+    if (names.length > 0) {
+      return {
+        classification: CLASS_CLIENT_INPUT,
+        cause: 'seed failed: SEED_CONFIG_BLOCKED; missing client-supplied secret ' + names.join(', '),
+        variableNames: names
+      };
+    }
+  }
+  if (reason === 'SEED_HOST_NOT_ALLOWED') {
+    return { classification: CLASS_CLIENT_INPUT, cause: 'seed failed: SEED_HOST_NOT_ALLOWED; host scope is client-supplied' };
+  }
+
+  // Network / 5xx / health failures are environment problems.
+  if (isNetworkFailureText(joined)) {
+    return {
+      classification: CLASS_DEPENDENCY,
+      cause: 'seed failed: ' + (reason || 'SEED_FAILED') + ' (network/server failure)'
+    };
+  }
+
+  // GraphQL validation / schema / wrong-type / seed-spec input defects.
+  if (isSchemaOrGraphqlText(joined)) {
+    return {
+      classification: CLASS_PIPELINE_DEFECT,
+      cause: 'seed failed: ' + (reason || 'SEED_FAILED') + ' (seed spec / schema error)'
+    };
+  }
+
+  // Default under the client's rules: a seed mutation failure is a Pipeline
+  // defect, never an environment failure.
+  return {
+    classification: CLASS_PIPELINE_DEFECT,
+    cause: 'seed failed: ' + (reason || 'SEED_FAILED')
+  };
+}
+
+var SEED_CLIENT_SECRET_NAME_PATTERNS = [
+  /SEED_TEST_CUSTOMER_PASSWORD/,
+  /CHANNEL_TOKENS/,
+  /SUPERADMIN_USERNAME|SUPERADMIN_PASSWORD|STAGING_ADMIN_EMAIL|STAGING_ADMIN_PASSWORD|VENDURE_ADMIN_API_URL/
+];
+
+function clientSecretNamesInText(text) {
+  var found = [];
+  for (var i = 0; i < SEED_CLIENT_SECRET_NAME_PATTERNS.length; i++) {
+    var m = String(text).match(SEED_CLIENT_SECRET_NAME_PATTERNS[i]);
+    if (m && found.indexOf(m[0]) === -1) found.push(m[0]);
+  }
+  return found;
+}
+
+var SEED_NETWORK_FAILURE_PATTERNS = [
+  /network error/i,
+  /fetch failed/i,
+  /ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN/i,
+  /socket hang up/i,
+  /temporary failure in name resolution/i,
+  /([Hh][Tt][Tt][Pp]|[Ss]tatus|statusCode)[^0-9]{0,12}5\d\d/,
+  /(?:Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)/i,
+  /connection (?:refused|reset|timed out)/i
+];
+
+function isNetworkFailureText(text) {
+  var s = String(text);
+  for (var i = 0; i < SEED_NETWORK_FAILURE_PATTERNS.length; i++) {
+    if (SEED_NETWORK_FAILURE_PATTERNS[i].test(s)) return true;
+  }
+  return false;
+}
+
+var SEED_SCHEMA_GQL_PATTERNS = [
+  /Expected value of type/i,
+  /Cannot query field/i,
+  /Unknown (?:argument|field|type|directive)/i,
+  /does not exist on type/i,
+  /Variable .+? got invalid value/i,
+  /got invalid value/i,
+  /must be one of/i,
+  /GraphQL validation/i,
+  /\benum\b/i,
+  /not available in the schema/i,
+  /cannot enable language/i,
+  /language.{0,60}not available/i,
+  /not available.{0,60}language/i,
+  /wrong type/i,
+  /expected type/i
+];
+
+function isSchemaOrGraphqlText(text) {
+  var s = String(text);
+  for (var i = 0; i < SEED_SCHEMA_GQL_PATTERNS.length; i++) {
+    if (SEED_SCHEMA_GQL_PATTERNS[i].test(s)) return true;
+  }
+  return false;
+}
+
+/**
+ * Attach the seed classification (and nothing secret) to the reduced seed
+ * record so run-summary.json / run.json and the blocked dependents can carry
+ * the same cause. Idempotent.
+ */
+function applySeedClassification(seed) {
+  if (!seed) return seed;
+  if (seed.ok === true) {
+    seed.classification = null;
+    seed.cause = null;
+    return seed;
+  }
+  var cc = classifySeedFailure(seed) || { classification: CLASS_PIPELINE_DEFECT, cause: 'seed failed' };
+  seed.classification = cc.classification;
+  seed.cause = cc.cause;
+  if (cc.variableNames) seed.variableNames = cc.variableNames;
+  return seed;
+}
+
+/**
+ * A dependent readiness task (CAN-B1-03 / CAN-B1-04) that must not run after
+ * a failed seed. It is surfaced as a BLOCK stage carrying the seed
+ * classification and the note "not executed: seed failed" so the run still
+ * records the task as blocked and forces a non-zero exit, never a PASS.
+ */
+function buildBlockedStageForSeed(stage, seed) {
+  const blocked = {
+    name: stage.name,
+    flag: stage.flag,
+    command: null,
+    args: [],
+    exitCode: PIPELINE_DEFECT_EXIT,
+    classification: (seed && seed.classification) || CLASS_PIPELINE_DEFECT,
+    cause: 'not executed: seed failed',
+    seedReason: (seed && seed.reason) || null,
+    summary: {
+      schemaVersion: '1.0',
+      runId: null,
+      counts: {},
+      tasks: [{
+        taskId: stage.value,
+        stage: stage.name,
+        result: 'BLOCK',
+        classification: (seed && seed.classification) || CLASS_PIPELINE_DEFECT,
+        cause: 'not executed: seed failed'
+      }]
+    }
+  };
+  return blocked;
+}
+
+/**
  * A stage counts as blocked or failed when its child pipeline exited
  * non-zero (task failed, spawn failed) or a classification was recorded
  * (e.g. CLIENT_INPUT_SCOPE / DEPENDENCY_ENVIRONMENT block). Any such stage
@@ -907,29 +1123,31 @@ function runSeedStep(cfg, seedModule) {
     }
   };
   return seedModule.seedStaging(context, { dryRun: !!cfg.seedDryRun }).then(function(result) {
-    return {
+    return applySeedClassification({
       ran: true,
       dryRun: !!cfg.seedDryRun,
       ok: !!(result && result.ok),
       reason: (result && result.reason) || null,
+      error: (result && typeof result.error === 'string') ? result.error : null,
       created: (result && Array.isArray(result.created)) ? result.created.length : 0,
       existing: (result && Array.isArray(result.existing)) ? result.existing.length : 0,
       conflicts: (result && Array.isArray(result.conflicts)) ? result.conflicts.length : 0,
       failed: (result && Array.isArray(result.failed)) ? result.failed.length : 0,
       errors: (result && Array.isArray(result.errors)) ? result.errors : []
-    };
+    });
   }, function(err) {
-    return {
+    return applySeedClassification({
       ran: true,
       dryRun: !!cfg.seedDryRun,
       ok: false,
       reason: 'SEED_THREW',
+      error: (err && err.message) || String(err),
       created: 0,
       existing: 0,
       conflicts: 0,
       failed: 0,
       errors: [(err && err.message) || String(err)]
-    };
+    });
   });
 }
 
@@ -1013,18 +1231,28 @@ async function runStaging(deps) {
     try {
       seedModule = require('../src/staging/seedStaging.js');
     } catch (e) {
-      seed = { ran: true, ok: false, reason: 'SEED_MODULE_UNAVAILABLE', created: 0, existing: 0, conflicts: 0, failed: 0, errors: [(e && e.message) || String(e)] };
+      seed = applySeedClassification({ ran: true, ok: false, reason: 'SEED_MODULE_UNAVAILABLE', error: (e && e.message) || String(e), created: 0, existing: 0, conflicts: 0, failed: 0, errors: [(e && e.message) || String(e)] });
     }
     if (seedModule) {
       seed = await runSeedStep(cfg, seedModule);
     }
   }
 
+
   let stages = [];
   if (cfg.mode === MODE_FULL && preflightOk) {
     const planned = buildStagesForTaskIds(cfg.taskIds);
+    // A failed seed means the dependent readiness tasks (CAN-B1-03/CAN-B1-04)
+    // must not spawn; they are surfaced as BLOCK stages carrying the seed
+    // classification. CAN-B2-16 (dry run, no staging dependency) may still run.
+    const seedBlocked = !!(seed && !seed.ok) && cfg.seedTestData;
     for (let i = 0; i < planned.length; i += 1) {
-      stages.push(runStage(cfg, planned[i]));
+      const p = planned[i];
+      if (seedBlocked && p.value !== DRY_RUN_TASK.taskId) {
+        stages.push(buildBlockedStageForSeed(p, seed));
+      } else {
+        stages.push(runStage(cfg, p));
+      }
     }
   }
 
@@ -1097,5 +1325,11 @@ export {
   VALID_MODES,
   INVALID_MODE_EXIT,
   PIPELINE_DEFECT_EXIT,
-  validateMode
+  validateMode,
+  classifySeedFailure,
+  applySeedClassification,
+  buildBlockedStageForSeed,
+  CLASS_DEPENDENCY,
+  CLASS_CLIENT_INPUT,
+  CLASS_PIPELINE_DEFECT
 };
