@@ -461,11 +461,10 @@ function failureResult(options) {
   };
 }
 
-function passResult(task, evidence) {
-  var expectedText = (task && task.expectedResult) || null;
+function passResult(task, evidence, actual) {
   return {
     success: true,
-    actual: expectedText,
+    actual: actual !== undefined ? actual : null,
     result: RESULT_PASS,
     errorCode: null,
     error: null,
@@ -874,6 +873,7 @@ async function handlerB1_03(context) {
   var table = [];
   var actualByCountry = {};
   var mismatches = [];
+  var missingCurrencyEvidence = [];
   var probeChecks = {};
   var inventoryRan = false;
 
@@ -1071,6 +1071,9 @@ async function handlerB1_03(context) {
 
     var activeCurrency = extractActiveCurrency(result.body);
     var variants = extractVariants(result.body);
+    if (activeCurrency === null) {
+      missingCurrencyEvidence.push(country);
+    }
 
     actualByCountry[country] = activeCurrency;
     table.push({
@@ -1133,6 +1136,18 @@ async function handlerB1_03(context) {
     { name: 'executor-summary.json', data: evidence, kind: 'executor-summary' }
   ], secrets);
 
+  // Missing required currency evidence (e.g. an HTTP 200 response whose
+  // activeChannel is absent / null) is a staging data problem, never RESULT_PASS.
+  if (missingCurrencyEvidence.length > 0) {
+    evidence.result = 'BLOCK';
+    evidence.missingCurrencyEvidence = missingCurrencyEvidence;
+    return finalizeWithCleanup(context, task, failureResult({
+      errorCode: 'STAGING_DATA_MISSING',
+      error: 'shop-api returned no activeChannel currency for: ' + missingCurrencyEvidence.join(', '),
+      evidence: evidence
+    }));
+  }
+
   if (mismatches.length > 0) {
     var detail = mismatches.map(function(m) {
       return m.country + ' expected ' + m.expected + ' got ' + m.actual +
@@ -1146,7 +1161,7 @@ async function handlerB1_03(context) {
   }
 
   evidence.result = RESULT_PASS;
-  return finalizeWithCleanup(context, task, passResult(task, evidence));
+  return finalizeWithCleanup(context, task, passResult(task, evidence, { countryCurrencyMap: actualByCountry }));
 }
 
 /**
@@ -1370,23 +1385,59 @@ async function handlerB1_04(context) {
   var fixture = null;
   var fixtureHash = null;
   var fixtureAction = 'NONE';
+  var fixtureFile = null;
   var existing = null;
   var errorOutcome = null;
+  var pinnedFixturePath = envValue(context, 'CAN_B1_04_EXPECTED_FIXTURE');
 
-  if (wsPath && actionable) {
+  // 1) Independent pinned fixture (highest precedence): read and validate it.
+  //    It is supplied up front, never derived from this run's own responses.
+  if (pinnedFixturePath && typeof pinnedFixturePath === 'string' && pinnedFixturePath.length > 0) {
+    var pinnedRaw = readFileQuiet(context, pinnedFixturePath);
+    if (pinnedRaw === null) {
+      errorOutcome = {
+        errorCode: 'ENVIRONMENT_ERROR',
+        error: 'expected-visibility pinned fixture unreadable: ' + pinnedFixturePath,
+        extraEvidence: { taskId: taskId, file: pinnedFixturePath, completedAt: timestamp }
+      };
+    } else {
+      try {
+        fixture = JSON.parse(pinnedRaw);
+      } catch (e) {
+        errorOutcome = {
+          errorCode: 'ENVIRONMENT_ERROR',
+          error: 'expected-visibility pinned fixture is not valid JSON',
+          extraEvidence: { taskId: taskId, file: pinnedFixturePath, completedAt: timestamp }
+        };
+      }
+      if (!errorOutcome && !isPlausibleVisibilityFixture(fixture)) {
+        errorOutcome = {
+          errorCode: 'ENVIRONMENT_ERROR',
+          error: 'expected-visibility pinned fixture has an invalid shape',
+          extraEvidence: { taskId: taskId, file: pinnedFixturePath, completedAt: timestamp }
+        };
+      }
+      if (!errorOutcome) {
+        fixtureAction = 'LOADED_PINNED';
+        fixtureFile = pinnedFixturePath;
+        fixtureHash = sha256Hex(pinnedRaw);
+      }
+    }
+  }
+
+  if (!errorOutcome && fixtureAction === 'NONE' && wsPath && actionable && !planted) {
+    // 2) Independent fixture persisted in the workspace: load + validate hash.
+    //    Seeding the expected fixture from this run's own observations would be
+    //    self-referential proof, so the task must not bootstrap that way.
     var fPath = fixturePath(wsPath);
+    fixtureFile = fPath;
     existing = readFileQuiet(context, fPath);
     if (existing === null) {
-      // Create the expected fixture from the live responses, then hash it.
-      fixture = canonicalizeVisibility(actualByCountry);
-      if (planted) {
-        fixture = plantMismatch(fixture, plantedSpec);
-      }
-      var fixtureContent = JSON.stringify(fixture, null, 2) + '\n';
-      fixtureHash = sha256Hex(fixtureContent);
-      writeFileInside(context, fPath, fixtureContent);
-      writeFileInside(context, fPath + '.sha256', fixtureHash + '\n' + fPath + '\n');
-      fixtureAction = planted ? 'CREATED_PLANTED_MISMATCH' : 'CREATED';
+      errorOutcome = {
+        errorCode: 'UNRESOLVED_ASSUMPTION',
+        error: 'no independent expected-visibility fixture available (no pinned fixture and no persisted workspace fixture); deriving the fixture from live responses would be self-referential, so variant isolation cannot be verified',
+        extraEvidence: { taskId: taskId, file: fPath, completedAt: timestamp }
+      };
     } else {
       fixtureAction = 'LOADED';
       var storedHash = readFixtureHash(context, wsPath);
@@ -1411,11 +1462,40 @@ async function handlerB1_04(context) {
           errorOutcome = {
             errorCode: 'ENVIRONMENT_ERROR',
             error: 'expected-visibility fixture is not valid JSON',
-            extraEvidence: { taskId: taskId, completedAt: timestamp }
+            extraEvidence: { taskId: taskId, file: fPath, completedAt: timestamp }
+          };
+        }
+        if (!errorOutcome && !isPlausibleVisibilityFixture(fixture)) {
+          errorOutcome = {
+            errorCode: 'ENVIRONMENT_ERROR',
+            error: 'expected-visibility fixture has an invalid shape',
+            extraEvidence: { taskId: taskId, file: fPath, completedAt: timestamp }
           };
         }
       }
     }
+  }
+
+  if (!errorOutcome && fixtureAction === 'NONE' && wsPath && actionable && planted) {
+    // 3) Control run: plant a mismatch into a workspace fixture so the leak
+    //    detector must fire. The run reports EXPECTED_MISMATCH, proving the
+    //    detector works; it can never be a passing outcome.
+    fixture = canonicalizeVisibility(actualByCountry);
+    fixture = plantMismatch(fixture, plantedSpec);
+    var fixtureContent = JSON.stringify(fixture, null, 2) + '\n';
+    fixtureHash = sha256Hex(fixtureContent);
+    fixtureFile = fixturePath(wsPath);
+    writeFileInside(context, fixtureFile, fixtureContent);
+    writeFileInside(context, fixtureFile + '.sha256', fixtureHash + '\n' + fixtureFile + '\n');
+    fixtureAction = 'CREATED_PLANTED_MISMATCH';
+  }
+
+  if (!errorOutcome && fixtureAction === 'NONE' && !pinnedFixturePath) {
+    errorOutcome = {
+      errorCode: 'ENVIRONMENT_ERROR',
+      error: 'expected-visibility comparison cannot run: no workspace and no independently supplied fixture',
+      extraEvidence: { taskId: taskId, completedAt: timestamp }
+    };
   }
 
   if (errorOutcome) {
@@ -1440,7 +1520,7 @@ async function handlerB1_04(context) {
     rawRequests: redactDeep(rawRequests, secrets),
     rawResponses: redactDeep(rawResponses, secrets),
     fixture: {
-      file: wsPath ? fixturePath(wsPath) : null,
+      file: fixtureFile || (wsPath ? fixturePath(wsPath) : null),
       action: fixtureAction,
       sha256: fixtureHash,
       expected: fixture
@@ -1469,7 +1549,7 @@ async function handlerB1_04(context) {
   }
 
   evidence.result = RESULT_PASS;
-  return finalizeWithCleanup(context, task, passResult(task, evidence));
+  return finalizeWithCleanup(context, task, passResult(task, evidence, { countryVisibility: canonicalActual }));
 }
 
 function readFixtureHash(context, wsPath) {
@@ -1477,6 +1557,33 @@ function readFixtureHash(context, wsPath) {
   if (line === null) return null;
   var trimmed = line.trim();
   return trimmed.split(/\s+/)[0] || null;
+}
+
+/**
+ * Validate that a supplied expected-visibility fixture has the expected shape:
+ * an object keyed by country code whose values are arrays of products carrying
+ * id/slug/name and an array of variants with an id and sku. A malformed fixture
+ * must not be silently accepted as an expected baseline.
+ */
+function isPlausibleVisibilityFixture(fixture) {
+  if (!fixture || typeof fixture !== 'object' || Array.isArray(fixture)) return false;
+  var keys = Object.keys(fixture);
+  if (keys.length === 0) return false;
+  for (var i = 0; i < keys.length; i++) {
+    var products = fixture[keys[i]];
+    if (!Array.isArray(products)) return false;
+    for (var p = 0; p < products.length; p++) {
+      var prod = products[p];
+      if (!prod || typeof prod !== 'object' || Array.isArray(prod)) return false;
+      if (!Array.isArray(prod.variants)) return false;
+      for (var v = 0; v < prod.variants.length; v++) {
+        var vr = prod.variants[v];
+        if (!vr || typeof vr !== 'object' || Array.isArray(vr)) return false;
+        if (!vr.sku && vr.sku !== '') return false;
+      }
+    }
+  }
+  return true;
 }
 
 function canonicalizeVisibility(actualByCountry) {

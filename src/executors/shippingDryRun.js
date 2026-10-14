@@ -519,11 +519,10 @@ function failureResult(options) {
   };
 }
 
-function passResult(task, evidence) {
-  var expectedText = (task && task.expectedResult) || null;
+function passResult(task, evidence, actual) {
   return {
     success: true,
-    actual: expectedText,
+    actual: actual !== undefined ? actual : null,
     result: RESULT_PASS,
     errorCode: null,
     error: null,
@@ -806,9 +805,23 @@ async function handlerShippingDryRun(context) {
   evidence.checks = checks;
   evidence.result = RESULT_PASS;
 
-  writeExecutorEvidence(context, task, passResult(task, evidence), evidence);
+  // Categorise the observed result from the genuine artifacts produced by the
+  // child scripts; the run record's actualResult and the validator's `actual`
+  // are derived from these observations, never from the manifest expected text.
+  var observedActual = {
+    status: artifacts.result && artifacts.result.status ? artifacts.result.status : 'unknown',
+    orders: artifacts.shippingPlan && Array.isArray(artifacts.shippingPlan.plans) ? artifacts.shippingPlan.plans.length : 0,
+    committedOrders: checks.committedOrders,
+    stockAdjustments: checks.stockAdjustments,
+    dryRun: true,
+    noApiCall: checks.noApiCall === true,
+    outputsMatchPlan: checks.outputsMatchPlan === true,
+    artifactsFound: checks.artifactsFound === true
+  };
 
-  return passResult(task, evidence);
+  writeExecutorEvidence(context, task, passResult(task, evidence, observedActual), evidence);
+
+  return passResult(task, evidence, observedActual);
 }
 
 function buildEvidence(context, taskId, timestamp, expected, expectedCodes, commands, artifacts, checks, fixtureValues) {

@@ -582,6 +582,43 @@ function buildCreateDiagnostic(res, data, defaultMsg, secrets) {
   return redactValue(fallback.join(' | '), secrets);
 }
 
+/**
+ * Returns true if the response body contains a top-level GraphQL errors array.
+ * A null / empty data with errors array means the server rejected the request
+ * even though it returned HTTP 200.
+ */
+function hasTopLevelGraphqlErrors(res) {
+  var body = res && res.response && res.response.body;
+  return !!(body && Array.isArray(body.errors) && body.errors.length > 0);
+}
+
+/**
+ * Extract a safe diagnostic string from a response that was expected to return
+ * a list of concrete objects (ProductVariant[] etc.).  Checks GraphQL errors,
+ * the HTTP status, and the data shape.  Uses redactValue() so the returned
+ * string is safe to record.
+ */
+function validateListMutationResult(res, data, defaultMsg, secrets) {
+  if (hasTopLevelGraphqlErrors(res)) {
+    var errs = res.response.body.errors;
+    var msg = (errs[0] && (errs[0].message || errs[0].errorCode)) || 'GraphQL error';
+    return redactValue('graphql: ' + msg, secrets);
+  }
+  if (!data) {
+    var parts = [];
+    var status = res && res.response ? res.response.httpStatus : null;
+    if (status !== null && status !== undefined) parts.push('http ' + status);
+    var net = res && res.networkError ? String(res.networkError) : '';
+    if (net) parts.push('network: ' + net);
+    if (parts.length === 0) parts.push(defaultMsg);
+    return redactValue(parts.join(' | '), secrets);
+  }
+  if (Array.isArray(data) && data.length === 0) {
+    return redactValue('empty list returned: ' + defaultMsg, secrets);
+  }
+  return null; // valid
+}
+
 async function ensureCountries(context, state, fetchFn, adminUrl, authToken, secrets) {
   var countries = [
     { code: 'DE', name: 'Germany' },
@@ -629,8 +666,10 @@ async function ensureCountries(context, state, fetchFn, adminUrl, authToken, sec
     var mutation = [
       'mutation CreateCountry($input: CreateCountryInput!) {',
       '  createCountry(input: $input) {',
-      '    ... on Country { id code enabled }',
-      '    ... on ErrorResult { errorCode message }',
+      '    __typename',
+      '    id',
+      '    code',
+      '    enabled',
       '  }',
       '}'
     ].join('\n');
@@ -707,8 +746,9 @@ async function ensureZones(context, state, fetchFn, adminUrl, authToken, secrets
     var mutation = [
       'mutation CreateZone($input: CreateZoneInput!) {',
       '  createZone(input: $input) {',
-      '    ... on Zone { id name }',
-      '    ... on ErrorResult { errorCode message }',
+      '    __typename',
+      '    id',
+      '    name',
       '  }',
       '}'
     ].join('\n');
@@ -829,8 +869,9 @@ async function ensureTax(context, state, fetchFn, adminUrl, authToken, secrets, 
     var createRate = [
       'mutation CreateTaxRate($input: CreateTaxRateInput!) {',
       '  createTaxRate(input: $input) {',
-      '    ... on TaxRate { id name }',
-      '    ... on ErrorResult { errorCode message }',
+      '    __typename',
+      '    id',
+      '    name',
       '  }',
       '}'
     ].join('\n');
@@ -1028,8 +1069,9 @@ async function ensureStockLocations(context, state, fetchFn, adminUrl, authToken
     var mutation = [
       'mutation CreateStockLocation($input: CreateStockLocationInput!) {',
       '  createStockLocation(input: $input) {',
-      '    ... on StockLocation { id name }',
-      '    ... on ErrorResult { errorCode message }',
+      '    __typename',
+      '    id',
+      '    name',
       '  }',
       '}'
     ].join('\n');
@@ -1045,7 +1087,7 @@ async function ensureStockLocations(context, state, fetchFn, adminUrl, authToken
       justCreated[name] = true;
       recordMutation(state, 'created', 'stockLocation', { name: name, id: data.id });
     } else {
-      var msg = (data && (data.message || data.errorCode)) || 'createStockLocation failed';
+      var msg = buildCreateDiagnostic(res, data, 'createStockLocation failed', secrets);
       recordMutation(state, 'failed', 'stockLocation', { name: name, error: msg });
     }
   }
@@ -1191,8 +1233,11 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
         var createVariants = [
           'mutation CreateProductVariants($input: [CreateProductVariantInput!]!) {',
           '  createProductVariants(input: $input) {',
-          '    ... on ProductVariant { id sku priceWithTax price }',
-          '    ... on ErrorResult { errorCode message }',
+          '    __typename',
+          '    id',
+          '    sku',
+          '    priceWithTax',
+          '    price',
           '  }',
           '}'
         ].join('\n');
@@ -1212,9 +1257,9 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
         }, authToken, secrets, primaryToken);
         bumpRequests(state);
         var varData = resVar.response && resVar.response.body && resVar.response.body.data && resVar.response.body.data.createProductVariants;
-        if (!varData || (varData.__typename === 'ErrorResult')) {
-          var vmsg = (varData && (varData.message || varData.errorCode)) || 'createProductVariants failed';
-          recordMutation(state, 'failed', 'variant', { sku: sku, error: vmsg });
+        var err = validateListMutationResult(resVar, varData, 'createProductVariants failed', secrets);
+        if (err) {
+          recordMutation(state, 'failed', 'variant', { sku: sku, error: err });
           continue;
         }
         // Vendure createProductVariants returns ProductVariant[] (an array).
@@ -1226,6 +1271,10 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
           variantId = varData.items[0].id || null;
         } else if (varData.id) {
           variantId = varData.id;
+        }
+        if (!variantId) {
+          recordMutation(state, 'failed', 'variant', { sku: sku, error: 'createProductVariants returned no id' });
+          continue;
         }
         recordMutation(state, 'created', 'variant', { sku: sku, id: variantId, priceMinor: primaryPriceMinor, currency: primaryCurrency });
         for (var a = 1; a < product.channels.length; a++) {
@@ -1256,14 +1305,22 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
           }, authToken, secrets, addToken);
           bumpRequests(state);
           var assignData = assignRes.response && assignRes.response.body && assignRes.response.body.data;
-          if (!assignData || !assignData.assignProductsToChannel) {
-            recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: 'assignProductsToChannel returned no data' });
+          if (hasTopLevelGraphqlErrors(assignRes)) {
+            var aErr = buildCreateDiagnostic(assignRes, null, 'assignProductsToChannel GraphQL error', secrets);
+            recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: aErr });
+          } else if (!assignData || !assignData.assignProductsToChannel) {
+            var aErr2 = buildCreateDiagnostic(assignRes, assignData, 'assignProductsToChannel returned no data', secrets);
+            recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: aErr2 });
           }
           if (addPriceMinor !== null && state.channelIdsByCode[addCode]) {
             var setPrice = [
               'mutation UpdateVariantPrice($input: [UpdateProductVariantInput!]!) {',
               '  updateProductVariants(input: $input) {',
-              '    ... on ProductVariant { id sku price priceWithTax }',
+              '    __typename',
+              '    id',
+              '    sku',
+              '    price',
+              '    priceWithTax',
               '  }',
               '}'
             ].join('\n');
@@ -1275,8 +1332,9 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
             }, authToken, secrets, addToken);
             bumpRequests(state);
             var spData = setPriceRes.response && setPriceRes.response.body && setPriceRes.response.body.data && setPriceRes.response.body.data.updateProductVariants;
-            if (!spData) {
-              recordMutation(state, 'blocked', 'variantPrice', { sku: sku, channel: addCode, error: 'could not write price in channel context' });
+            var spErr = validateListMutationResult(setPriceRes, spData, 'could not write price in channel context', secrets);
+            if (spErr) {
+              recordMutation(state, 'blocked', 'variantPrice', { sku: sku, channel: addCode, error: spErr });
             } else {
               recordMutation(state, 'updated', 'variantPrice', { sku: sku, channel: addCode, priceMinor: addPriceMinor });
             }
@@ -1307,8 +1365,9 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
     var createProduct = [
       'mutation CreateProduct($input: CreateProductInput!) {',
       '  createProduct(input: $input) {',
-      '    ... on Product { id slug }',
-      '    ... on ErrorResult { errorCode message }',
+      '    __typename',
+      '    id',
+      '    slug',
       '  }',
       '}'
     ].join('\n');
@@ -1325,12 +1384,17 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
     }, authToken, secrets, primaryToken);
     bumpRequests(state);
     var prodData = resProd.response && resProd.response.body && resProd.response.body.data && resProd.response.body.data.createProduct;
-    if (!prodData || prodData.__typename === 'ErrorResult') {
-      var pmsg = (prodData && (prodData.message || prodData.errorCode)) || 'createProduct failed';
+    if (!prodData) {
+      var pmsg = buildCreateDiagnostic(resProd, prodData, 'createProduct failed', secrets);
       recordMutation(state, 'failed', 'product', { slug: slug, error: pmsg });
       continue;
     }
     var productId = prodData.id;
+    if (!productId) {
+      var pmsg2 = buildCreateDiagnostic(resProd, prodData, 'createProduct returned no id', secrets);
+      recordMutation(state, 'failed', 'product', { slug: slug, error: pmsg2 });
+      continue;
+    }
     recordMutation(state, 'created', 'product', { slug: slug, id: productId });
 
     var primaryCurrency = null;
@@ -1376,12 +1440,15 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
       var priceInfo = variant.price[primaryCode];
       var primaryPriceMinor = priceInfo ? priceToMinorUnits(priceInfo.decimal, priceInfo.currencyCode || primaryCurrency) : null;
       var createVariants = [
-        'mutation CreateProductVariants($input: [CreateProductVariantInput!]!) {',
-        '  createProductVariants(input: $input) {',
-        '    ... on ProductVariant { id sku priceWithTax price }',
-        '    ... on ErrorResult { errorCode message }',
-        '  }',
-        '}'
+      'mutation CreateProductVariants($input: [CreateProductVariantInput!]!) {',
+      '  createProductVariants(input: $input) {',
+      '    __typename',
+      '    id',
+      '    sku',
+      '    priceWithTax',
+      '    price',
+      '  }',
+      '}'
       ].join('\n');
       var variantInput = [{
         productId: productId,
@@ -1399,9 +1466,9 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
       }, authToken, secrets, primaryToken);
       bumpRequests(state);
       var varData = resVar.response && resVar.response.body && resVar.response.body.data && resVar.response.body.data.createProductVariants;
-      if (!varData || (varData.__typename === 'ErrorResult')) {
-        var vmsg = (varData && (varData.message || varData.errorCode)) || 'createProductVariants failed';
-        recordMutation(state, 'failed', 'variant', { sku: sku, error: vmsg });
+      var verr = validateListMutationResult(resVar, varData, 'createProductVariants failed', secrets);
+      if (verr) {
+        recordMutation(state, 'failed', 'variant', { sku: sku, error: verr });
         continue;
       }
       // Vendure createProductVariants returns ProductVariant[] (an array).
@@ -1413,6 +1480,10 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
         variantId = varData.items[0].id || null;
       } else if (varData.id) {
         variantId = varData.id;
+      }
+      if (!variantId) {
+        recordMutation(state, 'failed', 'variant', { sku: sku, error: 'createProductVariants returned no id' });
+        continue;
       }
       recordMutation(state, 'created', 'variant', { sku: sku, id: variantId, priceMinor: primaryPriceMinor, currency: primaryCurrency });
 
@@ -1447,8 +1518,12 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
         }, authToken, secrets, addToken);
         bumpRequests(state);
         var assignData = assignRes.response && assignRes.response.body && assignRes.response.body.data;
-        if (!assignData || !assignData.assignProductsToChannel) {
-          recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: 'assignProductsToChannel returned no data' });
+        if (hasTopLevelGraphqlErrors(assignRes)) {
+          var aErr3 = buildCreateDiagnostic(assignRes, null, 'assignProductsToChannel GraphQL error', secrets);
+          recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: aErr3 });
+        } else if (!assignData || !assignData.assignProductsToChannel) {
+          var aErr4 = buildCreateDiagnostic(assignRes, assignData, 'assignProductsToChannel returned no data', secrets);
+          recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: aErr4 });
         }
 
         // Set the price in the additional channel's context.
@@ -1456,7 +1531,11 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
           var setPrice = [
             'mutation UpdateVariantPrice($input: [UpdateProductVariantInput!]!) {',
             '  updateProductVariants(input: $input) {',
-            '    ... on ProductVariant { id sku price priceWithTax }',
+            '    __typename',
+            '    id',
+            '    sku',
+            '    price',
+            '    priceWithTax',
             '  }',
             '}'
           ].join('\n');
@@ -1468,8 +1547,9 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
           }, authToken, secrets, addToken);
           bumpRequests(state);
           var spData = setPriceRes.response && setPriceRes.response.body && setPriceRes.response.body.data && setPriceRes.response.body.data.updateProductVariants;
-          if (!spData) {
-            recordMutation(state, 'blocked', 'variantPrice', { sku: sku, channel: addCode, error: 'could not write price in channel context' });
+          var spErr2 = validateListMutationResult(setPriceRes, spData, 'could not write price in channel context', secrets);
+          if (spErr2) {
+            recordMutation(state, 'blocked', 'variantPrice', { sku: sku, channel: addCode, error: spErr2 });
           } else {
             recordMutation(state, 'updated', 'variantPrice', { sku: sku, channel: addCode, priceMinor: addPriceMinor });
           }
@@ -1611,6 +1691,7 @@ async function verifyReadback(context, state, fetchFn, adminUrl, authToken, secr
         entry.status = 'STAGING_PRODUCTS_API_ERROR';
         entry.httpStatus = result.response ? result.response.httpStatus : null;
         state.errors.push('readback products query returned no items for ' + country.channelCode);
+        recordMutation(state, 'failed', 'readback', { code: country.channelCode, error: 'STAGING_PRODUCTS_API_ERROR: no products in channel' });
       }
       state.readback.push(redactDeep(entry, [token]));
     } catch (e) {
@@ -1912,7 +1993,7 @@ function finalizeSeedResult(context, state, extra) {
     if (extra.host !== undefined) out.host = extra.host;
     if (extra.credentialNames !== undefined) out.credentialNames = extra.credentialNames;
   }
-  out.ok = !!(extra && extra.ok) && state.failed.length === 0 && state.conflicts.length === 0;
+  out.ok = !!(extra && extra.ok) && state.failed.length === 0 && state.conflicts.length === 0 && state.blocked.length === 0;
 
   var written = writeSeedEvidence(context, state, out);
   out.evidence = written.ok ? { written: true, file: SEED_EVIDENCE_FILENAME } : { written: false, reason: written.reason };

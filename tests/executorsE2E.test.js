@@ -237,7 +237,10 @@ test('e2e CAN-B1-03: all correct -> exit 0, evidence verifies, review PASS', asy
     var record = verifyRecordOnDisk(runId, 'CAN-B1-03', 'result');
     assert.strictEqual(record.result, RESULT_READINESS_PASS, 'B1-03 readiness-subset PASS is READINESS_PASS');
     assert.strictEqual(record.coverage, 'readiness-subset', 'record carries readiness-subset coverage');
-    assert.strictEqual(record.actualResult, record.expectedResult, 'expected equals actual in record');
+    assert.ok(record.actualResult && typeof record.actualResult === 'object', 'actualResult is the structured observed result');
+    assert.strictEqual(record.actualResult.countryCurrencyMap.DE, 'EUR', 'observed DE currency recorded');
+    assert.strictEqual(record.actualResult.countryCurrencyMap.HU, 'HUF', 'observed HU currency recorded');
+    assert.notStrictEqual(record.actualResult, record.expectedResult, 'actual is observed, not a copy of the expected text');
     assert.ok(record.cleanupResetResult && record.cleanupResetResult.ok === true, 'cleanup reset recorded ok');
     var review = reviewModule.reviewRun(runId, { expectedTaskCount: 1, root: REPO_ROOT });
     assert.strictEqual(review.tasks['CAN-B1-03'].verdict, RESULT_READINESS_PASS, 'review.js returns READINESS_PASS for CAN-B1-03');
@@ -283,8 +286,38 @@ test('e2e CAN-B1-03: server down -> exit 6 DEPENDENCY_ENVIRONMENT', async functi
 test('e2e CAN-B1-04: all correct -> exit 0, review PASS for that task', async function(t) {
   var srv = await firstServerPortForScenario('b1-04-ok');
   var runId = makeRunId('b104ok');
+  var fixtureFile = path.join(os.tmpdir(), 'e2e-b104-expected-' + runId + '.json');
+  // Fixture must exactly match what b1-04-ok server returns per token.
+  // DE: p1(v1,v2) + p3(v3); AT: p1(v2); HU: p4(v4); GB: p5(v5)
+  var fixture = {
+    DE: [
+      { id: 'p1', name: 'Design One', slug: 'design-one', enabled: true, variants: [
+        { id: 'v1', sku: 'SKU-DE-1', name: 'Design One / S', enabled: true, price: 2500, currencyCode: 'EUR' },
+        { id: 'v2', sku: 'SKU-AT-1', name: 'Design One / M', enabled: true, price: 3000, currencyCode: 'EUR' }
+      ]},
+      { id: 'p3', name: 'Design Two', slug: 'design-two', enabled: true, variants: [
+        { id: 'v3', sku: 'SKU-DE-2', name: 'Design Two / S', enabled: true, price: 2600, currencyCode: 'EUR' }
+      ]}
+    ],
+    AT: [
+      { id: 'p1', name: 'Design One', slug: 'design-one', enabled: true, variants: [
+        { id: 'v2', sku: 'SKU-AT-1', name: 'Design One / M', enabled: true, price: 3000, currencyCode: 'EUR' }
+      ]}
+    ],
+    HU: [
+      { id: 'p4', name: 'Design HU', slug: 'design-hu', enabled: true, variants: [
+        { id: 'v4', sku: 'SKU-HU-1', name: 'Design HU / S', enabled: true, price: 875000, currencyCode: 'HUF' }
+      ]}
+    ],
+    GB: [
+      { id: 'p5', name: 'Design GB', slug: 'design-gb', enabled: true, variants: [
+        { id: 'v5', sku: 'SKU-GB-1', name: 'Design GB / S', enabled: true, price: 2200, currencyCode: 'GBP' }
+      ]}
+    ]
+  };
+  fs.writeFileSync(fixtureFile, JSON.stringify(fixture, null, 2) + '\n', 'utf8');
   try {
-    var res = await runPipelineChild('CAN-B1-04', runId, srv.port);
+    var res = await runPipelineChild('CAN-B1-04', runId, srv.port, { CAN_B1_04_EXPECTED_FIXTURE: fixtureFile });
     assert.strictEqual(res.status, 0, 'all-correct B1-04 exits 0; stderr tail: ' + String(res.stderr || '').slice(-400));
     var record = verifyRecordOnDisk(runId, 'CAN-B1-04', 'result');
     assert.strictEqual(record.result, RESULT_READINESS_PASS, 'B1-04 readiness-subset PASS is READINESS_PASS');
@@ -294,6 +327,7 @@ test('e2e CAN-B1-04: all correct -> exit 0, review PASS for that task', async fu
   } finally {
     srv.server.close();
     cleanupRun(runId);
+    fs.rmSync(fixtureFile, { force: true });
   }
 });
 

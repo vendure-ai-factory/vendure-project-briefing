@@ -962,3 +962,243 @@ test('seed: createCountry failure falls back to HTTP status and networkError whe
     'HTTP status must appear in the fallback diagnostic, got: ' + countryFailures[0].error);
 });
 
+// ---------------------------------------------------------------------------
+// Mutation-document regression tests (createCountry/createZone/createChannel/
+// createStockLocation/createProduct return types from the Vendure schema)
+// ---------------------------------------------------------------------------
+
+function captureFullInitFetch(inner) {
+  var calls = [];
+  var fn = function(url, init) {
+    calls.push({ url: String(url), init: init });
+    return inner(url, init);
+  };
+  fn.getCalls = function() { return calls; };
+  return fn;
+}
+
+function queriesMatching(fetchFn, operationName) {
+  var out = [];
+  var calls = fetchFn.getCalls ? fetchFn.getCalls() : [];
+  for (var i = 0; i < calls.length; i++) {
+    var init = calls[i] && calls[i].init ? calls[i].init : {};
+    var bodyStr = typeof init.body === 'string' ? init.body : JSON.stringify(init.body || {});
+    var parsed = null;
+    try { parsed = JSON.parse(bodyStr); } catch (e) { parsed = null; }
+    var q = parsed && parsed.query ? parsed.query : '';
+    if (!q) continue;
+    var op = q.match(/\bmutation\s+(\w+)/);
+    if (op && op[1] === operationName) out.push(q);
+  }
+  return out;
+}
+
+// Return types come from the Vendure snapshot
+// (evaluation-demo/migration-input/legacy/vendure-store/src/gql/graphql-env.d.ts).
+var CONCRETE_RETURN_MUTATIONS = {
+  createCountry: ['id', 'code', 'enabled'],
+  createZone: ['id', 'name'],
+  createStockLocation: ['id', 'name'],
+  createProduct: ['id', 'slug'],
+  createTaxRate: ['id', 'name'],
+  createProductVariants: ['id', 'sku'],
+  updateProductVariants: ['id', 'sku']
+};
+var UNION_RETURN_MUTATIONS = ['createChannel', 'createCustomer', 'login'];
+
+test('seed: createProductVariants returning null data records variant as failed', async function() {
+  var runId = 'run-cpv-null-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = createMutationOverrideFetch('ProductVariants', function() {
+    return { errors: [{ message: 'variant create denied' }], data: { createProductVariants: null } };
+  });
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  var variantFailures = result.failed.filter(function(f) { return f.entity === 'variant'; });
+  assert.ok(variantFailures.length > 0, 'a variant failure must be recorded');
+  assert.strictEqual(variantFailures[0].error.indexOf('variant create denied') !== -1, true, 'GraphQL error message preserved');
+});
+
+test('seed: createProduct returning null data records product as failed', async function() {
+  var runId = 'run-cp-null-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = createMutationOverrideFetch('Product', function() {
+    return { errors: [{ message: 'product create denied' }], data: { createProduct: null } };
+  });
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  var productFailures = result.failed.filter(function(f) { return f.entity === 'product'; });
+  assert.ok(productFailures.length > 0, 'a product failure must be recorded');
+  assert.strictEqual(productFailures[0].error.indexOf('product create denied') !== -1, true, 'GraphQL error message preserved');
+});
+
+test('seed: assignProductsToChannel HTTP 200 + GraphQL errors records blocked', async function() {
+  var runId = 'run-assign-gql-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('assignProductsToChannel') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ errors: [{ message: 'channel not found' }], data: null })); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  var blocked = result.blocked.filter(function(b) { return b.entity === 'product'; });
+  assert.ok(blocked.length > 0, 'assignment failure must be recorded as blocked');
+  assert.ok(blocked.some(function(b) { return b.error.indexOf('channel not found') !== -1; }), 'GraphQL error preserved in blocked reason');
+});
+
+test('seed: updateProductVariants HTTP 200 + GraphQL errors records blocked', async function() {
+  var runId = 'run-price-gql-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('updateProductVariants') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ errors: [{ message: 'price context denied' }], data: { updateProductVariants: null } })); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  var blocked = result.blocked.filter(function(b) { return b.entity === 'variantPrice'; });
+  assert.ok(blocked.length > 0, 'price failure must be recorded as blocked');
+  assert.ok(blocked.some(function(b) { return b.error.indexOf('price context denied') !== -1; }), 'GraphQL error preserved in blocked reason');
+});
+
+test('seed: updateProductVariants empty array result records blocked', async function() {
+  var runId = 'run-price-empty-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('updateProductVariants') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ data: { updateProductVariants: [] } })); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  var blocked = result.blocked.filter(function(b) { return b.entity === 'variantPrice'; });
+  assert.ok(blocked.length > 0, 'empty price result must be recorded as blocked');
+});
+
+test('seed: readback products API error is reflected as failed and ok:false', async function() {
+  var runId = 'run-readback-err-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var fetchFn = function(url, init) {
+    var u = String(url);
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (u.indexOf('/shop-api') !== -1 && q.indexOf('products') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ data: { activeChannel: { code: 'de', currencyCode: 'EUR' }, products: {} } })); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  var readbackFailed = result.failed.filter(function(f) { return f.entity === 'readback'; });
+  assert.ok(readbackFailed.length > 0, 'readback API error must be recorded as failed');
+  assert.strictEqual(result.ok, false, 'readback failure must not yield ok:true');
+});
+
+test('seed: blocked operations force final ok:false', async function() {
+  var runId = 'run-blocked-ok-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('assignProductsToChannel') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ errors: [{ message: 'blocked assignment' }], data: null })); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, false, 'blocked operations must force ok:false');
+});
+
+test('seed: mutation documents for concrete-return types never spread ErrorResult and select __typename', async function() {
+  var runId = 'run-mutdocs-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = captureFullInitFetch(makeSeedFetch({ kind: 'fresh' }));
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, true, 'fresh run must succeed');
+
+  Object.keys(CONCRETE_RETURN_MUTATIONS).forEach(function(fieldName) {
+    var opName = 'Create' + fieldName.slice(6);
+    var queries = queriesMatching(fetchFn, opName);
+    assert.ok(queries.length > 0, 'expected a ' + opName + ' mutation to be issued');
+    queries.forEach(function(q) {
+      assert.strictEqual(q.indexOf('... on ErrorResult'), -1,
+        fieldName + ' returns a concrete object type and must not spread ErrorResult');
+      assert.strictEqual(q.indexOf('__typename') !== -1, true,
+        fieldName + ' must select __typename so the result-type check works against a real server');
+      CONCRETE_RETURN_MUTATIONS[fieldName].forEach(function(f) {
+        assert.strictEqual(q.indexOf(f) !== -1, true, fieldName + ' must select field ' + f);
+      });
+    });
+  });
+});
+
+test('seed: mutation documents for union-return types keep the ErrorResult fragment', async function() {
+  var runId = 'run-unions-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var fetchFn = captureFullInitFetch(makeSeedFetch({ kind: 'fresh' }));
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, true, 'fresh run must succeed');
+
+  UNION_RETURN_MUTATIONS.forEach(function(fieldName) {
+    var opName = fieldName === 'login' ? 'Login' : 'Create' + fieldName.slice(6);
+    var queries = queriesMatching(fetchFn, opName);
+    assert.ok(queries.length > 0, 'expected a ' + opName + ' mutation to be issued');
+    queries.forEach(function(q) {
+      assert.strictEqual(q.indexOf('... on ErrorResult') !== -1, true,
+        fieldName + ' returns a union and must keep the ErrorResult fragment');
+    });
+  });
+});
+

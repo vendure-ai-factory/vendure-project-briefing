@@ -464,6 +464,28 @@ function finalizeTaskOutcome(options) {
   var actual = execution.actual;
   var evidence = execution.evidence || null;
   var evidenceOk = evidence !== null && typeof evidence === 'object' && Object.keys(evidence).length > 0;
+  var requireGenuineActual = !!(options.requireGenuineActual || (execution && execution.requireGenuineActual));
+
+  if (requireGenuineActual) {
+    // Acceptance tasks must demonstrate an independent observed result; a
+    // verbatim copy of the manifest expected text carries no observation and
+    // cannot satisfy the passing gate.
+    if (evidenceOk && isGenuineObservedActual(actual, expected)) {
+      return {
+        result: RESULT_PASS,
+        classification: null,
+        cause: null,
+        reason: null,
+        evidence: evidence
+      };
+    }
+    return {
+      result: 'BLOCK',
+      classification: FAILURE_CLASSES.APPLICATION_DEFECT,
+      cause: 'EXPECTED_MISMATCH',
+      reason: 'executor reported success but actual is not a genuine observed result'
+    };
+  }
 
   if (evidenceOk && valuesEqual(expected, actual)) {
     return {
@@ -481,6 +503,24 @@ function finalizeTaskOutcome(options) {
     cause: 'EXPECTED_MISMATCH',
     reason: 'expected did not equal actual from executor evidence'
   };
+}
+
+/**
+ * True when the executor's reported actual result carries independent observed
+ * content. A string that is byte-identical to the expected manifest text is a
+ * copy, not an observation, and is rejected; empty / null values are rejected.
+ * Structured values (objects / arrays) are accepted only when non-empty.
+ */
+function isGenuineObservedActual(actual, expected) {
+  if (actual === null || actual === undefined) return false;
+  if (typeof actual === 'string') {
+    if (actual.trim() === '') return false;
+    if (expected !== null && expected !== undefined && String(expected) === actual) return false;
+    return true;
+  }
+  if (Array.isArray(actual)) return actual.length > 0;
+  if (typeof actual === 'object') return Object.keys(actual).length > 0;
+  return false;
 }
 
 function valuesEqual(a, b) {

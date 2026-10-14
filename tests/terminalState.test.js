@@ -399,3 +399,25 @@ test('terminalState: RESULT_PASS is the single sanctioned PASS literal', functio
   }).result, 'PASS');
   done();
 });
+
+test('terminalState: requireGenuineActual rejects a copied expected string and accepts an observed object', function(t, done) {
+  assert.strictEqual(terminalStateModule.finalizeTaskOutcome({
+    applicable: true,
+    executorFound: true,
+    evidence: { ok: true },
+    expected: 'expected-result',
+    actual: 'expected-result',
+    executorEvidenceOk: true,
+    requireGenuineActual: true
+  }).result, 'BLOCK');
+  assert.strictEqual(terminalStateModule.finalizeTaskOutcome({
+    applicable: true,
+    executorFound: true,
+    evidence: { ok: true },
+    expected: 'expected-result',
+    actual: 'observed-observed',
+    executorEvidenceOk: true,
+    requireGenuineActual: true
+  }).result, terminalStateModule.RESULT_PASS);
+  done();
+});

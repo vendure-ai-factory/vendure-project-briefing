@@ -41,6 +41,10 @@ var VALID_SCOPES = {
 
 var ALLOWLISTED_HEALTH_HOSTS = ['staging.tibella.eu'];
 
+// Acceptance tasks whose outcome is gated on a genuine observed result rather
+// than a copied manifest text. Mirrors run-staging.mjs AUTHORIZED_TASK_IDS.
+var GENUINE_ACTUAL_TASKS = ['CAN-B1-03', 'CAN-B1-04', 'CAN-B2-16'];
+
 var FAILURE_CATEGORIES = {
   PIPELINE_DEFECT: 'PIPELINE_DEFECT',
   CLIENT_INPUT_SCOPE: 'CLIENT_INPUT_SCOPE',
@@ -1042,7 +1046,8 @@ async function runOneTask(parsed, shared) {
       actual: execData.actual,
       executorEvidenceOk: execData.success === true,
       error: execData.error,
-      errorCode: execData.errorCode
+      errorCode: execData.errorCode,
+      requireGenuineActual: GENUINE_ACTUAL_TASKS.indexOf(taskId) !== -1
     });
     runEnvRecord.execution = {
       success: execData.success,

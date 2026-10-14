@@ -120,7 +120,8 @@ function finalizeLikeCli(outcome, taskId) {
     actual: outcome.actual,
     executorEvidenceOk: outcome.success === true,
     error: outcome.error,
-    errorCode: outcome.errorCode
+    errorCode: outcome.errorCode,
+    requireGenuineActual: true
   });
 }
 
@@ -138,7 +139,8 @@ test('readOnlyShopApi B1-03: all correct returns PASS with expected == actual', 
   assert.strictEqual(outcome.success, true, 'run should succeed');
   assert.strictEqual(outcome.errorCode, null);
   assert.strictEqual(outcome.result, RESULT_PASS, 'must use RESULT_PASS, never a bare literal');
-  assert.strictEqual(outcome.actual, 'expected result for CAN-B1-03', 'actual mirrors the canonical expected result');
+  assert.strictEqual(typeof outcome.actual, 'object', 'actual is the observed per-country result, not the copied expected text');
+  assert.deepStrictEqual(outcome.actual.countryCurrencyMap, { DE: 'EUR', AT: 'EUR', HU: 'HUF', GB: 'GBP' }, 'actual derived from observed activeChannel currencies');
   assert.ok(outcome.evidence, 'evidence present');
   assert.strictEqual(outcome.evidence.expected.countryCurrencyMap.DE, 'EUR');
   assert.strictEqual(outcome.evidence.actual.countryCurrencyMap.HU, 'HUF');
@@ -151,6 +153,31 @@ test('readOnlyShopApi B1-03: all correct returns PASS with expected == actual', 
 
   var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-03');
   assert.strictEqual(finalOutcome.result, RESULT_PASS);
+});
+
+test('readOnlyShopApi: copied expected text cannot produce PASS under the genuine-actual gate', function() {
+  var fa = terminalState.finalizeTaskOutcome({
+    applicable: true,
+    executorFound: true,
+    evidence: { result: RESULT_PASS },
+    expected: 'expected result for CAN-B1-03',
+    actual: 'expected result for CAN-B1-03',
+    executorEvidenceOk: true,
+    requireGenuineActual: true
+  });
+  assert.strictEqual(fa.result, 'BLOCK');
+  assert.strictEqual(fa.cause, 'EXPECTED_MISMATCH');
+
+  var fg = terminalState.finalizeTaskOutcome({
+    applicable: true,
+    executorFound: true,
+    evidence: { result: RESULT_PASS },
+    expected: 'expected result for CAN-B1-03',
+    actual: { countryCurrencyMap: { DE: 'EUR', AT: 'EUR', HU: 'HUF', GB: 'GBP' } },
+    executorEvidenceOk: true,
+    requireGenuineActual: true
+  });
+  assert.strictEqual(fg.result, RESULT_PASS);
 });
 
 test('readOnlyShopApi B1-03: DE returning GBP is an APPLICATION_DEFECT', async function(t) {
@@ -209,6 +236,72 @@ test('readOnlyShopApi B1-03: missing channel token is a CLIENT_INPUT_SCOPE', asy
 });
 
 // ---------------------------------------------------------------------------
+// CAN-B1-03 Regression: HTTP 200 with activeChannel: null / missing currency
+// ---------------------------------------------------------------------------
+
+test('readOnlyShopApi B1-03: HTTP 200 with activeChannel: null is STAGING_DATA_MISSING, never PASS', async function(t) {
+  // DE returns HTTP 200 but with activeChannel: null (no currency evidence)
+  var server = fakeShopServer({
+    'de-token': { status: 200, body: { data: { activeChannel: null, products: { items: [] } } } },
+    'at-token': { status: 200, body: b1_03Body('EUR', [b1_03Item('AT product', 3000, 'EUR')]) },
+    'hu-token': { status: 200, body: b1_03Body('HUF', [b1_03Item('HU product', 875000, 'HUF')]) },
+    'gb-token': { status: 200, body: b1_03Body('GBP', [b1_03Item('GB product', 2200, 'GBP')]) }
+  });
+  var ctx = baseContext('CAN-B1-03', { fetch: server });
+  var outcome = await executors.handlerB1_03(ctx);
+
+  assert.strictEqual(outcome.success, false, 'activeChannel: null must not pass');
+  assert.strictEqual(outcome.errorCode, 'STAGING_DATA_MISSING', 'errorCode is STAGING_DATA_MISSING');
+  assert.ok(outcome.error.indexOf('DE') !== -1 || outcome.error.indexOf('currency') !== -1, 'error mentions currency gap');
+  assert.ok(outcome.evidence && outcome.evidence.missingCurrencyEvidence, 'missingCurrencyEvidence recorded');
+  assert.strictEqual(outcome.result, null, 'result is null on failure');
+
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-03');
+  assert.strictEqual(finalOutcome.result, 'BLOCK', 'BLOCK, not PASS');
+  assert.strictEqual(finalOutcome.classification, 'DEPENDENCY_ENVIRONMENT');
+});
+
+test('readOnlyShopApi B1-03: HTTP 200 with activeChannel: {} (missing currencyCode) is STAGING_DATA_MISSING, never PASS', async function(t) {
+  // HU returns HTTP 200 but with activeChannel: {} (no currencyCode field)
+  var server = fakeShopServer({
+    'de-token': { status: 200, body: b1_03Body('EUR', [b1_03Item('DE product', 2500, 'EUR')]) },
+    'at-token': { status: 200, body: b1_03Body('EUR', [b1_03Item('AT product', 3000, 'EUR')]) },
+    'hu-token': { status: 200, body: { data: { activeChannel: {}, products: { items: [] } } } },
+    'gb-token': { status: 200, body: b1_03Body('GBP', [b1_03Item('GB product', 2200, 'GBP')]) }
+  });
+  var ctx = baseContext('CAN-B1-03', { fetch: server });
+  var outcome = await executors.handlerB1_03(ctx);
+
+  assert.strictEqual(outcome.success, false, 'missing currencyCode must not pass');
+  assert.strictEqual(outcome.errorCode, 'STAGING_DATA_MISSING', 'errorCode is STAGING_DATA_MISSING');
+  assert.ok(outcome.error.indexOf('HU') !== -1 || outcome.error.indexOf('currency') !== -1, 'error mentions HU currency gap');
+
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-03');
+  assert.strictEqual(finalOutcome.result, 'BLOCK', 'BLOCK, not PASS');
+});
+
+test('readOnlyShopApi B1-03: HTTP 200 with all countries activeChannel: null -> STAGING_DATA_MISSING for all', async function(t) {
+  // All countries return activeChannel: null (complete missing currency evidence)
+  var server = fakeShopServer({
+    'de-token': { status: 200, body: { data: { activeChannel: null, products: { items: [] } } } },
+    'at-token': { status: 200, body: { data: { activeChannel: null, products: { items: [] } } } },
+    'hu-token': { status: 200, body: { data: { activeChannel: null, products: { items: [] } } } },
+    'gb-token': { status: 200, body: { data: { activeChannel: null, products: { items: [] } } } }
+  });
+  var ctx = baseContext('CAN-B1-03', { fetch: server });
+  var outcome = await executors.handlerB1_03(ctx);
+
+  assert.strictEqual(outcome.success, false, 'all null must not pass');
+  assert.strictEqual(outcome.errorCode, 'STAGING_DATA_MISSING');
+  assert.ok(outcome.evidence && outcome.evidence.missingCurrencyEvidence, 'missingCurrencyEvidence present');
+  // All four countries should be listed as missing
+  assert.strictEqual(outcome.evidence.missingCurrencyEvidence.length, 4, 'all 4 countries missing currency evidence');
+
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-03');
+  assert.strictEqual(finalOutcome.result, 'BLOCK', 'BLOCK, not PASS');
+});
+
+// ---------------------------------------------------------------------------
 // CAN-B1-04
 // ---------------------------------------------------------------------------
 
@@ -261,7 +354,7 @@ function realWorkspace() {
   };
 }
 
-test('readOnlyShopApi B1-04: creates + hashes fixture, all correct -> PASS', async function(t) {
+test('readOnlyShopApi B1-04: fresh workspace with no independent fixture cannot PASS', async function(t) {
   var real = realWorkspace();
   var ctx = baseContext('CAN-B1-04', {
     fetch: correctB1_04Server(),
@@ -272,23 +365,131 @@ test('readOnlyShopApi B1-04: creates + hashes fixture, all correct -> PASS', asy
   });
   var outcome = await executors.handlerB1_04(ctx);
 
-  assert.strictEqual(outcome.success, true, 'run should succeed');
-  assert.strictEqual(outcome.result, RESULT_PASS);
-  // The fixture and its hash are recorded in the returned evidence; the
-  // recorded sha256 must equal a fresh hash of the recorded fixture content.
-  assert.strictEqual(outcome.evidence.fixture.action, 'CREATED');
-  assert.ok(outcome.evidence.fixture.sha256, 'fixture sha256 recorded');
-  var recomputedFromEvidence = crypto.createHash('sha256')
-    .update(JSON.stringify(outcome.evidence.fixture.expected, null, 2) + '\n')
-    .digest('hex');
-  assert.strictEqual(outcome.evidence.fixture.sha256, recomputedFromEvidence, 'recorded hash matches recorded fixture content');
-  assert.strictEqual(outcome.evidence.isolationReport.variantLeaks.length, 0, 'no leaks');
-  // The executor destroyed its workspace before returning.
-  assert.strictEqual(fs.existsSync(real.ws.workspacePath), false, 'workspace cleaned up by executor');
+  // A fixture derived from this run's own observations is not independent
+  // proof; with no pre-existing/pinned fixture the run must not PASS.
+  assert.strictEqual(outcome.success, false, 'a run without an independent fixture is never a pass');
+  assert.ok(outcome.errorCode === 'UNMET' || outcome.errorCode !== null, 'blocked/failed outcome recorded: ' + outcome.errorCode);
+  assert.ok(String(outcome.error || '').indexOf('fixture') !== -1 || String(outcome.error || '').indexOf('UNRESOLVED') !== -1, 'diagnostic names the fixture gap');
 
   var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-04');
-  assert.strictEqual(finalOutcome.result, RESULT_PASS);
+  assert.strictEqual(finalOutcome.result, 'BLOCK', 'no independently loaded fixture means BLOCK, never PASS');
   fs.rmSync(real.ws.workspacePath, { recursive: true, force: true });
+});
+
+test('readOnlyShopApi B1-04: pinned expected fixture never self-referential; matching -> PASS', async function(t) {
+  var fixtureFile = path.join(os.tmpdir(), 'b1-04-pinned-' + Date.now() + '.json');
+  var fixture = {
+    DE: [
+      visibleProduct('p1', 'Design One', 'design-one', [variant('v1', 'SKU-DE-1', 'Design One / S', 2500, 'EUR'), variant('v2', 'SKU-AT-1', 'Design One / M', 3000, 'EUR')]),
+      visibleProduct('p3', 'Design Two', 'design-two', [variant('v3', 'SKU-DE-2', 'Design Two / S', 2600, 'EUR')])
+    ],
+    AT: [ visibleProduct('p1', 'Design One', 'design-one', [variant('v2', 'SKU-AT-1', 'Design One / M', 3000, 'EUR')]) ],
+    HU: [ visibleProduct('p4', 'Design HU', 'design-hu', [variant('v4', 'SKU-HU-1', 'Design HU / S', 875000, 'HUF')]) ],
+    GB: [ visibleProduct('p5', 'Design GB', 'design-gb', [variant('v5', 'SKU-GB-1', 'Design GB / S', 2200, 'GBP')]) ]
+  };
+  fs.writeFileSync(fixtureFile, JSON.stringify(fixture, null, 2) + '\n', 'utf8');
+  try {
+    var ctx = baseContext('CAN-B1-04', {
+      fetch: correctB1_04Server(),
+      getEnv: function() { return { CHANNEL_TOKENS: TOKENS_JSON, CAN_B1_04_EXPECTED_FIXTURE: fixtureFile }; }
+    });
+    var outcome = await executors.handlerB1_04(ctx);
+    assert.strictEqual(outcome.success, true, 'matching pinned fixture is a pass');
+    assert.strictEqual(outcome.result, RESULT_PASS);
+    assert.strictEqual(outcome.evidence.fixture.action, 'LOADED_PINNED', 'fixture was independently loaded, not derived from responses');
+    assert.strictEqual(outcome.evidence.isolationReport.variantLeaks.length, 0, 'no leaks');
+    var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-04');
+    assert.strictEqual(finalOutcome.result, RESULT_PASS);
+  } finally {
+    fs.rmSync(fixtureFile, { force: true });
+  }
+});
+
+test('readOnlyShopApi B1-04: pinned fixture leaking a variant -> APPLICATION_DEFECT', async function(t) {
+  var fixtureFile = path.join(os.tmpdir(), 'b1-04-pinned-leak-' + Date.now() + '.json');
+  // Pinned fixture matches live data EXCEPT it omits SKU-DE-2 from the DE
+  // channel, so the live DE response contains a variant the fixture does not
+  // expect -> a leak must be reported.
+  var fixture = {
+    DE: [ visibleProduct('p1', 'Design One', 'design-one', [variant('v1', 'SKU-DE-1', 'Design One / S', 2500, 'EUR'), variant('v2', 'SKU-AT-1', 'Design One / M', 3000, 'EUR')]) ],
+    AT: [],
+    HU: [],
+    GB: []
+  };
+  fs.writeFileSync(fixtureFile, JSON.stringify(fixture, null, 2) + '\n', 'utf8');
+  try {
+    var ctx = baseContext('CAN-B1-04', {
+      fetch: correctB1_04Server(),
+      getEnv: function() { return { CHANNEL_TOKENS: TOKENS_JSON, CAN_B1_04_EXPECTED_FIXTURE: fixtureFile }; }
+    });
+    var outcome = await executors.handlerB1_04(ctx);
+    assert.strictEqual(outcome.success, false, 'leak must be detected');
+    assert.strictEqual(outcome.errorCode, 'EXPECTED_MISMATCH');
+    var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-04');
+    assert.strictEqual(finalOutcome.result, 'BLOCK');
+    assert.strictEqual(finalOutcome.classification, 'APPLICATION_DEFECT');
+  } finally {
+    fs.rmSync(fixtureFile, { force: true });
+  }
+});
+
+test('readOnlyShopApi B1-04: pinned fixture unreadable -> ENVIRONMENT_ERROR, never PASS', async function(t) {
+  var missingFile = path.join(os.tmpdir(), 'b1-04-missing-' + Date.now() + '.json');
+  var ctx = baseContext('CAN-B1-04', {
+    fetch: correctB1_04Server(),
+    getEnv: function() { return { CHANNEL_TOKENS: TOKENS_JSON, CAN_B1_04_EXPECTED_FIXTURE: missingFile }; }
+  });
+  var outcome = await executors.handlerB1_04(ctx);
+  assert.strictEqual(outcome.success, false, 'unreadable pinned fixture must not pass');
+  assert.strictEqual(outcome.errorCode, 'ENVIRONMENT_ERROR');
+  var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-04');
+  assert.strictEqual(finalOutcome.result, 'BLOCK');
+});
+
+test('readOnlyShopApi B1-04: invalid JSON pinned fixture -> ENVIRONMENT_ERROR, never PASS', async function(t) {
+  var fixtureFile = path.join(os.tmpdir(), 'b1-04-badjson-' + Date.now() + '.json');
+  fs.writeFileSync(fixtureFile, '{ not json', 'utf8');
+  try {
+    var ctx = baseContext('CAN-B1-04', {
+      fetch: correctB1_04Server(),
+      getEnv: function() { return { CHANNEL_TOKENS: TOKENS_JSON, CAN_B1_04_EXPECTED_FIXTURE: fixtureFile }; }
+    });
+    var outcome = await executors.handlerB1_04(ctx);
+    assert.strictEqual(outcome.success, false, 'invalid fixture JSON must not pass');
+    assert.strictEqual(outcome.errorCode, 'ENVIRONMENT_ERROR');
+    var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-04');
+    assert.strictEqual(finalOutcome.result, 'BLOCK');
+  } finally {
+    fs.rmSync(fixtureFile, { force: true });
+  }
+});
+
+test('readOnlyShopApi B1-04: workspace fixture hash mismatch -> ENVIRONMENT_ERROR, never PASS', async function(t) {
+  var real = realWorkspace();
+  var fixture = {
+    DE: [],
+    AT: [],
+    HU: [],
+    GB: []
+  };
+  fs.writeFileSync(path.join(real.ws.workspacePath, 'expected-visibility.json'), JSON.stringify(fixture, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(path.join(real.ws.workspacePath, 'expected-visibility.sha256'), 'deadbeef' + '\n', 'utf8');
+  try {
+    var ctx = baseContext('CAN-B1-04', {
+      fetch: correctB1_04Server(),
+      workspace: real.ws,
+      mkdirSync: real.deps.mkdirSync,
+      writeFileSync: real.deps.writeFileSync,
+      readFileSync: real.deps.readFileSync
+    });
+    var outcome = await executors.handlerB1_04(ctx);
+    assert.strictEqual(outcome.success, false, 'hash mismatch must not pass');
+    assert.strictEqual(outcome.errorCode, 'ENVIRONMENT_ERROR');
+    var finalOutcome = finalizeLikeCli(outcome, 'CAN-B1-04');
+    assert.strictEqual(finalOutcome.result, 'BLOCK');
+  } finally {
+    fs.rmSync(real.ws.workspacePath, { recursive: true, force: true });
+  }
 });
 
 test('readOnlyShopApi B1-04: loaded fixture that differs is APPLICATION_DEFECT', async function(t) {
@@ -389,6 +590,17 @@ test('readOnlyShopApi B1-04: evidence written through writeEvidenceFile and veri
   var evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ev-b1-04-'));
   var runId = 'run-eu-' + Date.now().toString(36) + '-c2d';
   var real = realWorkspace();
+  var fixtureFile = path.join(os.tmpdir(), 'b1-04-evidence-' + Date.now() + '.json');
+  var fixture = {
+    DE: [
+      visibleProduct('p1', 'Design One', 'design-one', [variant('v1', 'SKU-DE-1', 'Design One / S', 2500, 'EUR'), variant('v2', 'SKU-AT-1', 'Design One / M', 3000, 'EUR')]),
+      visibleProduct('p3', 'Design Two', 'design-two', [variant('v3', 'SKU-DE-2', 'Design Two / S', 2600, 'EUR')])
+    ],
+    AT: [ visibleProduct('p1', 'Design One', 'design-one', [variant('v2', 'SKU-AT-1', 'Design One / M', 3000, 'EUR')]) ],
+    HU: [ visibleProduct('p4', 'Design HU', 'design-hu', [variant('v4', 'SKU-HU-1', 'Design HU / S', 875000, 'HUF')]) ],
+    GB: [ visibleProduct('p5', 'Design GB', 'design-gb', [variant('v5', 'SKU-GB-1', 'Design GB / S', 2200, 'GBP')]) ]
+  };
+  fs.writeFileSync(fixtureFile, JSON.stringify(fixture, null, 2) + '\n', 'utf8');
   var ctx = baseContext('CAN-B1-04', {
     fetch: correctB1_04Server(),
     workspace: real.ws,
@@ -396,6 +608,7 @@ test('readOnlyShopApi B1-04: evidence written through writeEvidenceFile and veri
     writeFileSync: real.deps.writeFileSync,
     readFileSync: real.deps.readFileSync,
     evidenceRoot: evidenceRoot,
+    getEnv: function() { return { CHANNEL_TOKENS: TOKENS_JSON, CAN_B1_04_EXPECTED_FIXTURE: fixtureFile }; },
     runEnvRecord: { runId: runId, stagingUrl: 'https://staging.tibella.eu' }
   });
   var outcome = await executors.handlerB1_04(ctx);
@@ -408,6 +621,7 @@ test('readOnlyShopApi B1-04: evidence written through writeEvidenceFile and veri
   });
   var verify = evidenceCollector.verifyEvidence(runId, { root: evidenceRoot });
   assert.strictEqual(verify.ok, true, 'verifyEvidence passes over executor evidence');
+  fs.rmSync(fixtureFile, { force: true });
   fs.rmSync(evidenceRoot, { recursive: true, force: true });
 });
 
@@ -739,17 +953,31 @@ test('readOnlyShopApi B1-04: success path never calls Admin API (zero admin requ
     return correctB1_04Server()(url, init);
   };
   var real = realWorkspace();
+  // Provide a pinned fixture so the test can verify Admin API is not called on success
+  var fixtureFile = path.join(os.tmpdir(), 'b1-04-admin-no-call-' + Date.now() + '.json');
+  var fixture = {
+    DE: [
+      visibleProduct('p1', 'Design One', 'design-one', [variant('v1', 'SKU-DE-1', 'Design One / S', 2500, 'EUR'), variant('v2', 'SKU-AT-1', 'Design One / M', 3000, 'EUR')]),
+      visibleProduct('p3', 'Design Two', 'design-two', [variant('v3', 'SKU-DE-2', 'Design Two / S', 2600, 'EUR')])
+    ],
+    AT: [ visibleProduct('p1', 'Design One', 'design-one', [variant('v2', 'SKU-AT-1', 'Design One / M', 3000, 'EUR')]) ],
+    HU: [ visibleProduct('p4', 'Design HU', 'design-hu', [variant('v4', 'SKU-HU-1', 'Design HU / S', 875000, 'HUF')]) ],
+    GB: [ visibleProduct('p5', 'Design GB', 'design-gb', [variant('v5', 'SKU-GB-1', 'Design GB / S', 2200, 'GBP')]) ]
+  };
+  fs.writeFileSync(fixtureFile, JSON.stringify(fixture, null, 2) + '\n', 'utf8');
   var ctx = baseContext('CAN-B1-04', {
     fetch: countingFetch,
     workspace: real.ws,
     mkdirSync: real.deps.mkdirSync,
     writeFileSync: real.deps.writeFileSync,
-    readFileSync: real.deps.readFileSync
+    readFileSync: real.deps.readFileSync,
+    getEnv: function() { return { CHANNEL_TOKENS: TOKENS_JSON, CAN_B1_04_EXPECTED_FIXTURE: fixtureFile }; }
   });
   var outcome = await executors.handlerB1_04(ctx);
 
   assert.strictEqual(outcome.success, true, 'success on correct data');
   assert.strictEqual(adminCallCount, 0, 'Admin API was never called on the success path');
+  fs.rmSync(fixtureFile, { force: true });
   fs.rmSync(real.ws.workspacePath, { recursive: true, force: true });
 });
 

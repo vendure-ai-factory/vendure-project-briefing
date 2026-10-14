@@ -229,6 +229,23 @@ function protectedEndMismatchPinned(record, index) {
 }
 
 /**
+ * True when a task record's expected/actual pair carries a genuine observed
+ * result. A string actual keeps the legacy contract: it must match the expected
+ * text. A structured actual (the observed result object the fix introduced)
+ * must simply be non-empty so the observed outcome is present in the record.
+ */
+function isGenuineObservedResult(expected, actual) {
+  if (actual === null || actual === undefined) return false;
+  if (typeof actual === 'string') {
+    if (actual.trim() === '') return false;
+    return expected === undefined || expected === null || String(expected) === actual;
+  }
+  if (Array.isArray(actual)) return actual.length > 0;
+  if (typeof actual === 'object') return Object.keys(actual).length > 0;
+  return false;
+}
+
+/**
  * Derive a single task verdict from evidence only.
  * A task is never a passing outcome unless every integrity, result,
  * expectation, intervention, cleanup, hash and assumption condition holds.
@@ -289,18 +306,17 @@ function deriveTaskVerdict(taskId, verifyTask, index) {
 
   var expected = record.expectedResult;
   var actual = record.actualResult;
-  var expectedMatchesActual = expected === actual || (expected !== undefined && actual !== undefined &&
-    String(expected) === String(actual));
+  var actualOk = isGenuineObservedResult(expected, actual);
   var coverage = record.coverage || 'full';
   var isReadinessPass = record.result === RESULT_READINESS_PASS ||
     (record.result === RESULT_PASS && coverage === COVERAGE_READINESS_SUBSET);
 
-  if ((record.result !== RESULT_PASS && record.result !== RESULT_READINESS_PASS) || !expectedMatchesActual) {
+  if ((record.result !== RESULT_PASS && record.result !== RESULT_READINESS_PASS) || !actualOk) {
     var failureClass = deriveFailureClass(record) || FAILURE_CLASSES.APPLICATION_DEFECT;
     var status = resolveStatus(failureClass, record);
     var why = (record.result !== RESULT_PASS && record.result !== RESULT_READINESS_PASS)
       ? 'result is ' + String(record.result)
-      : 'expected did not equal actual';
+      : 'actual is not a genuine observed result';
     return {
       taskId: taskId,
       verdict: BLOCK,

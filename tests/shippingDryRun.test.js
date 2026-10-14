@@ -131,7 +131,8 @@ function finalizeLikeCli(outcome, taskId) {
     actual: outcome.actual,
     executorEvidenceOk: outcome.success === true,
     error: outcome.error,
-    errorCode: outcome.errorCode
+    errorCode: outcome.errorCode,
+    requireGenuineActual: true
   });
 }
 
@@ -190,7 +191,12 @@ test('shippingDryRun: both scripts succeed and artifacts match -> PASS', async f
 
   assert.strictEqual(outcome.success, true, 'run should succeed');
   assert.strictEqual(outcome.result, RESULT_PASS, 'must use RESULT_PASS');
-  assert.strictEqual(outcome.actual, 'expected result for CAN-B2-16');
+  assert.strictEqual(typeof outcome.actual, 'object', 'actual is the observed artifact result, not the copied expected text');
+  assert.strictEqual(outcome.actual.status, 'passed');
+  assert.strictEqual(outcome.actual.orders, 2);
+  assert.strictEqual(outcome.actual.committedOrders, 0);
+  assert.strictEqual(outcome.actual.stockAdjustments, 0);
+  assert.strictEqual(outcome.actual.dryRun, true);
   assert.ok(outcome.evidence, 'evidence present');
 
   var ev = outcome.evidence;
@@ -244,6 +250,45 @@ test('shippingDryRun: both scripts succeed and artifacts match -> PASS', async f
   assert.strictEqual(finalOutcome.result, RESULT_PASS);
   fs.rmSync(ctx.workspace.workspacePath, { recursive: true, force: true });
 });
+
+test('shippingDryRun: expected-result text alone cannot produce PASS under the genuine-actual gate', function() {
+  // Regression: an executor that reports success with `actual` copied verbatim
+  // from the manifest expected text must be BLOCKED by the genuine-actual gate.
+  var fa = finalizeWithGenuineGate({
+    success: true,
+    actual: 'expected result for CAN-B2-16',
+    evidence: { result: RESULT_PASS },
+    error: null,
+    errorCode: null
+  });
+  assert.strictEqual(fa.result, 'BLOCK');
+  assert.strictEqual(fa.cause, 'EXPECTED_MISMATCH');
+
+  // The same gate passes a genuinely observed object actual.
+  var fg = finalizeWithGenuineGate({
+    success: true,
+    actual: { status: 'passed', orders: 2, committedOrders: 0, stockAdjustments: 0, dryRun: true, noApiCall: true, outputsMatchPlan: true, artifactsFound: true },
+    evidence: { result: RESULT_PASS },
+    error: null,
+    errorCode: null
+  });
+  assert.strictEqual(fg.result, RESULT_PASS);
+});
+
+function finalizeWithGenuineGate(outcome) {
+  return terminalState.finalizeTaskOutcome({
+    applicable: true,
+    executorFound: true,
+    evidence: outcome.evidence,
+    expected: 'expected result for CAN-B2-16',
+    actual: outcome.actual,
+    executorEvidenceOk: outcome.success === true,
+    error: outcome.error,
+    errorCode: outcome.errorCode,
+    requireGenuineActual: true
+  });
+}
+
 
 // ---------------------------------------------------------------------------
 // Path portability: the fixture CSV must be repo-relative or wslpath-translated
