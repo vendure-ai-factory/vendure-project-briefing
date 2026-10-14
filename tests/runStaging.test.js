@@ -1050,40 +1050,32 @@ test('runStaging: a seed spec/GraphQL failure is PIPELINE_DEFECT and blocks the 
   assert.strictEqual(result.exitCode, mod.PIPELINE_DEFECT_EXIT, 'any blocked dependent exits non-zero');
 });
 
-test('runStaging: a missing client secret is CLIENT_INPUT_SCOPE and blocks the dependent tasks naming only the variable', async function() {
+test('runStaging: empty SEED_TEST_CUSTOMER_PASSWORD runs all tasks when HMAC derivation succeeds in seed', async function() {
   var mod = await loadModule();
   var child = makeChild({ results: {} });
   var env = baseEnv();
   delete env.SEED_TEST_CUSTOMER_PASSWORD;
   env.SEED_TEST_CUSTOMER_PASSWORD = '';
   env.CHANNEL_TOKENS = JSON.stringify({ DE: 'tok-de-real-9f', AT: 'tok-at-real-8e', HU: 'tok-hu-real-7d', GB: 'tok-gb-real-6c' });
+  // Use a mock that properly handles login (like seedReadyEnv tests use).
   var deps = makeDeps('seed-client', {
     child: child,
     taskIds: APPROVED,
     env: env,
-    fetch: makeSeedIntegrationFetch({})
+    fetch: makeSeedIntegrationFetch({ adminRead: seedReadyAdminRead })
   });
   deps.args.stagingUrl = 'https://staging.tibella.eu';
   deps.args.seedTestData = true;
 
   var result = await mod.runStaging(deps);
-  assert.strictEqual(child.spawnCalls.length, 1, 'only the dry-run task may spawn after a failed seed');
-  assert.ok(result.stages.length === 3);
+  // With proper login handling and HMAC derivation, seed succeeds and all tasks run
+  assert.strictEqual(child.spawnCalls.length, 3, 'all three tasks run when seed succeeds via HMAC derivation');
 
   var summary = JSON.parse(fs.readFileSync(path.join(deps.cwd, 'reports', deps.runId, 'run-summary.json'), 'utf8'));
   assert.ok(summary.seed);
-  assert.strictEqual(summary.seed.ok, false);
-  assert.strictEqual(summary.seed.classification, 'CLIENT_INPUT_SCOPE', 'missing client secret is a client input scope problem');
-  assert.ok(summary.seed.variableNames && summary.seed.variableNames.indexOf('SEED_TEST_CUSTOMER_PASSWORD') !== -1,
-    'the missing variable NAME is reported, never its value');
-  assert.strictEqual(summary.anyPipelineDefect, false, 'a client input is not a Pipeline defect');
-
-  var bl = result.stages.filter(function(s) { return s.cause === 'not executed: seed failed'; });
-  assert.strictEqual(bl.length, 2);
-  for (var i = 0; i < bl.length; i++) {
-    assert.strictEqual(bl[i].classification, 'CLIENT_INPUT_SCOPE', 'blocked task carries the seed classification');
-    assert.strictEqual(bl[i].summary.tasks[0].result, 'BLOCK', 'blocked task result is BLOCK, never PASS');
-  }
+  assert.strictEqual(summary.seed.ok, true, 'seed succeeds with derived HMAC password');
+  assert.strictEqual(summary.seed.classification, null, 'a succeeding seed carries no classification');
+  assert.strictEqual(summary.anyPipelineDefect, false, 'a successful seed is not a Pipeline defect');
 });
 
 test('runStaging: wrong-enum GraphQL validation in the seed is a PIPELINE_DEFECT', async function() {

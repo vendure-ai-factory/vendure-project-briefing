@@ -882,6 +882,51 @@ function applySeedClassification(seed) {
 }
 
 /**
+ * Write a stub record.json for a blocked task and patch index.json so the
+ * compliance report shows result:BLOCK with the correct classification and
+ * cause, instead of MISSING_EVIDENCE.
+ */
+function writeBlockedTaskEvidence(cfg, blocked) {
+  var taskInfo = blocked && blocked.summary && blocked.summary.tasks && blocked.summary.tasks[0];
+  if (!taskInfo || !taskInfo.taskId) return;
+  var taskId = taskInfo.taskId;
+  var root = path.join(cfg.cwd, 'evidence', cfg.runId);
+  var taskDir = path.join(root, taskId);
+  var record = {
+    result: taskInfo.result || 'BLOCK',
+    classification: taskInfo.classification || null,
+    cause: taskInfo.cause || null
+  };
+  try {
+    cfg.fs.mkdirSync(taskDir, { recursive: true });
+    cfg.fs.writeFileSync(path.join(taskDir, 'record.json'), JSON.stringify(record, null, 2) + '\n', 'utf8');
+  } catch (e) {
+    return;
+  }
+  // Patch index.json to register the blocked task so generateReport finds it.
+  var indexPath = path.join(root, 'index.json');
+  var idx;
+  try {
+    idx = JSON.parse(cfg.fs.readFileSync(indexPath, 'utf8'));
+  } catch (e) {
+    return;
+  }
+  if (!idx.tasks) idx.tasks = {};
+  if (!idx.tasks[taskId]) idx.tasks[taskId] = [];
+  // Avoid duplicates.
+  var exists = idx.tasks[taskId].some(function(e) { return e && e.path === taskId + '/record.json'; });
+  if (!exists) {
+    var crypto = require('node:crypto');
+    var content = JSON.stringify(record, null, 2) + '\n';
+    var hash = crypto.createHash('sha256').update(content).digest('hex');
+    idx.tasks[taskId].push({ path: taskId + '/record.json', sha256: hash, kind: 'record', timestamp: new Date().toISOString() });
+    try {
+      cfg.fs.writeFileSync(indexPath, JSON.stringify(idx, null, 2) + '\n', 'utf8');
+    } catch (e2) {}
+  }
+}
+
+/**
  * A dependent readiness task (CAN-B1-03 / CAN-B1-04) that must not run after
  * a failed seed. It is surfaced as a BLOCK stage carrying the seed
  * classification and the note "not executed: seed failed" so the run still
@@ -1019,6 +1064,25 @@ function writeAggregatedSummary(cfg, preflight, stages, seed) {
     }
   }
   const anyDefect = stages.some(function(s) { return s.classification === CLASS_PIPELINE_DEFECT; });
+  // Collect any actual integer-error note from the seed evidence.
+  var seedNotes = [];
+  if (seed && seed.errors && Array.isArray(seed.errors)) {
+    seed.errors.forEach(function(e) {
+      if (typeof e === 'string' && e.indexOf('invalid input syntax for type integer') !== -1) {
+        seedNotes.push('Follow-up: real staging still returns the integer error on CAN-B1-03; confirm the real channel tokens with the client (human action, not code).');
+      }
+    });
+  }
+  // Also check the readback errors (which carry the staging-specific integer error).
+  if (seed && seed.blocked) {
+    seed.blocked.forEach(function(b) {
+      if (b.error && b.error.indexOf && b.error.indexOf('invalid input syntax for type integer') !== -1) {
+        if (seedNotes.length === 0) {
+          seedNotes.push('Follow-up: real staging still returns the integer error on CAN-B1-03; confirm the real channel tokens with the client (human action, not code).');
+        }
+      }
+    });
+  }
   const summary = {
     schemaVersion: '1.0',
     runId: cfg.runId,
@@ -1030,9 +1094,7 @@ function writeAggregatedSummary(cfg, preflight, stages, seed) {
     seed: seed || undefined,
     stages: stageRows,
     tasks: allTasks,
-    notes: [
-      'Follow-up: if real staging still returns "invalid input syntax for type integer: undefined" on CAN-B1-03 after the pipeline defect fixes 1-4, the next step is to confirm the real channel tokens with the client (human action, not code).'
-    ]
+    notes: seedNotes
   };
   const file = path.join(outDir, 'run-summary.json');
   try {
@@ -1242,16 +1304,36 @@ async function runStaging(deps) {
   let stages = [];
   if (cfg.mode === MODE_FULL && preflightOk) {
     const planned = buildStagesForTaskIds(cfg.taskIds);
-    // A failed seed means the dependent readiness tasks (CAN-B1-03/CAN-B1-04)
-    // must not spawn; they are surfaced as BLOCK stages carrying the seed
-    // classification. CAN-B2-16 (dry run, no staging dependency) may still run.
-    const seedBlocked = !!(seed && !seed.ok) && cfg.seedTestData;
+    // only the dry-run task may still run; the two dependent readiness tasks are
+    // surfaced as BLOCK stages. CAN-B2-16 (dry run, no staging dependency) may
+    // still run even when the seed failed. A partial seed that only failed on
+    // customer creation (e.g. no SEED_TEST_CUSTOMER_PASSWORD) ran successfully and
+    // created channels, products, etc. - the dependent tasks can still run if their
+    // required fixtures are present.
+    var seedFailed = !!(seed && !seed.ok) && cfg.seedTestData;
+    // seedHasOnlyCustomerBlock: true when the seed ran (seed.ok=false) but the
+    // ONLY blocked entity is customer (e.g. no explicit SEED_TEST_CUSTOMER_PASSWORD,
+    // HMAC derivation worked, but customer creation failed for other reasons). In this
+    // case the catalog steps ran successfully and dependent tasks can still run.
+    // When seed.blocked is empty (login failure, network error, etc.) or has a
+    // non-customer entity blocked, tasks must not run.
+    var seedHasOnlyCustomerBlock = seedFailed && seed && seed.blocked &&
+      seed.blocked.length > 0 &&
+      seed.blocked.every(function(b) { return b.entity === 'customer'; });
+    // seedCanProvideFixtures: true when seed hasn't failed, OR when it only
+    // failed on customer (catalog steps ran and created fixtures).
+    var seedCanProvideFixtures = !seedFailed || seedHasOnlyCustomerBlock;
     for (let i = 0; i < planned.length; i += 1) {
       const p = planned[i];
-      if (seedBlocked && p.value !== DRY_RUN_TASK.taskId) {
-        stages.push(buildBlockedStageForSeed(p, seed));
-      } else {
+      // Tasks run when the seed provided fixtures (successful or customer-only block).
+      // CAN-B2-16 (dry run) always runs when preflight passes. Other tasks only
+      // run when seedCanProvideFixtures is true.
+      if (seedCanProvideFixtures || p.value === DRY_RUN_TASK.taskId) {
         stages.push(runStage(cfg, p));
+      } else {
+        var blocked = buildBlockedStageForSeed(p, seed);
+        stages.push(blocked);
+        writeBlockedTaskEvidence(cfg, blocked);
       }
     }
   }

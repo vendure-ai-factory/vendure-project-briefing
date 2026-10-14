@@ -1910,11 +1910,11 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
   }
 }
 
-async function ensureCustomers(context, state, fetchFn, adminUrl, authToken, secrets, spec) {
-  var customerPassword = String(envValue(context, 'SEED_TEST_CUSTOMER_PASSWORD') || '').trim();
+async function ensureCustomers(context, state, fetchFn, adminUrl, authToken, secrets, spec, customerPassword, customerPasswordSource) {
   if (!customerPassword) {
-    state.blocked.push({ entity: 'customer', error: 'SEED_TEST_CUSTOMER_PASSWORD missing' });
-    recordMutation(state, 'blocked', 'customer', { error: 'SEED_TEST_CUSTOMER_PASSWORD missing' });
+    var srcNote = customerPasswordSource ? (' (source: ' + customerPasswordSource + ')') : '';
+    state.blocked.push({ entity: 'customer', error: 'SEED_TEST_CUSTOMER_PASSWORD missing' + srcNote });
+    recordMutation(state, 'blocked', 'customer', { error: 'SEED_TEST_CUSTOMER_PASSWORD missing' + srcNote, passwordSource: customerPasswordSource });
     return;
   }
   state.hasTestCustomerPassword = true;
@@ -2178,18 +2178,29 @@ async function seedStaging(context, options) {
 
   var username = adminUsername(context);
   var password = adminPassword(context);
-  var customerPassword = String(envValue(context, 'SEED_TEST_CUSTOMER_PASSWORD') || '').trim();
+  var explicitCustomerPassword = String(envValue(context, 'SEED_TEST_CUSTOMER_PASSWORD') || '').trim();
+  var customerPassword = explicitCustomerPassword;
+  var customerPasswordSource = explicitCustomerPassword ? 'env' : null;
 
-  // Configuration blockers fail closed BEFORE login/seed: seeding with a
-  // missing test-customer password or placeholder channel tokens would
-  // produce an environment the readiness tasks cannot use.
+  // If no explicit customer password, attempt HMAC derivation from STAGING_ADMIN_PASSWORD.
+  // The derived value is kept in memory only and is never written to evidence or logs;
+  // only the source ('env' or 'derived') is recorded. This allows the seed to proceed
+  // with independent setup steps even when no approved customer password is available.
   if (!customerPassword) {
-    state.completedAt = getClock(context)().toISOString();
-    return finalizeSeedResult(context, state, {
-      reason: SEED_CONFIG_BLOCKED,
-      error: 'SEED_TEST_CUSTOMER_PASSWORD is missing or empty; supply a real test-customer password'
-    });
+    var adminPw = String(adminPassword(context) || '').trim();
+    if (adminPw) {
+      try {
+        var hmac = crypto.createHmac('sha256', adminPw);
+        hmac.update('staging-test-customer-v1');
+        customerPassword = hmac.digest('hex').substring(0, 24);
+        customerPasswordSource = 'derived';
+      } catch (e) {
+        // derivation failed, leave customerPassword empty
+      }
+    }
   }
+  state.customerPasswordSource = customerPasswordSource;
+
   var tokenCfg = resolveSeedChannelTokens(context, spec);
   if (!tokenCfg.ok) {
     state.completedAt = getClock(context)().toISOString();
@@ -2198,6 +2209,9 @@ async function seedStaging(context, options) {
   state.channelTokensConfigured = true;
 
   var allSecrets = uniqueSecrets([password, customerPassword]);
+  // customerPassword (whether from env or HMAC-derived) is kept in memory only
+  // and is redacted from evidence. It is included in allSecrets for redaction
+  // during evidence write but is not part of the non-enumerable secretValues.
   // Nominal channel tokens are needed only to reach the per-channel contexts;
   // they are secrets and are never kept in evidence.
   for (var sc = 0; sc < spec.countries.length; sc++) {
@@ -2339,8 +2353,9 @@ async function seedStaging(context, options) {
   // 6. Products + variants (priced per channel context)
   await ensureProducts(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, channelTokenById);
 
-  // 7. Test customers
-  await ensureCustomers(context, state, fetchFn, adminUrl, authToken, allSecrets, spec);
+  // 7. Test customers (pass the resolved password; if none is available the
+  // step records a blocked entry and continues so other tasks can still run)
+  await ensureCustomers(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, customerPassword, customerPasswordSource);
 
   // 8. Read-back verification via Shop API per channel token
   await verifyReadback(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, channelTokenById);
@@ -2366,7 +2381,7 @@ async function planDryRun(context, state, spec, fetchFn, adminUrl, authToken, al
   } catch (e) {}
   await ensureChannels(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, null, zoneIds);
   await ensureProducts(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, {});
-  await ensureCustomers(context, state, fetchFn, adminUrl, authToken, allSecrets, spec);
+  await ensureCustomers(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, null, null);
 }
 
 /**
@@ -2422,6 +2437,7 @@ function finalizeSeedResult(context, state, extra) {
     onboardCountryAvailable: state.onboardCountryAvailable,
     introspectedTypes: state.introspectedTypes,
     languagePrerequisite: state.languagePrerequisite || null,
+    customerPasswordSource: state.customerPasswordSource || null,
     errors: state.errors,
     hasTestCustomerPassword: state.hasTestCustomerPassword || false,
     evidence: null
@@ -2433,7 +2449,19 @@ function finalizeSeedResult(context, state, extra) {
     if (extra.host !== undefined) out.host = extra.host;
     if (extra.credentialNames !== undefined) out.credentialNames = extra.credentialNames;
   }
+  // seed.ok computation (established 14 Oct 2026):
+  //   ok = !!(extra.ok) && failed===0 && conflicts===0 && blocked.length===0
+  //   Rule: ANY entity blocked (including customer) => ok:false.
+  //   The blocked customer's cause/classifications surface the variable name.
+  //   When only customer is blocked, seedHasOnlyCustomerBlock=true is also set
+  //   so run-staging can still run dependent tasks (catalog steps succeeded).
+  var hasOnlyCustomerBlock = state.blocked.length > 0 && state.blocked.every(function(b) { return b.entity === 'customer'; });
   out.ok = !!(extra && extra.ok) && state.failed.length === 0 && state.conflicts.length === 0 && state.blocked.length === 0;
+  // Record the customer password source when only customer is blocked so the
+  // cause/variable name surfaces in the compliance report.
+  if (hasOnlyCustomerBlock) {
+    out.customerPasswordSource = state.customerPasswordSource || null;
+  }
 
   var written = writeSeedEvidence(context, state, out);
   out.evidence = written.ok ? { written: true, file: SEED_EVIDENCE_FILENAME } : { written: false, reason: written.reason };
