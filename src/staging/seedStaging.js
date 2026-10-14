@@ -18,8 +18,28 @@ var REDACTED_MARKER = '[REDACTED]';
 var SEED_HOST_NOT_ALLOWED = 'SEED_HOST_NOT_ALLOWED';
 var SEED_CONFLICT = 'SEED_CONFLICT';
 var ADMIN_CREDENTIALS_MISSING = 'ADMIN_CREDENTIALS_MISSING';
+var SEED_CONFIG_BLOCKED = 'SEED_CONFIG_BLOCKED';
 
 var ALLOWED_HOSTS = ['staging.tibella.eu'];
+
+// Vendure >= 3.x models variant stock tracking as the GlobalFlag enum
+// (INHERIT | TRUE | FALSE), not a Boolean.  A Boolean/missing value is rejected
+// by the schema (GraphQL validation: "Expected value of type 'GlobalFlag'"),
+// which is exactly what the staging run observed.  We never invent a value:
+// undefined stays INHERIT (the server default), true -> TRUE, false -> FALSE.
+var GLOBAL_FLAG_MAP = {
+  true: 'TRUE',
+  false: 'FALSE',
+  TRUE: 'TRUE',
+  FALSE: 'FALSE',
+  INHERIT: 'INHERIT'
+};
+
+function toGlobalFlag(value) {
+  if (value === undefined || value === null || value === '') return 'INHERIT';
+  var normalized = typeof value === 'boolean' ? String(value) : String(value).toUpperCase();
+  return GLOBAL_FLAG_MAP[normalized] || 'INHERIT';
+}
 var MAX_REQUESTS = 80;
 var SEED_EVIDENCE_FILENAME = 'seed-record.json';
 var SEED_EVIDENCE_KIND = 'seed';
@@ -384,6 +404,83 @@ function runIdOf(context) {
   return opts.runId || null;
 }
 
+/**
+ * The git HEAD (execution revision) from the run environment. A pre-resolved
+ * gitHead in context.runEnv (or runEnvRecord) wins; otherwise we resolve from
+ * the local repo (context.cwd). Never throws. An unresolvable HEAD is null
+ * (absent), which the report shows as n/a.
+ */
+function gitHeadOf(context) {
+  var record = (context && context.runEnv) || (context && context.runEnvRecord);
+  if (record && (record.gitHead || record.revisionId)) {
+    return record.gitHead || record.revisionId;
+  }
+  var cwdValue = (context && context.cwd) || process.cwd();
+  var childProcess = (context && context.deps && context.deps.childProcess) || null;
+  if (!childProcess) {
+    try { childProcess = require('child_process'); } catch (e) { childProcess = null; }
+  }
+  if (!childProcess || typeof childProcess.execFileSync !== 'function') {
+    return null;
+  }
+  try {
+    var out = childProcess.execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: cwdValue,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 10000
+    });
+    var hash = String(out).trim();
+    return hash || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * The manifest reference commit. A pre-resolved value in context.runEnvRecord
+ * wins; otherwise we read manifest/acceptance-manifest.v0.4.json resolved from
+ * the repo root. Never throws; missing manifest yields null.
+ */
+function referenceCommitOf(context) {
+  var record = (context && context.runEnvRecord);
+  if (record && record.referenceCommit) return record.referenceCommit;
+  var cwdValue = (context && context.cwd) || process.cwd();
+  var manifestPath = path.join(cwdValue, 'manifest', 'acceptance-manifest.v0.4.json');
+  try {
+    var parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    if (parsed && parsed.source && parsed.source.referenceCommit) {
+      return parsed.source.referenceCommit;
+    }
+    if (parsed && parsed.referenceCommit) return parsed.referenceCommit;
+  } catch (e) {}
+  return null;
+}
+
+/**
+ * Compute the protected-path hash (all PROTECTED_ROOTS) at the current tree.
+ * Uses the same module as the task runner so seed evidence and task evidence
+ * agree on the value. Never throws; returns null on failure.
+ */
+function protectedPathsHashOf(context) {
+  var protectedModule = null;
+  try {
+    protectedModule = require('../protectedPaths');
+  } catch (e) {
+    protectedModule = null;
+  }
+  if (!protectedModule || typeof protectedModule.computeProtectedHashes !== 'function') {
+    return null;
+  }
+  var cwdValue = (context && context.cwd) || process.cwd();
+  try {
+    var info = protectedModule.computeProtectedHashes({ root: cwdValue });
+    return info && info.ok ? info.combinedHash : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Resolve admin URL + credentials (reuse adminChannelInventory)
 // ---------------------------------------------------------------------------
@@ -437,6 +534,54 @@ function adminUsername(context) {
 function adminPassword(context) {
   var env = getEnvFn(context)();
   return String(env.SUPERADMIN_PASSWORD || env.STAGING_ADMIN_PASSWORD || '').trim();
+}
+
+// Registry placeholder channel tokens (the demo spec values). The real
+// staging tokens arrive via the CHANNEL_TOKENS env var; a missing or
+// placeholder value is a configuration blocker, never a silent fallback.
+// Token VALUES are never logged or written.
+var PLACEHOLDER_CHANNEL_TOKENS = ['de-token', 'at-token', 'hu-token', 'gb-token'];
+
+function resolveSeedChannelTokens(context, spec) {
+  var env = getEnvFn(context)();
+  var raw = env ? env.CHANNEL_TOKENS : undefined;
+  var map = null;
+  if (raw !== undefined && raw !== null && raw !== '') {
+    if (typeof raw === 'string') {
+      try { map = JSON.parse(raw); } catch (e) {
+        return { ok: false, error: 'CHANNEL_TOKENS is not valid JSON' };
+      }
+    } else if (typeof raw === 'object' && raw !== null) {
+      map = raw;
+    } else {
+      return { ok: false, error: 'CHANNEL_TOKENS must be a JSON object of channel tokens' };
+    }
+  }
+  if (!map) {
+    return { ok: false, error: 'CHANNEL_TOKENS missing; real channel tokens are required to seed' };
+  }
+  var missing = [];
+  var placeholder = [];
+  for (var i = 0; i < (spec && spec.countries ? spec.countries.length : 0); i++) {
+    var c = spec.countries[i];
+    var key = c.countryCode;
+    var tok = map[key] || map[key.toLowerCase()] || map[c.channelCode] || map[c.channelToken];
+    if (typeof tok !== 'string' || tok.length === 0) {
+      missing.push(key);
+      continue;
+    }
+    if (PLACEHOLDER_CHANNEL_TOKENS.indexOf(tok) !== -1) {
+      placeholder.push(key);
+    }
+    c.channelToken = tok;
+  }
+  if (missing.length > 0) {
+    return { ok: false, error: 'CHANNEL_TOKENS missing values for: ' + missing.join(', ') };
+  }
+  if (placeholder.length > 0) {
+    return { ok: false, error: 'CHANNEL_TOKENS contains placeholder values for: ' + placeholder.join(', ') };
+  }
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +638,125 @@ async function loginToAdmin(context, fetchFn, adminUrl, username, password, secr
 // ---------------------------------------------------------------------------
 // Pre-read probe (no mutations)
 // ---------------------------------------------------------------------------
+
+/**
+ * Ensures the seed's default language (channel defaultLanguageCode, 'en') is
+ * enabled in globalSettings.availableLanguages before createChannel runs, by
+ * checking the introspection-first (no invented fields) and then either
+ * confirming presence or calling updateGlobalSettings to add it, keeping the
+ * existing languages.
+ *
+ * Returns { ok, present, added, planned, available, error }.
+ *   ok:true  language already present / added via mutation / planned (dry-run)
+ *   ok:false the update failed, was not permitted, or could not be verified;
+ *            a 'failed' entry is recorded in state with the exact error and
+ *            the caller is expected to skip channel creation.
+ */
+async function ensureDefaultLanguage(context, state, fetchFn, adminUrl, authToken, secrets, introspection, required) {
+  required = required || 'en';
+  var globalSettingsAvail = hasField(introspection, 'GlobalSettings', 'availableLanguages');
+  var updateInputAvail = hasInputField(introspection, 'UpdateGlobalSettingsInput', 'availableLanguages');
+  var updateMutationAvail = hasMutation(introspection, 'updateGlobalSettings');
+
+  // Read current languages. A failed read is a blocker: fail closed rather than
+  // seed into a server whose language set we cannot verify.
+  var query = '{ globalSettings { availableLanguages } }';
+  var res;
+  try {
+    res = await adminGraphqlRequest(fetchFn, adminUrl, { query: query, variables: {} }, authToken, secrets);
+  } catch (e) {
+    res = { response: null, networkError: (e && e.message) || String(e) };
+  }
+  var body = res.response && res.response.body;
+  var langs = body && body.data && body.data.globalSettings && body.data.globalSettings.availableLanguages;
+  if (!Array.isArray(langs)) {
+    var readErr = (res.networkError) || ((body && body.errors && body.errors.length > 0) ? body.errors.map(function(e2) { return e2.message; }).join('; ') : 'globalSettings query failed or availableLanguages missing');
+    recordMutation(state, 'failed', 'language', { required: required, reason: 'read', error: readErr });
+    state.languagePrerequisite = { required: required, present: false, error: readErr, available: null };
+    return { ok: false, error: readErr };
+  }
+
+  var present = false;
+  for (var i = 0; i < langs.length; i++) {
+    if (String(langs[i]).toLowerCase() === String(required).toLowerCase()) { present = true; break; }
+  }
+  if (present) {
+    state.languagePrerequisite = { required: required, present: true, added: false, available: langs };
+    return { ok: true, present: true, available: langs };
+  }
+
+  // Required language missing.
+  if (state.dryRun) {
+    // Plan the step without calling the mutation.
+    recordMutation(state, 'created', 'language', { required: required, planned: true, plan: 'add ' + required + ' to globalSettings.availableLanguages, keeping existing' });
+    state.languagePrerequisite = { required: required, present: false, planned: true, available: langs };
+    return { ok: true, planned: true, available: langs };
+  }
+
+  // updateGlobalSettings not available in the schema -> cannot enable it.
+  if (!globalSettingsAvail || !updateInputAvail || !updateMutationAvail) {
+    var notPermitted = 'updateGlobalSettings is not available in the schema (GlobalSettings.availableLanguages=' + globalSettingsAvail + ', UpdateGlobalSettingsInput.availableLanguages=' + updateInputAvail + ', mutation=' + updateMutationAvail + '); cannot enable language "' + required + '"';
+    recordMutation(state, 'failed', 'language', { required: required, reason: 'not-permitted', error: notPermitted });
+    state.languagePrerequisite = { required: required, present: false, error: notPermitted, available: langs };
+    return { ok: false, error: notPermitted };
+  }
+
+  // Build the new language set keeping the existing languages.
+  var newLangs = [];
+  var seen = {};
+  for (var j = 0; j < langs.length; j++) {
+    var lv = String(langs[j]);
+    if (!seen[lv.toLowerCase()]) { seen[lv.toLowerCase()] = true; newLangs.push(lv); }
+  }
+  if (!seen[String(required).toLowerCase()]) newLangs.push(required);
+
+  var mutation = [
+    'mutation UpdateGlobalSettings($input: UpdateGlobalSettingsInput!) {',
+    '  updateGlobalSettings(input: $input) {',
+    '    ... on GlobalSettings { availableLanguages }',
+    '    ... on ErrorResult { errorCode message }',
+    '  }',
+    '}'
+  ].join('\n');
+  var mres;
+  try {
+    mres = await adminGraphqlRequest(fetchFn, adminUrl, { query: mutation, variables: { input: { availableLanguages: newLangs } } }, authToken, secrets);
+  } catch (e) {
+    mres = { response: null, networkError: (e && e.message) || String(e) };
+  }
+  var mbody = mres.response && mres.response.body;
+  var mdata = mbody && mbody.data && mbody.data.updateGlobalSettings;
+  var mErrors = (mbody && mbody.errors && mbody.errors.length > 0) ? mbody.errors.map(function(e) { return e.message; }).join('; ') : null;
+  if (mres.networkError) {
+    recordMutation(state, 'failed', 'language', { required: required, reason: 'update', error: 'updateGlobalSettings network error: ' + mres.networkError });
+    state.languagePrerequisite = { required: required, present: false, available: langs, error: 'updateGlobalSettings network error: ' + mres.networkError };
+    return { ok: false, error: 'updateGlobalSettings failed: ' + mres.networkError };
+  }
+  if (mErrors) {
+    recordMutation(state, 'failed', 'language', { required: required, reason: 'update', error: mErrors });
+    state.languagePrerequisite = { required: required, present: false, available: langs, error: mErrors };
+    return { ok: false, error: mErrors };
+  }
+  if (mdata && mdata.availableLanguages !== undefined && !(mdata.errorCode || mdata.message)) {
+    recordMutation(state, 'updated', 'language', { required: required, added: true, languages: mdata.availableLanguages });
+    state.languagePrerequisite = { required: required, present: false, added: true, available: mdata.availableLanguages };
+    return { ok: true, added: true, available: mdata.availableLanguages };
+  }
+  var updateErr = (mdata && (mdata.message || mdata.errorCode)) || 'updateGlobalSettings returned no usable data';
+  recordMutation(state, 'failed', 'language', { required: required, reason: 'update', error: updateErr });
+  state.languagePrerequisite = { required: required, present: false, available: langs, error: updateErr };
+  return { ok: false, error: updateErr };
+}
+
+function hasField(introspection, typeName, fieldName) {
+  var t = introspection && introspection.types && introspection.types[typeName];
+  return !!(t && t.present && t.fields && t.fields.indexOf(fieldName) !== -1);
+}
+
+function hasInputField(introspection, typeName, fieldName) {
+  var t = introspection && introspection.types && introspection.types[typeName];
+  return !!(t && t.present && ((t.inputFields && t.inputFields.indexOf(fieldName) !== -1) || (t.fields && t.fields.indexOf(fieldName) !== -1)));
+}
 
 async function preReadAdmin(context, fetchFn, adminUrl, authToken, secrets) {
   var query = [
@@ -905,6 +1169,12 @@ async function ensureChannels(context, state, fetchFn, adminUrl, authToken, secr
     var chFields = introspection.types.Channel.fields;
     if (chFields.indexOf('availableCurrencyCodes') !== -1) channelFields.push('availableCurrencyCodes');
     if (chFields.indexOf('pricesIncludeTax') !== -1) channelFields.push('pricesIncludeTax');
+    // defaultLanguageCode / defaultTaxZone / defaultShippingZone are used both
+    // to enforce the seed language on existing channels and to write
+    // non-sensitive per-channel evidence (the identifiers only, never tokens).
+    if (chFields.indexOf('defaultLanguageCode') !== -1) channelFields.push('defaultLanguageCode');
+    if (chFields.indexOf('defaultTaxZone') !== -1) channelFields.push('defaultTaxZone { id name }');
+    if (chFields.indexOf('defaultShippingZone') !== -1) channelFields.push('defaultShippingZone { id name }');
   }
   var query = '{ channels(options: { take: 100 }) { items { ' + channelFields.join(' ') + ' } totalItems } }';
 
@@ -957,16 +1227,22 @@ async function ensureChannels(context, state, fetchFn, adminUrl, authToken, secr
     if (byCodeHit && byTokenHit) {
       channelIds[code] = byCodeHit.id;
       recordMutation(state, 'existing', 'channel', { code: code, id: byCodeHit.id, currency: byCodeHit[currencyField], tokenMatches: true });
+      await ensureChannelLanguage(context, state, fetchFn, adminUrl, authToken, secrets, introspection, byCodeHit, code, country.defaultLanguageCode);
+      recordChannelEvidence(state, byCodeHit, code, currencyField);
       continue;
     }
     if (byCodeHit) {
       channelIds[code] = byCodeHit.id;
       recordMutation(state, 'existing', 'channel', { code: code, id: byCodeHit.id, currency: byCodeHit[currencyField] });
+      await ensureChannelLanguage(context, state, fetchFn, adminUrl, authToken, secrets, introspection, byCodeHit, code, country.defaultLanguageCode);
+      recordChannelEvidence(state, byCodeHit, code, currencyField);
       continue;
     }
     if (byTokenHit) {
       channelIds[code] = byTokenHit.id;
       recordMutation(state, 'existing', 'channel', { code: code, id: byTokenHit.id, currency: byTokenHit[currencyField] });
+      await ensureChannelLanguage(context, state, fetchFn, adminUrl, authToken, secrets, introspection, byTokenHit, code, country.defaultLanguageCode);
+      recordChannelEvidence(state, byTokenHit, code, currencyField);
       continue;
     }
 
@@ -1018,16 +1294,91 @@ async function ensureChannels(context, state, fetchFn, adminUrl, authToken, secr
     var data = resChan.response && resChan.response.body && resChan.response.body.data && resChan.response.body.data.createChannel;
     if (data && data.__typename === 'Channel') {
       channelIds[code] = data.id;
-      recordMutation(state, 'created', 'channel', { code: code, id: data.id, currency: expectedCurrency });
+      recordMutation(state, 'created', 'channel', { code: code, id: data.id, currency: expectedCurrency, languageCode: data.defaultLanguageCode || chanInput.defaultLanguageCode });
       // Do NOT store the raw channel token here — it is a secret and would
-      // be serialised into evidence.  Only code and currency are diagnostic.
-      state.channels.push({ code: code, currency: expectedCurrency });
+      // be serialised into evidence.  Only code, currency, language and
+      // zone names are diagnostic and non-sensitive.
+      state.channels.push({
+        code: code,
+        currency: expectedCurrency,
+        defaultLanguageCode: data.defaultLanguageCode || chanInput.defaultLanguageCode || country.defaultLanguageCode,
+        defaultTaxZone: data.defaultTaxZone ? { name: data.defaultTaxZone.name } : null,
+        defaultShippingZone: data.defaultShippingZone ? { name: data.defaultShippingZone.name } : null
+      });
     } else {
       var cmsg = (data && (data.message || data.errorCode)) || 'createChannel failed';
-      recordMutation(state, 'failed', 'channel', { code: code, error: cmsg });
+      recordMutation(state, 'failed', 'channel', { code: code, error: cmsg, languageCode: chanInput.defaultLanguageCode });
     }
   }
   return channelIds;
+}
+
+/**
+ * Enforce the channel defaultLanguageCode from an existing channel record.
+ * If the channel exists with a wrong/missing language, call updateChannel to
+ * set defaultLanguageCode to the value the seed expects and record the change.
+ * On failure or not-permitted, record a 'failed' entry (exact redacted error)
+ * but do NOT remove the channel from channelIds - the seeder records the
+ * failure and the caller's finalizeSeedResult will force ok:false. The helper
+ * is a no-op in dry-run (plans only, no mutation) and when the language already
+ * matches. Token values are never written.
+ */
+async function ensureChannelLanguage(context, state, fetchFn, adminUrl, authToken, secrets, introspection, record, code, expectedLang) {
+  if (!expectedLang) return;
+  if (state.dryRun) return;
+  var currentLang = record && record.defaultLanguageCode;
+  if (String(currentLang || '').toLowerCase() === String(expectedLang).toLowerCase()) return;
+  var updateChannelAvail = hasMutation(introspection, 'updateChannel');
+  var updateInputAvail = hasInputField(introspection, 'UpdateChannelInput', 'defaultLanguageCode');
+  if (!updateChannelAvail || !updateInputAvail) {
+    recordMutation(state, 'failed', 'channel', { code: code, reason: 'language', error: 'updateChannel not available in schema; cannot set defaultLanguageCode to ' + expectedLang });
+    return;
+  }
+  var mutation = [
+    'mutation UpdateChannelLanguage($input: UpdateChannelInput!) {',
+    '  updateChannel(input: $input) {',
+    '    ... on Channel { id code defaultLanguageCode }',
+    '    ... on ErrorResult { errorCode message }',
+    '  }',
+    '}'
+  ].join('\n');
+  var mutationInput = { id: record.id, defaultLanguageCode: expectedLang };
+  var res = await adminGraphqlRequest(fetchFn, adminUrl, { query: mutation, variables: { input: mutationInput } }, authToken, secrets);
+  bumpRequests(state);
+  var mbody = res.response && res.response.body;
+  var mdata = mbody && mbody.data && mbody.data.updateChannel;
+  var gqlErrors = (mbody && mbody.errors && mbody.errors.length > 0) ? mbody.errors.map(function(e) { return e.message; }).join('; ') : null;
+  if (res.networkError) {
+    recordMutation(state, 'failed', 'channel', { code: code, reason: 'language', error: 'updateChannel network error: ' + res.networkError });
+    return;
+  }
+  if (gqlErrors) {
+    recordMutation(state, 'failed', 'channel', { code: code, reason: 'language', error: gqlErrors });
+    return;
+  }
+  if (mdata && mdata.code && !(mdata.errorCode || mdata.message)) {
+    recordMutation(state, 'updated', 'channel', { code: code, id: mdata.id, languageFrom: currentLang, languageTo: mdata.defaultLanguageCode || expectedLang });
+    record.defaultLanguageCode = mdata.defaultLanguageCode || expectedLang;
+    return;
+  }
+  var uMsg = (mdata && (mdata.message || mdata.errorCode)) || 'updateChannel returned no usable data';
+  recordMutation(state, 'failed', 'channel', { code: code, reason: 'language', error: uMsg });
+}
+
+/**
+ * Record non-sensitive per-channel evidence: identifiers only (code, currency,
+ * defaultLanguageCode, zone names). Channel tokens, admin email and passwords
+ * are NEVER written here.
+ */
+function recordChannelEvidence(state, record, code, currencyField) {
+  var entry = {
+    code: code,
+    currency: record && record[currencyField] ? record[currencyField] : null,
+    defaultLanguageCode: record && record.defaultLanguageCode ? record.defaultLanguageCode : null,
+    defaultTaxZone: record && record.defaultTaxZone ? (record.defaultTaxZone.name || record.defaultTaxZone.id) : null,
+    defaultShippingZone: record && record.defaultShippingZone ? (record.defaultShippingZone.name || record.defaultShippingZone.id) : null
+  };
+  state.channels.push(entry);
 }
 
 async function ensureStockLocations(context, state, fetchFn, adminUrl, authToken, secrets, spec, channelIds) {
@@ -1247,7 +1598,7 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
           translations: [{ languageCode: 'en', name: variant.name }],
           price: primaryPriceMinor,
           stockOnHand: variant.stockOnHand,
-          trackInventory: variant.trackInventory,
+          trackInventory: toGlobalFlag(variant.trackInventory),
           useGlobalOutOfStockThreshold: variant.useGlobalOutOfStockThreshold || false,
           outOfStockThreshold: variant.outOfStockThreshold
         }];
@@ -1456,7 +1807,7 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
         translations: [{ languageCode: 'en', name: variant.name }],
         price: primaryPriceMinor,
         stockOnHand: variant.stockOnHand,
-        trackInventory: variant.trackInventory,
+        trackInventory: toGlobalFlag(variant.trackInventory),
         useGlobalOutOfStockThreshold: variant.useGlobalOutOfStockThreshold || false,
         outOfStockThreshold: variant.outOfStockThreshold
       }];
@@ -1664,6 +2015,15 @@ async function verifyReadback(context, state, fetchFn, adminUrl, authToken, secr
       state.readback.push({ code: country.channelCode, dryRun: true });
       continue;
     }
+    // Skip a country whose channel was never created or found: querying it
+    // would fall through to the default channel and produce the misleading
+    // "invalid input syntax for type integer: undefined" error.
+    var channelIds = state.channelIdsByCode || {};
+    var foundChannelId = channelIds[String(country.channelCode).toLowerCase()];
+    if (!foundChannelId) {
+      state.readback.push({ code: country.channelCode, skipped: 'channel missing' });
+      continue;
+    }
     try {
       var result = await adminGraphqlRequest(fetchFn, shopBase, {
         query: query,
@@ -1675,6 +2035,11 @@ async function verifyReadback(context, state, fetchFn, adminUrl, authToken, secr
       if (body && body.errors && body.errors.length > 0) {
         entry.error = body.errors.map(function(e) { return redactValue(e.message, [token]); }).join('; ');
         state.errors.push('readback error for ' + country.channelCode + ': ' + entry.error);
+        // A readback that fails (even at HTTP 200 with GraphQL errors, e.g. the
+        // confirmed staging "invalid input syntax for type integer: undefined")
+        // must never yield a passing seed: record it as a failed readback so
+        // finalizeSeedResult forces ok:false.
+        recordMutation(state, 'failed', 'readback', { code: country.channelCode, error: entry.error });
       }
       if (body && body.data) {
         entry.activeChannel = body.data.activeChannel ? { code: body.data.activeChannel.code, currency: body.data.activeChannel.currencyCode } : null;
@@ -1723,10 +2088,17 @@ function writeSeedEvidence(context, state, evidencePayload) {
       // The evidence collector requires the run index to exist before
       // writeEvidenceFile appends to it; initialise it at the same resolved
       // root+baseDir so the file lands at evidence/<runId>/seed/seed-record.json.
+      // The index is created with the run metadata (git HEAD, manifest
+      // reference commit, protected-path hash at start) so the compliance
+      // report can read index.json top-level fields instead of n/a.
       var initOpts = { root: (opts.root || process.cwd()), baseDir: (opts.baseDir || 'evidence'), reuseExisting: true };
       var loaded = evidenceCollector.loadIndex(path.resolve(initOpts.root, initOpts.baseDir), runId);
       if (!loaded.exists) {
-        evidenceCollector.initEvidenceIndex(runId, {}, initOpts);
+        evidenceCollector.initEvidenceIndex(runId, {
+          executionRevision: gitHeadOf(context),
+          referenceCommit: referenceCommitOf(context),
+          protectedPathsHash: protectedPathsHashOf(context)
+        }, initOpts);
       }
       var res = evidenceCollector.writeEvidenceFile(runId, 'seed', SEED_EVIDENCE_FILENAME, content, opts);
       return { ok: true, result: res };
@@ -1808,6 +2180,24 @@ async function seedStaging(context, options) {
   var username = adminUsername(context);
   var password = adminPassword(context);
   var customerPassword = String(envValue(context, 'SEED_TEST_CUSTOMER_PASSWORD') || '').trim();
+
+  // Configuration blockers fail closed BEFORE login/seed: seeding with a
+  // missing test-customer password or placeholder channel tokens would
+  // produce an environment the readiness tasks cannot use.
+  if (!customerPassword) {
+    state.completedAt = getClock(context)().toISOString();
+    return finalizeSeedResult(context, state, {
+      reason: SEED_CONFIG_BLOCKED,
+      error: 'SEED_TEST_CUSTOMER_PASSWORD is missing or empty; supply a real test-customer password'
+    });
+  }
+  var tokenCfg = resolveSeedChannelTokens(context, spec);
+  if (!tokenCfg.ok) {
+    state.completedAt = getClock(context)().toISOString();
+    return finalizeSeedResult(context, state, { reason: SEED_CONFIG_BLOCKED, error: tokenCfg.error });
+  }
+  state.channelTokensConfigured = true;
+
   var allSecrets = uniqueSecrets([password, customerPassword]);
   // Nominal channel tokens are needed only to reach the per-channel contexts;
   // they are secrets and are never kept in evidence.
@@ -1831,7 +2221,8 @@ async function seedStaging(context, options) {
 
   // Introspect schema types before building inputs.
   var introspectResult = await introspectTypes(fetchFn, adminUrl, authToken, [
-    'Mutation', 'Channel', 'CreateChannelInput', 'CreateProductInput', 'CreateProductVariantInput', 'Zone', 'Country'
+    'Mutation', 'Channel', 'CreateChannelInput', 'CreateProductInput', 'CreateProductVariantInput', 'Zone', 'Country',
+    'GlobalSettings', 'UpdateGlobalSettingsInput', 'UpdateChannelInput'
   ]);
   bumpRequests(state);
   state.introspectedTypes = {};
@@ -1850,11 +2241,33 @@ async function seedStaging(context, options) {
   bumpRequests(state);
   state.preRead = preRead.ok ? redactDeep(preRead.data, allSecrets) : { error: (preRead.error || 'pre-read failed') };
 
+  // Language prerequisite BEFORE createChannel: the seed drives the channel
+  // defaultLanguageCode 'en'. If 'en' is missing, enable it via
+  // updateGlobalSettings (keeping existing languages) so createChannel /
+  // createProduct succeed. If the update fails or is not permitted, a clear
+  // failed entry is recorded and channel creation is skipped.
+  var requiredLang = 'en';
+  if (spec.countries && spec.countries.length > 0 && spec.countries[0].defaultLanguageCode) {
+    requiredLang = String(spec.countries[0].defaultLanguageCode);
+  }
+  var langResult = await ensureDefaultLanguage(context, state, fetchFn, adminUrl, authToken, allSecrets, introspectResult, requiredLang);
+  bumpRequests(state);
+  if (!langResult.ok && !langResult.planned) {
+    // ensureDefaultLanguage already recorded the 'failed' entry; skip channel
+    // creation so the misleading integer error never reaches the readback.
+    state.completedAt = getClock(context)().toISOString();
+    return finalizeSeedResult(context, state, { reason: SEED_CONFIG_BLOCKED, error: langResult.error });
+  }
+
   if (state.dryRun) {
     state.created = [];
     state.conflicts = [];
     state.failed = [];
     state.mutations = 0;
+    // Re-record the planned language step (the reset above cleared it).
+    if (langResult.planned) {
+      recordMutation(state, 'created', 'language', { required: requiredLang, planned: true, plan: 'add ' + requiredLang + ' to globalSettings.availableLanguages, keeping existing' });
+    }
     // Still record the plan for each entity.
     await planDryRun(context, state, spec, fetchFn, adminUrl, authToken, allSecrets);
     state.completedAt = getClock(context)().toISOString();
@@ -1957,6 +2370,33 @@ async function planDryRun(context, state, spec, fetchFn, adminUrl, authToken, al
   await ensureCustomers(context, state, fetchFn, adminUrl, authToken, allSecrets, spec);
 }
 
+/**
+ * After the seed evidence is written, record the protected-path hash at the
+ * END of the run into index.json meta.protectedEndHash (the run-level end hash
+ * the compliance report reads). Uses the evidence collector's updateRunMeta so
+ * a single index.json is edited in place. Never throws.
+ */
+function writeRunMetaProtectedEnd(context, runId) {
+  var endHash = protectedPathsHashOf(context);
+  if (!endHash) return { ok: false, reason: 'no protected hash' };
+  var evidenceCollector = null;
+  try {
+    evidenceCollector = require('../evidenceCollector');
+  } catch (e) {
+    evidenceCollector = null;
+  }
+  if (!evidenceCollector || typeof evidenceCollector.updateRunMeta !== 'function') {
+    return { ok: false, reason: 'no evidence collector' };
+  }
+  var opts = resolveEvidenceOptions(context);
+  try {
+    evidenceCollector.updateRunMeta(runId, { protectedEndHash: endHash }, opts);
+    return { ok: true, endHash: endHash };
+  } catch (e) {
+    return { ok: false, reason: (e && e.message) || String(e) };
+  }
+}
+
 function finalizeSeedResult(context, state, extra) {
   var out = {
     ok: false,
@@ -1982,6 +2422,7 @@ function finalizeSeedResult(context, state, extra) {
     readback: state.readback,
     onboardCountryAvailable: state.onboardCountryAvailable,
     introspectedTypes: state.introspectedTypes,
+    languagePrerequisite: state.languagePrerequisite || null,
     errors: state.errors,
     hasTestCustomerPassword: state.hasTestCustomerPassword || false,
     evidence: null
@@ -1997,6 +2438,10 @@ function finalizeSeedResult(context, state, extra) {
 
   var written = writeSeedEvidence(context, state, out);
   out.evidence = written.ok ? { written: true, file: SEED_EVIDENCE_FILENAME } : { written: false, reason: written.reason };
+  // Record the run-level protected-end hash in index.json meta (completes the
+  // start/end pair read by the compliance report).
+  var metaEnd = writeRunMetaProtectedEnd(context, runIdOf(context));
+  out.runLevelProtectedEndHash = metaEnd.ok ? metaEnd.endHash : null;
 
   // Never expose the secrets on the returned record.
   delete state.secrets;
@@ -2012,6 +2457,10 @@ function finalizeSeedResult(context, state, extra) {
 module.exports = {
   seedStaging: seedStaging,
   writeSeedEvidence: writeSeedEvidence,
+  writeRunMetaProtectedEnd: writeRunMetaProtectedEnd,
+  gitHeadOf: gitHeadOf,
+  referenceCommitOf: referenceCommitOf,
+  protectedPathsHashOf: protectedPathsHashOf,
   SEED_HOST_NOT_ALLOWED: 'SEED_HOST_NOT_ALLOWED',
   SEED_CONFLICT: 'SEED_CONFLICT',
   ADMIN_CREDENTIALS_MISSING: 'ADMIN_CREDENTIALS_MISSING',

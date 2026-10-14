@@ -13,6 +13,11 @@ var SENTINEL_AUTH = 'sentinel-auth-token-9f8e';
 var SENTINEL_TOKEN = 'sentinel-channel-token-abc123';
 var SENTINEL_CUSTOMER_PASSWORD = 'sentinel-customer-pw-zz9';
 
+// Real-shaped (non-placeholder) channel tokens the seeded mock DB and the
+// CHANNEL_TOKENS env both use. The runtime seeder now rejects the nominal
+// placeholder tokens, so tests must exercise it with plausible real values.
+var TEST_CHANNEL_TOKENS = { DE: 'tok-de-real-9f', AT: 'tok-at-real-8e', HU: 'tok-hu-real-7d', GB: 'tok-gb-real-6c' };
+
 function loadSpec() {
   return JSON.parse(fs.readFileSync(SPECDIR, 'utf8'));
 }
@@ -50,8 +55,12 @@ function channelField() {
 
 function seededChannelsData(spec) {
   var items = spec.countries.map(function(c) {
-    var ch = { id: 'chan-' + c.channelCode, code: c.channelCode, token: c.channelToken, availableCurrencyCodes: [c.currencyCode] };
+    var token = (TEST_CHANNEL_TOKENS[c.countryCode]) || c.channelToken;
+    var ch = { id: 'chan-' + c.channelCode, code: c.channelCode, token: token, availableCurrencyCodes: [c.currencyCode] };
     ch[channelField()] = c.currencyCode;
+    ch.defaultLanguageCode = spec.countries && spec.countries[0] ? spec.countries[0].defaultLanguageCode : 'en';
+    ch.defaultTaxZone = { id: 'zone-' + (c.zoneName || '').toLowerCase(), name: (c.zoneName || '') };
+    ch.defaultShippingZone = { id: 'zone-' + (c.zoneName || '').toLowerCase(), name: (c.zoneName || '') };
     return ch;
   });
   return { data: { channels: { items: items, totalItems: items.length } } };
@@ -113,7 +122,8 @@ function introspectionData() {
       'login', 'createChat', 'deleteChat', 'createChannel', 'createCountry', 'createZone',
       'createTaxCategory', 'createTaxRate', 'createStockLocation',
       'createProduct', 'createProductVariants', 'assignProductsToChannel',
-      'assignProductVariantsToChannel', 'assignStockLocationsToChannel', 'createCustomer'
+      'assignProductVariantsToChannel', 'assignStockLocationsToChannel', 'createCustomer',
+      'updateGlobalSettings', 'updateChannel'
     ]), inputFields: [] },
     Channel: { name: 'Channel', fields: outputFields([
       'id', 'code', 'token', 'defaultLanguageCode', 'defaultShippingZone',
@@ -128,7 +138,10 @@ function introspectionData() {
     CreateProductInput: { name: 'CreateProductInput', fields: [], inputFields: inputFields(['translations', 'enabled']) },
     CreateProductVariantInput: { name: 'CreateProductVariantInput', fields: [], inputFields: inputFields(['productId', 'sku', 'translations', 'price', 'stockOnHand', 'trackInventory', 'outOfStockThreshold']) },
     Zone: { name: 'Zone', fields: outputFields(['id', 'name']), inputFields: [] },
-    Country: { name: 'Country', fields: outputFields(['id', 'code', 'enabled']), inputFields: [] }
+    Country: { name: 'Country', fields: outputFields(['id', 'code', 'enabled']), inputFields: [] },
+    GlobalSettings: { name: 'GlobalSettings', fields: outputFields(['availableLanguages', 'pricesIncludeTax']), inputFields: [] },
+    UpdateGlobalSettingsInput: { name: 'UpdateGlobalSettingsInput', fields: [], inputFields: inputFields(['availableLanguages']) },
+    UpdateChannelInput: { name: 'UpdateChannelInput', fields: [], inputFields: inputFields(['id', 'defaultLanguageCode']) }
   } };
 }
 
@@ -169,6 +182,9 @@ function makeMutationResponse(query) {
   }
   if (query.indexOf('updateProductVariants') !== -1) {
     return { data: { updateProductVariants: [{ id: 'new-variant', sku: 'TST' }] } };
+  }
+  if (query.indexOf('updateChannel') !== -1) {
+    return { data: { updateChannel: { __typename: 'Channel', id: 'new-channel', code: 'de', defaultLanguageCode: 'en' } } };
   }
   if (query.indexOf('createCustomer') !== -1) {
     return { data: { createCustomer: { __typename: 'Customer', id: 'new-customer', emailAddress: 'test-de@example.invalid' } } };
@@ -216,7 +232,7 @@ function makeSeedFetch(state) {
     conflict: function(query) {
       if (query.indexOf('channels') !== -1) {
         var items = [{
-          id: 'chan-de', code: 'de', token: 'de-token', availableCurrencyCodes: ['USD']
+          id: 'chan-de', code: 'de', token: TEST_CHANNEL_TOKENS.DE, availableCurrencyCodes: ['USD']
         }];
         items[0][channelField()] = 'USD';
         return { data: { channels: { items: items, totalItems: 1 } } };
@@ -226,26 +242,43 @@ function makeSeedFetch(state) {
     }
   };
   var seed = seeds[state.kind] || seeds.fresh;
+  if (typeof seed !== 'function') seed = seeds.fresh;
   var fetchFn = function(url, init) {
-    var u = String(url);
-    calls.push({ url: u, init: init && init.headers ? init.headers : {} });
-    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
-    var query = body.query || body.query || '';
-    var isShop = u.indexOf('/shop-api') !== -1;
-    if (u.indexOf('/health') !== -1) {
-      return Promise.resolve({ status: 200, json: function() { return Promise.resolve({ status: 'ok' }); } });
-    }
-    if (query.indexOf('mutation Login') !== -1) {
-      return Promise.resolve({
-        status: 200,
-        headers: { get: function(n) { return n === 'vendure-auth-token' ? SENTINEL_AUTH : null; } },
-        text: function() { return Promise.resolve(JSON.stringify({ data: { login: { __typename: 'CurrentUser', id: 'u1', identifier: 'admin@staging.local' } } })); }
-      });
-    }
-    if (query.indexOf('Introspect') !== -1) {
-      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify(introspectionData())); } });
-    }
-    if (query.indexOf('mutation ') !== -1) {
+  var u = String(url);
+  calls.push({ url: u, init: init && init.headers ? init.headers : {} });
+  var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+  var query = body.query || body.query || '';
+  var isShop = u.indexOf('/shop-api') !== -1;
+  if (u.indexOf('/health') !== -1) {
+   return Promise.resolve({ status: 200, json: function() { return Promise.resolve({ status: 'ok' }); } });
+  }
+  if (query.indexOf('mutation Login') !== -1) {
+   return Promise.resolve({
+   status: 200,
+   headers: { get: function(n) { return n === 'vendure-auth-token' ? SENTINEL_AUTH : null; } },
+   text: function() { return Promise.resolve(JSON.stringify({ data: { login: { __typename: 'CurrentUser', id: 'u1', identifier: 'admin@staging.local' } } })); }
+   });
+  }
+  if (query.indexOf('Introspect') !== -1) {
+   return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify(introspectionData())); } });
+  }
+  if (query.indexOf('globalSettings') !== -1) {
+   var langs = (state && state.availableLanguages) || ['en', 'de'];
+   return Promise.resolve({
+   status: 200,
+   headers: { get: function() { return null; } },
+   text: function() { return Promise.resolve(JSON.stringify({ data: { globalSettings: { availableLanguages: langs } } })); }
+   });
+  }
+  if (query.indexOf('updateGlobalSettings') !== -1) {
+   var reqLangs = body.variables && body.variables.input && body.variables.input.availableLanguages;
+   return Promise.resolve({
+   status: 200,
+   headers: { get: function() { return null; } },
+   text: function() { return Promise.resolve(JSON.stringify({ data: { updateGlobalSettings: { __typename: 'GlobalSettings', availableLanguages: reqLangs || ['de', 'en'] } } })); }
+   });
+  }
+  if (query.indexOf('mutation ') !== -1) {
       return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify(makeMutationResponse(query))); } });
     }
     var data = seed(query, isShop);
@@ -261,7 +294,8 @@ function makeContext(opts) {
     SUPERADMIN_USERNAME: 'admin@staging.local',
     SUPERADMIN_PASSWORD: SENTINEL_PASSWORD,
     VENDURE_ADMIN_API_URL: opts.adminApiUrl || 'https://staging.tibella.eu/admin-api',
-    SEED_TEST_CUSTOMER_PASSWORD: SENTINEL_CUSTOMER_PASSWORD
+    SEED_TEST_CUSTOMER_PASSWORD: SENTINEL_CUSTOMER_PASSWORD,
+    CHANNEL_TOKENS: (opts.channelTokens !== undefined ? opts.channelTokens : JSON.stringify(TEST_CHANNEL_TOKENS))
   };
   if (opts.env) Object.keys(opts.env).forEach(function(k) { env[k] = opts.env[k]; });
   var fetchFn = opts.fetch || makeSeedFetch({ kind: 'fresh' });
@@ -278,6 +312,10 @@ function makeContext(opts) {
       evidenceOptions: function() { return { root: opts.root || process.cwd(), baseDir: 'evidence', reuseExisting: true }; }
     }
   };
+  if (opts.givenRunEnv) {
+    context.runEnv = { gitHead: 'cafebaberev1', revisionId: null, referenceCommit: 'refcommit-123' };
+    context.runEnvRecord = { gitHead: 'cafebaberev1', referenceCommit: 'refcommit-123' };
+  }
   return { context: context, fetchFn: fetchFn };
 }
 
@@ -1200,5 +1238,476 @@ test('seed: mutation documents for union-return types keep the ErrorResult fragm
         fieldName + ' returns a union and must keep the ErrorResult fragment');
     });
   });
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests for the confirmed staging seed defects
+// ---------------------------------------------------------------------------
+
+// Capture the createProductVariants request body so the trackInventory value
+// that is actually sent can be asserted.
+function captureVariantCreateFetch(inner) {
+  var variantCalls = [];
+  var fn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('createProductVariants') !== -1) {
+      variantCalls.push(body);
+    }
+    return inner(url, init);
+  };
+  fn.getVariantCalls = function() { return variantCalls; };
+  fn.getCalls = inner.getCalls || function() { return []; };
+  return fn;
+}
+
+test('seed: trackInventory is sent as GlobalFlag enum, not Boolean', async function() {
+  var runId = 'run-trackflag-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var fetchFn = captureVariantCreateFetch(inner);
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, true, 'fresh run must succeed');
+  var variantCalls = fetchFn.getVariantCalls();
+  assert.ok(variantCalls.length > 0, 'expected createProductVariants calls');
+  for (var i = 0; i < variantCalls.length; i++) {
+    var input = variantCalls[i].variables && variantCalls[i].variables.input;
+    assert.ok(Array.isArray(input) && input.length > 0, 'input must be an array of variants');
+    for (var v = 0; v < input.length; v++) {
+      var tk = input[v].trackInventory;
+      // Must be the GlobalFlag enum string; a Boolean (or missing) is the bug.
+      assert.ok(tk === 'TRUE' || tk === 'FALSE' || tk === 'INHERIT',
+        'trackInventory must be a GlobalFlag enum value, got: ' + JSON.stringify(tk));
+    }
+  }
+});
+
+test('seed: trackInventory maps true/false/undefined to TRUE/FALSE/INHERIT', async function() {
+  var runId = 'run-trackspec-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  // Build a custom spec whose variants exercise all three GlobalFlag input
+  // cases: a Boolean true, a Boolean false, and an undefined (missing) value.
+  var base = loadSpec();
+  var spec = JSON.parse(JSON.stringify(base));
+  spec.products.forEach(function(p) {
+    p.variants.forEach(function(v) {
+      if (v.sku === 'TST-ALL-1') v.trackInventory = true;
+      else if (v.sku === 'TST-DE-ONLY-1') v.trackInventory = false;
+      else delete v.trackInventory;
+    });
+  });
+  var specPath = path.join(root, 'custom-spec.json');
+  fs.writeFileSync(specPath, JSON.stringify(spec));
+  var inner = makeSeedFetch({ kind: 'fresh', spec: spec });
+  var fetchFn = captureVariantCreateFetch(inner);
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, { specPath: specPath });
+  assert.strictEqual(result.ok, true, 'fresh run must succeed');
+  var variantCalls = fetchFn.getVariantCalls();
+  assert.ok(variantCalls.length > 0, 'expected createProductVariants calls');
+  var bySku = {};
+  for (var i = 0; i < variantCalls.length; i++) {
+    var input = variantCalls[i].variables && variantCalls[i].variables.input;
+    assert.ok(Array.isArray(input) && input.length > 0, 'input must be an array of variants');
+    for (var v = 0; v < input.length; v++) {
+      bySku[input[v].sku] = input[v].trackInventory;
+    }
+  }
+  assert.strictEqual(bySku['TST-ALL-1'], 'TRUE', 'boolean true must map to TRUE');
+  assert.strictEqual(bySku['TST-DE-ONLY-1'], 'FALSE', 'boolean false must map to FALSE');
+  assert.strictEqual(bySku['TST-HU-ONLY-1'], 'INHERIT', 'undefined must map to INHERIT');
+  assert.strictEqual(bySku['TST-DE-AT-1'], 'INHERIT', 'undefined must map to INHERIT');
+});
+
+test('seed: missing test customer password blocks before any seed mutation', async function() {
+  var runId = 'run-nopw-' + Date.now();
+  var requested = [];
+  var serverHit = [];
+  var fetchFn = function(url, init) {
+    requested.push(String(url));
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('mutation ') !== -1) serverHit.push(q);
+    return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve('{}'); } });
+  };
+  fetchFn.getCalls = function() { return requested; };
+  var built = makeContext({
+    runId: runId,
+    fetch: fetchFn,
+    env: { SEED_TEST_CUSTOMER_PASSWORD: '' }
+  });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.reason, 'SEED_CONFIG_BLOCKED');
+  assert.ok(result.error.indexOf('SEED_TEST_CUSTOMER_PASSWORD') !== -1);
+  assert.strictEqual(serverHit.length, 0, 'must not issue any mutation without a customer password');
+});
+
+test('seed: missing CHANNEL_TOKENS blocks with SEED_CONFIG_BLOCKED', async function() {
+  var runId = 'run-notoks-' + Date.now();
+  var requested = [];
+  var serverHit = [];
+  var fetchFn = function(url, init) {
+    requested.push(String(url));
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('mutation ') !== -1) serverHit.push(q);
+    return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve('{}'); } });
+  };
+  fetchFn.getCalls = function() { return requested; };
+  var built = makeContext({
+    runId: runId,
+    fetch: fetchFn,
+    channelTokens: null
+  });
+  // makeContext merges opts.env after defaults; forcing CHANNEL_TOKENS removal
+  // by overriding the env value.
+  built.context.deps.getEnv = function() {
+    var env = {
+      SUPERADMIN_USERNAME: 'admin@staging.local',
+      SUPERADMIN_PASSWORD: SENTINEL_PASSWORD,
+      VENDURE_ADMIN_API_URL: 'https://staging.tibella.eu/admin-api',
+      SEED_TEST_CUSTOMER_PASSWORD: SENTINEL_CUSTOMER_PASSWORD
+    };
+    return env;
+  };
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.reason, 'SEED_CONFIG_BLOCKED');
+  assert.ok(result.error.indexOf('CHANNEL_TOKENS') !== -1);
+  assert.strictEqual(serverHit.length, 0, 'must not issue any mutation without real channel tokens');
+});
+
+test('seed: placeholder channel tokens block with SEED_CONFIG_BLOCKED', async function() {
+  var runId = 'run-placetok-' + Date.now();
+  var requested = [];
+  var serverHit = [];
+  var fetchFn = function(url, init) {
+    requested.push(String(url));
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('mutation ') !== -1) serverHit.push(q);
+    return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve('{}'); } });
+  };
+  fetchFn.getCalls = function() { return requested; };
+  var built = makeContext({
+    runId: runId,
+    fetch: fetchFn,
+    channelTokens: JSON.stringify({ DE: 'de-token', AT: 'at-token', HU: 'hu-token', GB: 'gb-token' })
+  });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.reason, 'SEED_CONFIG_BLOCKED');
+  assert.ok(result.error.indexOf('placeholder') !== -1);
+  assert.strictEqual(serverHit.length, 0, 'must not seed with placeholder channel tokens');
+});
+
+test('seed: language already present in globalSettings requires no update mutation', async function() {
+  var runId = 'run-langpresent-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh', availableLanguages: ['en', 'de'] });
+  var updateCalls = [];
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('updateGlobalSettings') !== -1) updateCalls.push(body);
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.languagePrerequisite.present, true);
+  assert.strictEqual(result.languagePrerequisite.added, false);
+  assert.strictEqual(updateCalls.length, 0, 'language already present: no updateGlobalSettings mutation');
+});
+
+test('seed: language missing in globalSettings is added via updateGlobalSettings keeping existing', async function() {
+  var runId = 'run-langadd-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh', availableLanguages: ['de'] });
+  var updateCalls = [];
+  var createChannelCalls = [];
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('updateGlobalSettings') !== -1) updateCalls.push(body);
+    if (q.indexOf('createChannel') !== -1) createChannelCalls.push(body);
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, true, 'seed must continue after enabling language');
+  assert.strictEqual(result.languagePrerequisite.present, false);
+  assert.strictEqual(result.languagePrerequisite.added, true);
+  assert.strictEqual(result.languagePrerequisite.error, undefined);
+  assert.strictEqual(updateCalls.length, 1, 'updateGlobalSettings must be called exactly once');
+  var input = updateCalls[0].variables && updateCalls[0].variables.input;
+  assert.deepStrictEqual(input.availableLanguages, ['de', 'en'], 'en added to the existing languages, keeping de');
+  // The mutation is recorded in created with the markets preserved.
+  var langCreated = result.created.filter(function(c) { return c.entity === 'language'; });
+  assert.strictEqual(langCreated.length, 1, 'language update must be recorded in created');
+  assert.strictEqual(createChannelCalls.length, 4, 'channels are created after language is enabled');
+});
+
+test('seed: updateGlobalSettings failing records failed entry and skips channel creation', async function() {
+  var runId = 'run-langfail-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh', availableLanguages: ['de'] });
+  var createChannelCalls = [];
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('updateGlobalSettings') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ data: { updateGlobalSettings: { __typename: 'ErrorResult', errorCode: 'FORBIDDEN', message: 'Not permitted' } } })); }
+      });
+    }
+    if (q.indexOf('createChannel') !== -1) createChannelCalls.push(body);
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, false, 'update failure must not yield a passing seed');
+  assert.strictEqual(result.reason, 'SEED_CONFIG_BLOCKED');
+  assert.ok(result.error.length > 0, 'must surface the exact update error');
+  var langFailures = result.failed.filter(function(f) { return f.entity === 'language'; });
+  assert.ok(langFailures.length > 0, 'a failed language entry must be recorded');
+  assert.ok(langFailures[0].error.indexOf('Not permitted') !== -1, 'failed entry must carry the exact server error');
+  assert.strictEqual(createChannelCalls.length, 0, 'channel creation must be skipped after a failed language update');
+});
+
+test('seed: language update not permitted when schema lacks updateGlobalSettings', async function() {
+  var runId = 'run-langnotperm-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh', availableLanguages: ['de'] });
+  // Override introspection to match a server without updateGlobalSettings.
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('Introspect') !== -1) {
+      var noMutation = introspectionData();
+      noMutation.data.Mutation.fields = noMutation.data.Mutation.fields.filter(function(f) { return f.name !== 'updateGlobalSettings'; });
+      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify(noMutation)); } });
+    }
+    if (q.indexOf('updateGlobalSettings') !== -1) {
+      throw new Error('updateGlobalSettings must not be called when schema lacks it');
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, false);
+  assert.strictEqual(result.reason, 'SEED_CONFIG_BLOCKED');
+  var langFailures = result.failed.filter(function(f) { return f.entity === 'language'; });
+  assert.ok(langFailures.length > 0, 'a failed language entry must be recorded');
+  assert.ok(langFailures[0].error.indexOf('schema') !== -1, 'must name the schema limitation');
+});
+
+test('seed: readback skips a country whose channel was not created/found, recording skipped', async function() {
+  var runId = 'run-readback-skip-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  // GB channel creation fails, so GB never enters channelIdsByCode.
+  var inner = makeSeedFetch({ kind: 'fresh', availableLanguages: ['en', 'de'] });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('createChannel') !== -1 && body.variables && body.variables.input && body.variables.input.code === 'gb') {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ data: { createChannel: { __typename: 'ErrorResult', errorCode: 'UNKNOWN_ERROR', message: 'channel creation denied for gb' } } })); }
+      });
+    }
+    if (q.indexOf('updateGlobalSettings') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ data: { updateGlobalSettings: { __typename: 'GlobalSettings', availableLanguages: ['en', 'de'] } } })); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  // GB channel creation failed (recorded), so readback must skip it.
+  var gbReadback = (result.readback || []).filter(function(r) { return r.code === 'gb'; });
+  assert.strictEqual(gbReadback.length, 1, 'gb readback entry must still be present');
+  assert.strictEqual(gbReadback[0].skipped, 'channel missing', 'gb readback must be skipped, not queried');
+  assert.strictEqual(gbReadback[0].error, undefined, 'the misleading integer error must never be pushed');
+  // Other countries are still read back.
+  var deReadback = (result.readback || []).filter(function(r) { return r.code === 'de'; });
+  assert.ok(deReadback.length > 0, 'de readback must still be performed');
+  var channelFailures = result.failed.filter(function(f) { return f.entity === 'channel' && f.code === 'gb'; });
+  assert.ok(channelFailures.length > 0, 'gb channel creation failure is still recorded as failed');
+});
+
+test('seed: dry-run with missing language plans the update but issues no mutation', async function() {
+  var runId = 'run-langdry-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh', availableLanguages: ['de'] });
+  var updateCalls = [];
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('updateGlobalSettings') !== -1) updateCalls.push(body);
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, { dryRun: true });
+  assert.strictEqual(result.dryRun, true);
+  assert.strictEqual(result.mutations, 0, 'dry-run must never mutate');
+  assert.strictEqual(updateCalls.length, 0, 'dry-run must not call updateGlobalSettings');
+  var langPlanned = result.created.filter(function(c) { return c.entity === 'language'; });
+  assert.ok(langPlanned.length > 0, 'dry-run records the language plan');
+  assert.strictEqual(langPlanned[0].planned, true);
+  assert.strictEqual(result.languagePrerequisite.planned, true);
+});
+
+test('seed: existing channel with wrong defaultLanguageCode is updated and recorded', async function() {
+  var runId = 'run-chanlang-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  // The staged channels exist but carry the wrong default language 'zh'.
+  var inner = makeSeedFetch({ kind: 'seeded' });
+  var updateCalls = [];
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('channels') !== -1 && q.indexOf('{') !== -1 &&
+        q.indexOf('channels(options:') !== -1 && q.indexOf('updateChannel') === -1) {
+      var base = seededChannelsData(loadSpec());
+      base.data.channels.items.forEach(function(ch) { ch.defaultLanguageCode = 'zh'; });
+      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify(base)); } });
+    }
+    if (q.indexOf('updateChannel') !== -1) {
+      var input = body.variables && body.variables.input;
+      updateCalls.push({ query: q, input: input });
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ data: { updateChannel: { __typename: 'Channel', id: 'chan-' + ((input && input.id) || 'x'), code: 'x', defaultLanguageCode: input && input.defaultLanguageCode ? input.defaultLanguageCode : 'en' } } })); }
+      });
+    }
+    if (q.indexOf('updateGlobalSettings') !== -1) {
+      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify({ data: { updateGlobalSettings: { __typename: 'GlobalSettings', availableLanguages: ['zh', 'en'] } } })); } });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, true, 'channel language updates (<4) must not fail the seed');
+  assert.ok(updateCalls.length >= 1, 'updateChannel must be called for a channel with wrong language');
+  assert.ok(updateCalls.length <= 4, 'at most one updateChannel per seeded country channel');
+  var updatedEntries = result.created.filter(function(c) { return c.entity === 'channel' && c.languageTo; });
+  assert.ok(updatedEntries.length >= 1, 'a channel-language change entry must exist and carry languageTo');
+  for (var k = 0; k < updatedEntries.length; k++) {
+    assert.ok(updatedEntries[k].languageFrom !== undefined, 'the previous language must be recorded');
+    assert.strictEqual(updatedEntries[k].languageTo, 'en', 'the new language code must be en');
+  }
+});
+
+test('seed: updateChannel denied records failed entry but keeps processing', async function() {
+  var runId = 'run-chanlangdeny-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'seeded' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('channels') !== -1 && q.indexOf('{') !== -1 &&
+        q.indexOf('channels(options:') !== -1 && q.indexOf('updateChannel') === -1) {
+      var base = seededChannelsData(loadSpec());
+      base.data.channels.items.forEach(function(ch) { ch.defaultLanguageCode = 'zh'; });
+      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify(base)); } });
+    }
+    if (q.indexOf('updateChannel') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ data: { updateChannel: { __typename: 'ErrorResult', errorCode: 'FORBIDDEN', message: 'Language update not permitted' } } })); }
+      });
+    }
+    if (q.indexOf('updateGlobalSettings') !== -1) {
+      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify({ data: { updateGlobalSettings: { __typename: 'GlobalSettings', availableLanguages: ['zh', 'en'] } } })); } });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  var chanLangFailures = result.failed.filter(function(f) { return f.entity === 'channel' && f.reason === 'language'; });
+  assert.ok(chanLangFailures.length > 0, 'a failed channel-language entry must be recorded');
+  assert.ok(chanLangFailures[0].error.indexOf('not permitted') !== -1, 'must carry the exact server error');
+});
+
+test('seed: evidence files contain no channel token or admin credential strings', async function() {
+  var runId = 'run-evidence-safe-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var built = makeContext({ runId: runId, fetch: inner, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, true);
+  var evidenceDir = path.join(root, 'evidence', runId);
+  var files = listFiles(evidenceDir);
+  var forbidden = [SENTINEL_PASSWORD, SENTINEL_TOKEN, SENTINEL_CUSTOMER_PASSWORD, SENTINEL_AUTH]
+    .concat(Object.keys(TEST_CHANNEL_TOKENS).map(function(k) { return TEST_CHANNEL_TOKENS[k]; }));
+  for (var i = 0; i < files.length; i++) {
+    var content = fs.readFileSync(files[i], 'utf8');
+    for (var f2 = 0; f2 < forbidden.length; f2++) {
+      assert.strictEqual(content.indexOf(forbidden[f2]), -1,
+        'evidence must not leak secret value in ' + files[i]);
+    }
+  }
+  // The seed record itself carries the availableLanguages list and per-channel
+  // non-sensitive identifiers.
+  var seedRecord = JSON.parse(fs.readFileSync(path.join(evidenceDir, 'seed', 'seed-record.json'), 'utf8'));
+  assert.ok(seedRecord.languagePrerequisite, 'seed record must carry languagePrerequisite');
+  assert.ok(Array.isArray(seedRecord.languagePrerequisite.available), 'availableLanguages list must be in evidence');
+  assert.ok(Array.isArray(seedRecord.channels) && seedRecord.channels.length > 0, 'per-channel evidence must exist');
+  for (var c = 0; c < seedRecord.channels.length; c++) {
+    var ch = seedRecord.channels[c];
+    assert.ok(ch.code, 'evidence carries the channel code');
+    assert.ok(ch.currency, 'evidence carries the channel currency');
+    assert.strictEqual(typeof ch.defaultLanguageCode, 'string', 'evidence carries the channel defaultLanguageCode');
+  }
+});
+
+
+test('seed: index.json meta populated with execution revision, reference commit and protected hashes', async function() {
+  var runId = 'run-metachunk-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var built = makeContext({ runId: runId, fetch: inner, root: root, cwd: root, givenRunEnv: true });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, true, 'fresh seed must succeed');
+  assert.ok(result.runLevelProtectedEndHash, 'run-level protected end hash must be recorded');
+
+  var indexPath = path.join(root, 'evidence', runId, 'index.json');
+  var index = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  assert.strictEqual(index.executionRevision, 'cafebaberev1', 'executionRevision from run env');
+  assert.strictEqual(index.referenceCommit, 'refcommit-123', 'referenceCommit from run env');
+  assert.ok(index.protectedPathsHash, 'protected start hash must be set');
+  assert.strictEqual(index.meta.protectedEndHash, index.protectedPathsHash, 'end hash matches start (evidence dir is not protected)');
+
+  var entry = index.tasks.seed[0];
+  assert.strictEqual(entry.kind, 'seed');
+  assert.strictEqual(entry.path, 'seed/seed-record.json');
 });
 
