@@ -2449,6 +2449,14 @@ function finalizeSeedResult(context, state, extra) {
     if (extra.host !== undefined) out.host = extra.host;
     if (extra.credentialNames !== undefined) out.credentialNames = extra.credentialNames;
   }
+  // ADMIN_CREDENTIALS_MISSING: set a non-sensitive cause naming the three
+  // scoped variables. extra.credentialNames (populated by adminCredentialState /
+  // adminChannelInventory.adminCredentialNames) lists only admin login names and
+  // is not authoritative for these, so use the literals. Only the NAMES are
+  // placed in cause; never credential values or derived passwords.
+  if (out.reason === ADMIN_CREDENTIALS_MISSING) {
+    out.cause = 'missing STAGING_ADMIN_EMAIL, STAGING_ADMIN_PASSWORD, SEED_TEST_CUSTOMER_PASSWORD';
+  }
   // seed.ok computation (established 14 Oct 2026):
   //   ok = !!(extra.ok) && failed===0 && conflicts===0 && blocked.length===0
   //   Rule: ANY entity blocked (including customer) => ok:false.

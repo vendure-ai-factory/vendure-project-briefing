@@ -543,6 +543,14 @@ test('seed: missing credentials returns ADMIN_CREDENTIALS_MISSING', async functi
   var result = await seed(seedStaging.seedStaging, built.context, {});
   assert.strictEqual(result.reason, 'ADMIN_CREDENTIALS_MISSING');
   assert.strictEqual(requested.length, 0, 'no request before the credentials check');
+  // Cause names the three scoped env vars and no sentinel values.
+  var eNames = ['STAGING_ADMIN_EMAIL', 'STAGING_ADMIN_PASSWORD', 'SEED_TEST_CUSTOMER_PASSWORD'];
+  for (var i = 0; i < eNames.length; i++) {
+    assert.ok(result.cause.indexOf(eNames[i]) !== -1, 'cause must name ' + eNames[i] + ', got: ' + result.cause);
+  }
+  [SENTINEL_PASSWORD, SENTINEL_CUSTOMER_PASSWORD, SENTINEL_AUTH].forEach(function(s) {
+    assert.strictEqual(result.cause.indexOf(s), -1, 'cause must not contain sentinel: ' + s);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1477,12 +1485,23 @@ test('seed: neither password variable present fails seed with ADMIN_CREDENTIALS_
   assert.strictEqual((result.blocked || []).length, 0, 'no blocked entries when seed fails at admin check');
   // customerPasswordSource is not set (HMAC derivation was never attempted).
   assert.strictEqual(result.customerPasswordSource, null, 'customerPasswordSource must be null when seed fails early');
-  // The cause (if set) must name STAGING_ADMIN_PASSWORD (the missing admin credential).
-  var cause = (result.cause || '').toLowerCase();
-  if (cause) {
-    assert.ok(cause.indexOf('staging_admin_password') !== -1 || (result.credentialNames && result.credentialNames.indexOf('STAGING_ADMIN_PASSWORD') !== -1),
-      'cause or credentialNames must mention STAGING_ADMIN_PASSWORD, got cause=' + result.cause + ' credNames=' + JSON.stringify(result.credentialNames));
+  // The cause must name all three scoped env vars and must never contain actual
+  // credential / derived-password values.
+  assert.strictEqual(typeof result.cause, 'string', 'seed must carry a non-sensitive cause');
+  var expectedNames = ['STAGING_ADMIN_EMAIL', 'STAGING_ADMIN_PASSWORD', 'SEED_TEST_CUSTOMER_PASSWORD'];
+  for (var ni = 0; ni < expectedNames.length; ni++) {
+    assert.ok(result.cause.indexOf(expectedNames[ni]) !== -1,
+      'cause must name ' + expectedNames[ni] + ', got: ' + result.cause);
   }
+  assert.ok(result.cause.indexOf(SENTINEL_PASSWORD) === -1,
+    'cause must not contain the admin credential value');
+  assert.ok(result.cause.indexOf(SENTINEL_CUSTOMER_PASSWORD) === -1,
+    'cause must not contain the customer password value');
+  assert.ok(result.cause.indexOf(SENTINEL_AUTH) === -1,
+    'cause must not contain the admin auth token value');
+  assert.ok(result.cause.indexOf('undefined') === -1 &&
+    result.cause.indexOf('null') === -1,
+    'cause must not leak undefined/null as values');
 });
 
 test('seed: customer created via HMAC derives password and seed ok:true', async function() {
