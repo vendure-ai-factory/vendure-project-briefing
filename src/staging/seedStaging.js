@@ -309,6 +309,7 @@ function createState() {
     blocked: [],
     channels: [],
     readback: null,
+    readbackLadder: null,
     preRead: null,
     errors: [],
     requestBudget: MAX_REQUESTS,
@@ -1555,10 +1556,40 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
             variantIds: [],
             channelId: state.channelIdsByCode[primaryCode]
           }
-        }, authToken, secrets, primaryToken);
+        }, authToken, secrets, null);
         bumpRequests(state);
-        // Non-blocking: if the server denies channel visibility the variant creation
-        // itself will fail with a clear error; do not spam state.blocked here.
+        // assignProductsToChannel must run in the DEFAULT channel context (no
+        // vendure-token header) so the product — which only exists in the default
+        // channel — is visible.  Response is classified by shape:
+        //   top-level errors array  => failure
+        //   result is an array       => success
+        //   result is an object with errorCode => failure
+        var paData1 = preAssignRes.response && preAssignRes.response.body && preAssignRes.response.body.data;
+        if (hasTopLevelGraphqlErrors(preAssignRes)) {
+          recordMutation(state, 'failed', 'product', {
+            slug: slug,
+            channel: primaryCode,
+            error: buildCreateDiagnostic(preAssignRes, null, 'assignProductsToChannel failed', secrets)
+          });
+        } else if (!paData1 || !paData1.assignProductsToChannel) {
+          recordMutation(state, 'failed', 'product', {
+            slug: slug,
+            channel: primaryCode,
+            error: buildCreateDiagnostic(preAssignRes, paData1, 'assignProductsToChannel returned no data', secrets)
+          });
+        } else if (!Array.isArray(paData1.assignProductsToChannel) && paData1.assignProductsToChannel.errorCode) {
+          recordMutation(state, 'failed', 'product', {
+            slug: slug,
+            channel: primaryCode,
+            error: buildCreateDiagnostic(preAssignRes, paData1.assignProductsToChannel,
+              'assignProductsToChannel failed', secrets)
+          });
+        }
+        // On failure: continue to next product (variants are skipped).
+        if (hasTopLevelGraphqlErrors(preAssignRes) || !paData1 || !paData1.assignProductsToChannel ||
+            (!Array.isArray(paData1.assignProductsToChannel) && paData1.assignProductsToChannel.errorCode)) {
+          continue;
+        }
       }
       for (var v = 0; v < product.variants.length; v++) {
         var variant = product.variants[v];
@@ -1669,15 +1700,18 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
               variantIds: [variantId],
               channelId: state.channelIdsByCode[addCode]
             }
-          }, authToken, secrets, addToken);
+          }, authToken, secrets, null);
           bumpRequests(state);
           var assignData = assignRes.response && assignRes.response.body && assignRes.response.body.data;
           if (hasTopLevelGraphqlErrors(assignRes)) {
             var aErr = buildCreateDiagnostic(assignRes, null, 'assignProductsToChannel GraphQL error', secrets);
             recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: aErr });
-          } else if (!assignData || !assignData.assignProductsToChannel) {
+          } else if (!assignData || !assignData?.assignProductsToChannel) {
             var aErr2 = buildCreateDiagnostic(assignRes, assignData, 'assignProductsToChannel returned no data', secrets);
             recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: aErr2 });
+          } else if (!Array.isArray(assignData.assignProductsToChannel) && assignData.assignProductsToChannel?.errorCode) {
+            var aErr3 = buildCreateDiagnostic(assignRes, assignData.assignProductsToChannel, 'assignProductsToChannel failed', secrets);
+            recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: aErr3 });
           }
           if (addPriceMinor !== null && state.channelIdsByCode[addCode]) {
             var setPrice = [
@@ -1787,8 +1821,34 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
           variantIds: [],
           channelId: state.channelIdsByCode[primaryCode]
         }
-      }, authToken, secrets, primaryToken);
+      }, authToken, secrets, null);
       bumpRequests(state);
+      // Same classification as site 1 above.
+      var paData2 = preAssignRes2.response && preAssignRes2.response.body && preAssignRes2.response.body.data;
+      if (hasTopLevelGraphqlErrors(preAssignRes2)) {
+        recordMutation(state, 'failed', 'product', {
+          slug: slug,
+          channel: primaryCode,
+          error: buildCreateDiagnostic(preAssignRes2, null, 'assignProductsToChannel failed', secrets)
+        });
+      } else if (!paData2 || !paData2.assignProductsToChannel) {
+        recordMutation(state, 'failed', 'product', {
+          slug: slug,
+          channel: primaryCode,
+          error: buildCreateDiagnostic(preAssignRes2, paData2, 'assignProductsToChannel returned no data', secrets)
+        });
+      } else if (!Array.isArray(paData2.assignProductsToChannel) && paData2.assignProductsToChannel.errorCode) {
+        recordMutation(state, 'failed', 'product', {
+          slug: slug,
+          channel: primaryCode,
+          error: buildCreateDiagnostic(preAssignRes2, paData2.assignProductsToChannel,
+            'assignProductsToChannel failed', secrets)
+        });
+      }
+      if (hasTopLevelGraphqlErrors(preAssignRes2) || !paData2 || !paData2.assignProductsToChannel ||
+          (!Array.isArray(paData2.assignProductsToChannel) && paData2.assignProductsToChannel.errorCode)) {
+        continue;
+      }
     }
 
     for (var v = 0; v < product.variants.length; v++) {
@@ -1901,15 +1961,15 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
             variantIds: [variantId],
             channelId: state.channelIdsByCode[addCode]
           }
-        }, authToken, secrets, addToken);
+        }, authToken, secrets, null);
         bumpRequests(state);
         var assignData = assignRes.response && assignRes.response.body && assignRes.response.body.data;
         if (hasTopLevelGraphqlErrors(assignRes)) {
-          var aErr3 = buildCreateDiagnostic(assignRes, null, 'assignProductsToChannel GraphQL error', secrets);
-          recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: aErr3 });
+          recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: buildCreateDiagnostic(assignRes, null, 'assignProductsToChannel GraphQL error', secrets) });
         } else if (!assignData || !assignData.assignProductsToChannel) {
-          var aErr4 = buildCreateDiagnostic(assignRes, assignData, 'assignProductsToChannel returned no data', secrets);
-          recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: aErr4 });
+          recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: buildCreateDiagnostic(assignRes, assignData, 'assignProductsToChannel returned no data', secrets) });
+        } else if (!Array.isArray(assignData.assignProductsToChannel) && assignData.assignProductsToChannel.errorCode) {
+          recordMutation(state, 'blocked', 'product', { slug: slug, channel: addCode, error: buildCreateDiagnostic(assignRes, assignData.assignProductsToChannel, 'assignProductsToChannel failed', secrets) });
         }
 
         // Set the price in the additional channel's context.
@@ -2023,6 +2083,85 @@ async function ensureCustomers(context, state, fetchFn, adminUrl, authToken, sec
         : ((data && (data.message || data.errorCode)) || 'createCustomer failed');
       recordMutation(state, 'failed', 'customer', { email: email, error: redactValue(msg, secrets) });
     }
+  }
+}
+
+/**
+ * Readback ladder via Admin API per channel context (country channels + default).
+ * Five query steps per channel; stops at first failure and records which step
+ * failed.  Results are stored in state.readbackLadder and written to evidence;
+ * the ladder does not change seed.ok (that is determined by verifyReadback and
+ * finalizeSeedResult alone).
+ *
+ * Ladder steps:
+ *   (a) activeChannel { code currencyCode }
+ *   (b) products(options:{take:1}) { totalItems }
+ *   (c) products(options:{take:1}) { items { id name } }
+ *   (d) products(options:{take:1}) { items { id variants { id } } }
+ *   (e) products(options:{take:1}) { items { id variants { price currencyCode } } }
+ */
+async function readbackLadder(context, state, fetchFn, adminUrl, authToken, secrets, spec, channelTokenById) {
+  state.readbackLadder = [];
+
+  var contexts = [];
+  for (var ci = 0; ci < spec.countries.length; ci++) {
+    var c = spec.countries[ci];
+    var token = channelTokenById[c.channelCode] || c.channelToken || null;
+    contexts.push({ channelCode: c.channelCode, token: token });
+  }
+  contexts.push({ channelCode: '__default__', token: null });
+
+  var steps = [
+    { key: 'a', query: '{ activeChannel { code defaultCurrencyCode } }' },
+    { key: 'b', query: '{ products(options: { take: 1 }) { totalItems } }' },
+    { key: 'c', query: '{ products(options: { take: 1 }) { items { id name } } }' },
+    { key: 'd', query: '{ products(options: { take: 1 }) { items { id variants { id } } } }' },
+    { key: 'e', query: '{ products(options: { take: 1 }) { items { id variants { price currencyCode } } } }' }
+  ];
+
+  for (var j = 0; j < contexts.length; j++) {
+    var ctx = contexts[j];
+    // authToken must always be in callSecrets so error messages redact it.
+    // For channel context, channelToken is prepended so redactDeep redacts it first.
+    var callSecrets = ctx.token ? [ctx.token, authToken].concat(secrets) : [authToken].concat(secrets);
+    var entry = { channel: ctx.channelCode, steps: {} };
+    var stoppedAt = null;
+    for (var s = 0; s < steps.length; s++) {
+      var step = steps[s];
+      if (state.dryRun) {
+        entry.steps[step.key] = { ok: true, dryRun: true };
+        continue;
+      }
+      try {
+        var res = await adminGraphqlRequest(fetchFn, adminUrl, {
+          query: step.query,
+          variables: {}
+        }, authToken, callSecrets, ctx.token);
+        bumpRequests(state);
+        var body = res.response && res.response.body;
+        var errMsg = null;
+        if (hasTopLevelGraphqlErrors(res)) {
+          var topErrors = body.errors;
+          var first = topErrors && topErrors[0];
+          errMsg = redactValue((first && (first.message || first.errorCode)) || 'GraphQL error', callSecrets);
+        } else if (!body || !body.data) {
+          errMsg = redactValue('no data in response', callSecrets);
+        }
+        if (errMsg) {
+          entry.steps[step.key] = { ok: false, error: errMsg };
+          stoppedAt = step.key;
+          break;
+        } else {
+          entry.steps[step.key] = { ok: true };
+        }
+      } catch (e) {
+        entry.steps[step.key] = { ok: false, error: redactValue((e && e.message) || String(e), callSecrets) };
+        stoppedAt = step.key;
+        break;
+      }
+    }
+    entry.stoppedAt = stoppedAt;
+    state.readbackLadder.push(redactDeep(entry, callSecrets));
   }
 }
 
@@ -2400,6 +2539,9 @@ async function seedStaging(context, options) {
   // step records a blocked entry and continues so other tasks can still run)
   await ensureCustomers(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, customerPassword, customerPasswordSource);
 
+  // 7.5 Readback ladder (read-only diagnostics; does not change seed.ok)
+  await readbackLadder(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, channelTokenById);
+
   // 8. Read-back verification via Shop API per channel token
   await verifyReadback(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, channelTokenById);
 
@@ -2477,6 +2619,7 @@ function finalizeSeedResult(context, state, extra) {
     channels: state.channels,
     preRead: state.preRead,
     readback: state.readback,
+    readbackLadder: state.readbackLadder,
     onboardCountryAvailable: state.onboardCountryAvailable,
     introspectedTypes: state.introspectedTypes,
     languagePrerequisite: state.languagePrerequisite || null,

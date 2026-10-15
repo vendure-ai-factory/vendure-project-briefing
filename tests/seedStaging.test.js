@@ -893,6 +893,230 @@ test('seed: second run with already-seeded state creates no new entities', async
 });
 
 // ---------------------------------------------------------------------------
+// Test 18: preAssign (assignProductsToChannel) runs in the DEFAULT channel
+// context (no vendure-token) for both paths; on failure the product is recorded
+// as 'failed' with the real redacted message and no variant is created.
+// ---------------------------------------------------------------------------
+
+test('seed: preAssign runs in default channel context; failure records failed and skips variants', async function() {
+  var runId = 'run-preassign-fail-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+
+  // Wrap the base mock: intercept PreAssignProductToChannel and return a
+  // top-level GraphQL error — the default channel context must detect this via
+  // hasTopLevelGraphqlErrors(), record a 'failed' entry, and skip variant
+  // creation entirely for that product.
+  var innerFetch = makeSeedFetch({ kind: 'fresh' });
+  var callLog = [];
+  var fetchFn = function(url, init) {
+    callLog.push({ url: String(url), init: init });
+    var body = (function() { try { return JSON.parse(init && init.body || '{}'); } catch (e) { return {}; } })();
+    var q = body.query || '';
+    if (q.indexOf('PreAssignProductToChannel') !== -1) {
+      // Simulate the server rejecting the assignment with a GraphQL error
+      // (e.g. product is not visible in the channel or channel constraint failed).
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() {
+          return Promise.resolve(JSON.stringify({
+            errors: [{ message: 'cannot assign product to channel: NO_REVERSE_EDGE', errorCode: 'NO_REVERSE_EDGE' }],
+            data: { assignProductsToChannel: null, assignProductVariantsToChannel: null }
+          }));
+        }
+      });
+    }
+    return innerFetch(url, init);
+  };
+  fetchFn.getCalls = function() { return callLog; };
+
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  // preAssign failure must be recorded as 'failed' with the real redacted message.
+  var productFailures = result.failed.filter(function(f) { return f.entity === 'product'; });
+  assert.ok(productFailures.length > 0,
+    'preAssign failure must produce at least one failed product entry, got: ' + JSON.stringify(result.failed));
+  assert.ok(productFailures.some(function(f) { return f.error.indexOf('NO_REVERSE_EDGE') !== -1; }),
+    'the real redacted error must be preserved in the failed record, got: ' + JSON.stringify(result.failed));
+
+  // No variant may be recorded as created for a blocked product.
+  var createdVariants = result.created.filter(function(c) { return c.entity === 'variant'; });
+  assert.strictEqual(createdVariants.length, 0,
+    'variant creation must be skipped after preAssign failure; got: ' + createdVariants.length + ' created variants');
+
+  // Explicitly confirm createProductVariants was never called (the failure was
+  // detected before the first variant create for the relevant product).
+  var allVariantCalls = fetchFn.getCalls().filter(function(call) {
+    var q = '';
+    try { q = JSON.parse(call.init && call.init.body || '{}').query || ''; } catch (e) {}
+    return q.indexOf('createProductVariants') !== -1;
+  });
+  assert.strictEqual(allVariantCalls.length, 0,
+    'createProductVariants must never be called when preAssign fails for all products');
+
+  // If a channel token was NOT sent with the preAssign call, the request is made
+  // in the default channel context — the bug fix.  Assert the preAssign requests
+  // carry no vendure-token header.
+  var preAssignCalls = fetchFn.getCalls().filter(function(call) {
+    var q = '';
+    try { q = JSON.parse(call.init && call.init.body || '{}').query || ''; } catch (e) {}
+    return q.indexOf('PreAssignProductToChannel') !== -1;
+  });
+  assert.ok(preAssignCalls.length > 0, 'preAssign requests were issued');
+  var noTokenInPreAssign = true;
+  preAssignCalls.forEach(function(call) {
+    var headers = call.init && call.init.headers ? call.init.headers : {};
+    assert.strictEqual(headers['vendure-token'], undefined,
+      'preAssign must NOT carry a vendure-token header (default channel context), headers=' + JSON.stringify(headers));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: preAssign response classification — ErrorResult shape, no top-level errors
+// Vendure can return { __typename: 'ErrorResult', errorCode, message } in the
+// data field without any top-level errors[].  That shape must be detected,
+// the product recorded as failed, and createProductVariants must NOT be called.
+// ---------------------------------------------------------------------------
+test('seed: preAssign ErrorResult shape (errorCode, no top-level errors) records failed and skips variants', async function() {
+  var runId = 'run-preassign-errorresult-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+
+  var innerFetch = makeSeedFetch({ kind: 'fresh' });
+  var callLog = [];
+  var fetchFn = function(url, init) {
+    callLog.push({ url: String(url), init: init });
+    var body = (function() { try { return JSON.parse(init && init.body || '{}'); } catch (e) { return {}; } })();
+    var q = body.query || '';
+    if (q.indexOf('PreAssignProductToChannel') !== -1) {
+      // Return an ErrorResult object — NO top-level errors[] — to exercise the
+      // errorCode shape check specifically.
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() {
+          return Promise.resolve(JSON.stringify({
+            data: {
+              assignProductsToChannel: {
+                __typename: 'ErrorResult',
+                message: 'product does not satisfy channel constraints',
+                errorCode: 'CHANNEL_CONSTRAINT_ERROR'
+              },
+              assignProductVariantsToChannel: { id: 'placeholder-id' }
+            }
+          }));
+        }
+      });
+    }
+    return innerFetch(url, init);
+  };
+  fetchFn.getCalls = function() { return callLog; };
+
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  var productFailures = result.failed.filter(function(f) { return f.entity === 'product'; });
+  assert.ok(productFailures.length > 0,
+    'ErrorResult shape must produce a failed product entry, got: ' + JSON.stringify(result.failed));
+  assert.ok(productFailures.some(function(f) { return f.error.indexOf('CHANNEL_CONSTRAINT_ERROR') !== -1; }),
+    'the redacted errorCode must be preserved in the failed record, got: ' + JSON.stringify(result.failed));
+
+  var createdVariants = result.created.filter(function(c) { return c.entity === 'variant'; });
+  assert.strictEqual(createdVariants.length, 0,
+    'variant creation must be skipped after ErrorResult; got: ' + createdVariants.length + ' created variants');
+
+  var variantCalls = fetchFn.getCalls().filter(function(call) {
+    var q = '';
+    try { q = JSON.parse(call.init && call.init.body || '{}').query || ''; } catch (e) {}
+    return q.indexOf('createProductVariants') !== -1;
+  });
+  assert.strictEqual(variantCalls.length, 0,
+    'createProductVariants must never be called when preAssign returns ErrorResult');
+
+  // No vendure-token header on preAssign (default channel context preserved).
+  var preAssignCalls = fetchFn.getCalls().filter(function(call) {
+    var q = '';
+    try { q = JSON.parse(call.init && call.init.body || '{}').query || ''; } catch (e) {}
+    return q.indexOf('PreAssignProductToChannel') !== -1;
+  });
+  preAssignCalls.forEach(function(call) {
+    var headers = call.init && call.init.headers ? call.init.headers : {};
+    assert.strictEqual(headers['vendure-token'], undefined,
+      'preAssign must NOT carry a vendure-token header, headers=' + JSON.stringify(headers));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: preAssign response classification — null / missing data
+// If data.assignProductsToChannel is null or data itself is absent, the product
+// must be recorded as failed and createProductVariants must NOT be called.
+// ---------------------------------------------------------------------------
+test('seed: preAssign null/missing data records failed and skips variants', async function() {
+  var runId = 'run-preassign-nulldata-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+
+  var innerFetch = makeSeedFetch({ kind: 'fresh' });
+  var callLog = [];
+  var fetchFn = function(url, init) {
+    callLog.push({ url: String(url), init: init });
+    var body = (function() { try { return JSON.parse(init && init.body || '{}'); } catch (e) { return {}; } })();
+    var q = body.query || '';
+    if (q.indexOf('PreAssignProductToChannel') !== -1) {
+      // Return data.assignProductsToChannel === null; no top-level errors[].
+      // This exercises the !paData1 || !paData1.assignProductsToChannel guard.
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() {
+          return Promise.resolve(JSON.stringify({
+            data: {
+              assignProductsToChannel: null,
+              assignProductVariantsToChannel: null
+            }
+          }));
+        }
+      });
+    }
+    return innerFetch(url, init);
+  };
+  fetchFn.getCalls = function() { return callLog; };
+
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  var productFailures = result.failed.filter(function(f) { return f.entity === 'product'; });
+  assert.ok(productFailures.length > 0,
+    'null data must produce a failed product entry, got: ' + JSON.stringify(result.failed));
+
+  var createdVariants = result.created.filter(function(c) { return c.entity === 'variant'; });
+  assert.strictEqual(createdVariants.length, 0,
+    'variant creation must be skipped when preAssign returns null; got: ' + createdVariants.length + ' created variants');
+
+  var variantCalls = fetchFn.getCalls().filter(function(call) {
+    var q = '';
+    try { q = JSON.parse(call.init && call.init.body || '{}').query || ''; } catch (e) {}
+    return q.indexOf('createProductVariants') !== -1;
+  });
+  assert.strictEqual(variantCalls.length, 0,
+    'createProductVariants must never be called when preAssign data is null');
+
+  // No vendure-token header on preAssign (default channel context preserved).
+  var preAssignCalls = fetchFn.getCalls().filter(function(call) {
+    var q = '';
+    try { q = JSON.parse(call.init && call.init.body || '{}').query || ''; } catch (e) {}
+    return q.indexOf('PreAssignProductToChannel') !== -1;
+  });
+  preAssignCalls.forEach(function(call) {
+    var headers = call.init && call.init.headers ? call.init.headers : {};
+    assert.strictEqual(headers['vendure-token'], undefined,
+      'preAssign must NOT carry a vendure-token header, headers=' + JSON.stringify(headers));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Failure-diagnostic tests for ensureCountries / ensureZones creates
 // ---------------------------------------------------------------------------
 
@@ -1080,7 +1304,7 @@ test('seed: createProduct returning null data records product as failed', async 
   assert.strictEqual(productFailures[0].error.indexOf('product create denied') !== -1, true, 'GraphQL error message preserved');
 });
 
-test('seed: assignProductsToChannel HTTP 200 + GraphQL errors records blocked', async function() {
+test('seed: additional channel assignProductsToChannel HTTP 200 + GraphQL errors records blocked', async function() {
   var runId = 'run-assign-gql-' + Date.now();
   var root = path.join(__dirname, '..', 'runs', runId, 'root');
   fs.mkdirSync(root, { recursive: true });
@@ -1088,7 +1312,10 @@ test('seed: assignProductsToChannel HTTP 200 + GraphQL errors records blocked', 
   var fetchFn = function(url, init) {
     var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
     var q = body.query || '';
-    if (q.indexOf('assignProductsToChannel') !== -1) {
+    // Fail only the ADDITIONAL-channel assign (AssignToChannel can name the
+    // additional channel); the PRIMARY preAssign (PreAssignProductToChannel)
+    // must be allowed through so it succeeds in the default channel context.
+    if (q.indexOf('AssignToChannel') !== -1) {
       return Promise.resolve({
         status: 200,
         headers: { get: function() { return null; } },
@@ -1101,8 +1328,74 @@ test('seed: assignProductsToChannel HTTP 200 + GraphQL errors records blocked', 
   var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
   var result = await seed(seedStaging.seedStaging, built.context, {});
   var blocked = result.blocked.filter(function(b) { return b.entity === 'product'; });
-  assert.ok(blocked.length > 0, 'assignment failure must be recorded as blocked');
+  assert.ok(blocked.length > 0, 'assignment failure must be recorded as blocked, got: ' + JSON.stringify(result.blocked));
   assert.ok(blocked.some(function(b) { return b.error.indexOf('channel not found') !== -1; }), 'GraphQL error preserved in blocked reason');
+});
+
+// ---------------------------------------------------------------------------
+// Regression: additional-channel assignProductsToChannel — ErrorResult shape
+// Vendure can return { __typename: 'ErrorResult', errorCode, message } without
+// top-level errors[].  That shape must be detected and 'blocked' recorded.
+// ---------------------------------------------------------------------------
+test('seed: additional channel assignProductsToChannel ErrorResult shape records blocked', async function() {
+  var runId = 'run-addl-err-result-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('AssignToChannel') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() {
+          return Promise.resolve(JSON.stringify({
+            data: {
+              assignProductsToChannel: { __typename: 'ErrorResult', message: 'channel constraint not satisfied', errorCode: 'CHANNEL_CONSTRAINT_ERROR' },
+              assignProductVariantsToChannel: { id: 'placeholder' }
+            }
+          }));
+        }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  var blocked = result.blocked.filter(function(b) { return b.entity === 'product' && b.channel; });
+  assert.ok(blocked.length > 0, 'ErrorResult shape must produce blocked entry, got: ' + JSON.stringify(result.blocked));
+  assert.ok(blocked.some(function(b) { return b.error.indexOf('CHANNEL_CONSTRAINT_ERROR') !== -1; }), 'errorCode must be in blocked reason, got: ' + JSON.stringify(result.blocked));
+});
+
+// ---------------------------------------------------------------------------
+// Regression: additional-channel assignProductsToChannel — null / missing data
+// When data.assignProductsToChannel is null and hasTopLevelGraphqlErrors is false,
+// !assignData?.assignProductsToChannel must guard the access without throwing.
+// ---------------------------------------------------------------------------
+test('seed: additional channel assignProductsToChannel null data records blocked', async function() {
+  var runId = 'run-addl-null-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('AssignToChannel') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ data: { assignProductsToChannel: null } })); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  var blocked = result.blocked.filter(function(b) { return b.entity === 'product' && b.channel; });
+  assert.ok(blocked.length > 0, 'null data must produce blocked entry, got: ' + JSON.stringify(result.blocked));
 });
 
 test('seed: updateProductVariants HTTP 200 + GraphQL errors records blocked', async function() {
@@ -1939,5 +2232,188 @@ test('seed: index.json meta populated with execution revision, reference commit 
   var entry = index.tasks.seed[0];
   assert.strictEqual(entry.kind, 'seed');
   assert.strictEqual(entry.path, 'seed/seed-record.json');
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests for confirmed run-mv9a72gw-h8xrsw staging failures
+// Failure B regression: createProductVariants must be called WITH primaryToken
+// (vendure-token header set to the product's primary channel token). Without this,
+// Vendure executes the mutation in the default channel context where the product
+// does not exist and returns "No Product with the id N could be found" — the exact
+// failure seen in run-mv9a72gw.
+test('seed: createProductVariants carries vendure-token header matching its primary channel', async function() {
+  var runId = 'run-cpvtok2-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var spec = loadSpec();
+
+  // Single fetch that drives the existing-product / missing-variant path:
+  // - product-by-slug query: returns product as existing (channels included so
+  //   primaryToken can be derived correctly)
+  // - variant-by-filter query: returns empty so seeder creates the missing variant
+  // - all other requests: captured in allCalls and delegated to seeded mock
+  var baseFetch = makeSeedFetch({ kind: 'fresh' });
+  var allCalls = [];
+  var testFetch = function(url, init) {
+    var u = String(url);
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('products') !== -1 && q.indexOf('filter') !== -1 && q.indexOf('slug') !== -1) {
+      var slugMatch = body.variables && body.variables.slug;
+      var found = spec.products.filter(function(p) { return p.slug === slugMatch; });
+      if (found.length > 0) {
+        allCalls.push({ url: u, init: init });
+        return Promise.resolve({
+          status: 200, headers: { get: function() { return null; } },
+          text: function() {
+            return Promise.resolve(JSON.stringify({
+              data: { products: { items: [{ id: 'prod-' + found[0].slug, slug: found[0].slug, channels: found[0].channels }], totalItems: 1 } }
+            }));
+          }
+        });
+      }
+    }
+    if (q.indexOf('productVariants') !== -1 && q.indexOf('filter') !== -1) {
+      allCalls.push({ url: u, init: init });
+      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify({ data: { productVariants: { items: [], totalItems: 0 } } })); } });
+    }
+    allCalls.push({ url: u, init: init });
+    return baseFetch(url, init);
+  };
+  testFetch.getCalls = function() { return allCalls; };
+
+  var built = makeContext({ runId: runId, fetch: testFetch, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  assert.strictEqual(result.ok, true, 'seed must succeed in partial state');
+
+  // Primary channel -> expected vendure-token
+  // tst-all/tst-de-only/tst-de-at: primary = 'de' -> tok-de-real-9f
+  // tst-hu-only: primary = 'hu' -> tok-hu-real-7d
+  var TOKEN_MAP = {
+    'tst-all':     TEST_CHANNEL_TOKENS.DE,
+    'tst-de-only': TEST_CHANNEL_TOKENS.DE,
+    'tst-de-at':   TEST_CHANNEL_TOKENS.DE,
+    'tst-hu-only': TEST_CHANNEL_TOKENS.HU
+  };
+
+  // Verify: exactly 4 createProductVariants calls, each with correct vendure-token
+  var createVarCalls = allCalls.filter(function(c) {
+    if (c.url.indexOf('/admin-api') === -1) return false;
+    var bodyStr = c.init && c.init.body ? c.init.body : '';
+    var parsed = null;
+    try { parsed = JSON.parse(bodyStr); } catch (e) { parsed = {}; }
+    return (parsed.query || '').indexOf('createProductVariants') !== -1;
+  });
+
+  assert.strictEqual(createVarCalls.length, 4,
+    'exactly 4 createProductVariants calls expected (one per variant), got: ' + createVarCalls.length);
+
+  createVarCalls.forEach(function(cvc, idx) {
+    var headers = cvc.init && cvc.init.headers ? cvc.init.headers : {};
+    var tok = headers['vendure-token'] || headers['Vendure-Token'] || '';
+    assert.strictEqual(Boolean(tok), true,
+      'createProductVariants call ' + (idx + 1) + ' must carry vendure-token header');
+
+    // Derive expected token from productId -> slug -> primary channel
+    var parsed = null;
+    try { parsed = JSON.parse(cvc.init.body); } catch (e) { parsed = {}; }
+    var input = parsed.variables && parsed.variables.input;
+    var productId = (input && input[0] && input[0].productId) || '';
+    var slug = '';
+    for (var pi = 0; pi < spec.products.length; pi++) {
+      if ('prod-' + spec.products[pi].slug === productId) { slug = spec.products[pi].slug; break; }
+    }
+    var expectedTok = TOKEN_MAP[slug] || '?';
+    assert.strictEqual(tok, expectedTok,
+      'createProductVariants call ' + (idx + 1) + ' (product=' + slug + ') vendure-token must be ' + expectedTok + ', got: ' + tok);
+  });
+});
+
+test('seed: readback GraphQL error from Shop API is captured as failed readback and forces ok:false', async function() {
+  var runId = 'run-readback-gqlerr-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'fresh' });
+  var fetchFn = function(url, init) {
+    var u = String(url);
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    // Simulate the confirmed staging Shop API error: "invalid input syntax for
+    // type integer: undefined" for every channel readback query.
+    if (u.indexOf('/shop-api') !== -1 && q.indexOf('activeChannel') !== -1 && q.indexOf('Readback') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() {
+          return Promise.resolve(JSON.stringify({
+            errors: [{ message: 'invalid input syntax for type integer: "undefined"' }],
+            data: null
+          }));
+        }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  // The GraphQL error in the Shop API response must be captured.
+  var readbackEntries = (result.readback || []).filter(function(r) { return r.error && r.error.indexOf('invalid input syntax') !== -1; });
+  assert.ok(readbackEntries.length > 0, 'Shop API GraphQL error must appear in readback entries');
+  // It must be recorded as a failed mutation.
+  var readbackFailed = result.failed.filter(function(f) { return f.entity === 'readback'; });
+  assert.ok(readbackFailed.length > 0, 'readback GraphQL error must appear in result.failed');
+  // The seed must not yield ok:true when readback has GraphQL errors.
+  assert.strictEqual(result.ok, false, 'seed with Shop API GraphQL readback errors must be ok:false');
+});
+
+// ---------------------------------------------------------------------------
+// Test: readbackLadder records each channel and stops at the first failing step
+// ---------------------------------------------------------------------------
+
+test('seed: readbackLadder stops at the first failing step and does not change seed.ok', async function() {
+  var runId = 'run-ladder-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  // Seeded mock gives full channel/product/variant data.  Override the price
+  // step (query selecting variants with price) so it fails only when run in a
+  // channel context (has a vendure-token), and only for the FIRST such call.
+  var inner = makeSeedFetch({ kind: 'seeded' });
+  var failedPriceOnce = false;
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    var hasToken = !!(init && init.headers && init.headers['vendure-token']);
+    if (hasToken && q.indexOf('variants') !== -1 && q.indexOf('price') !== -1) {
+      if (!failedPriceOnce) {
+        failedPriceOnce = true;
+        return Promise.resolve({
+          status: 200,
+          headers: { get: function() { return null; } },
+          text: function() { return Promise.resolve(JSON.stringify({ errors: [{ message: 'integer price parse failed: undefined' }], data: null })); }
+        });
+      }
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  assert.ok(result.readbackLadder, 'readbackLadder must be present on the result');
+  var deEntry = result.readbackLadder.filter(function(l) { return l.channel === 'de'; })[0];
+  assert.ok(deEntry, 'DE channel ladder entry must exist');
+  // Steps a-d ok:true; step e ok:false and stoppedAt='e'.
+  assert.strictEqual(deEntry.steps.a.ok, true, 'step a must be ok');
+  assert.strictEqual(deEntry.steps.b.ok, true, 'step b must be ok');
+  assert.strictEqual(deEntry.steps.c.ok, true, 'step c must be ok');
+  assert.strictEqual(deEntry.steps.d.ok, true, 'step d must be ok');
+  assert.strictEqual(deEntry.steps.e.ok, false, 'step e must fail');
+  assert.strictEqual(deEntry.stoppedAt, 'e', 'ladder must stop at step e');
+  // Default channel ladder entry present.
+  var defaultEntry = result.readbackLadder.filter(function(l) { return l.channel === '__default__'; })[0];
+  assert.ok(defaultEntry, 'default channel ladder entry must exist');
 });
 
