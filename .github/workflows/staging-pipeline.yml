@@ -142,6 +142,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           STAGING_ADMIN_EMAIL: ${{ secrets.STAGING_ADMIN_EMAIL }}
           STAGING_ADMIN_PASSWORD: ${{ secrets.STAGING_ADMIN_PASSWORD }}
+          SEED_TEST_CUSTOMER_PASSWORD: ${{ secrets.SEED_TEST_CUSTOMER_PASSWORD }}
           CHANNEL_TOKENS: ${{ secrets.CHANNEL_TOKENS }}
         run: |
           set -euo pipefail
