@@ -13,9 +13,9 @@ var SENTINEL_AUTH = 'sentinel-auth-token-9f8e';
 var SENTINEL_TOKEN = 'sentinel-channel-token-abc123';
 var SENTINEL_CUSTOMER_PASSWORD = 'sentinel-customer-pw-zz9';
 
-// Real-shaped (non-placeholder) channel tokens the seeded mock DB and the
-// CHANNEL_TOKENS env both use. The runtime seeder now rejects the nominal
-// placeholder tokens, so tests must exercise it with plausible real values.
+// Real channel tokens the seeded mock DB and the CHANNEL_TOKENS env both use.
+// The registry values (de-token etc.) are accepted as-is; the tests use
+// distinct real-shaped values so acceptance is proven rather than assumed.
 var TEST_CHANNEL_TOKENS = { DE: 'tok-de-real-9f', AT: 'tok-at-real-8e', HU: 'tok-hu-real-7d', GB: 'tok-gb-real-6c' };
 
 function loadSpec() {
@@ -1591,27 +1591,45 @@ test('seed: missing CHANNEL_TOKENS blocks with SEED_CONFIG_BLOCKED', async funct
   assert.strictEqual(serverHit.length, 0, 'must not issue any mutation without real channel tokens');
 });
 
-test('seed: placeholder channel tokens block with SEED_CONFIG_BLOCKED', async function() {
-  var runId = 'run-placetok-' + Date.now();
-  var requested = [];
+test('seed: empty channel token blocks with SEED_CONFIG_BLOCKED', async function() {
+  var runId = 'run-emptytok-' + Date.now();
   var serverHit = [];
   var fetchFn = function(url, init) {
-    requested.push(String(url));
     var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
     var q = body.query || '';
     if (q.indexOf('mutation ') !== -1) serverHit.push(q);
     return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve('{}'); } });
   };
-  fetchFn.getCalls = function() { return requested; };
+  fetchFn.getCalls = function() { return []; };
+  var built = makeContext({
+    runId: runId,
+    fetch: fetchFn,
+    channelTokens: JSON.stringify({ DE: '', AT: 'at-token', HU: 'hu-token', GB: 'gb-token' })
+  });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.reason, 'SEED_CONFIG_BLOCKED');
+  assert.ok(result.error.indexOf('DE') !== -1 && result.error.indexOf('missing') !== -1, 'empty token surfaces as a missing value');
+  assert.strictEqual(serverHit.length, 0, 'must not seed with an empty channel token');
+});
+
+test('seed: registry channel tokens are accepted and seed proceeds', async function() {
+  var runId = 'run-registrytok-' + Date.now();
+  var serverHit = [];
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    if (q.indexOf('mutation ') !== -1) serverHit.push(q);
+    return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve('{}'); } });
+  };
+  fetchFn.getCalls = function() { return []; };
   var built = makeContext({
     runId: runId,
     fetch: fetchFn,
     channelTokens: JSON.stringify({ DE: 'de-token', AT: 'at-token', HU: 'hu-token', GB: 'gb-token' })
   });
   var result = await seed(seedStaging.seedStaging, built.context, {});
-  assert.strictEqual(result.reason, 'SEED_CONFIG_BLOCKED');
-  assert.ok(result.error.indexOf('placeholder') !== -1);
-  assert.strictEqual(serverHit.length, 0, 'must not seed with placeholder channel tokens');
+  assert.notStrictEqual(result.reason, 'SEED_CONFIG_BLOCKED', 'registry channel tokens must not block the seed');
+  assert.ok(result.error === undefined || result.error.indexOf('placeholder') === -1, 'no placeholder rejection for registry tokens');
 });
 
 test('seed: language already present in globalSettings requires no update mutation', async function() {

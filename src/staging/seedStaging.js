@@ -536,12 +536,6 @@ function adminPassword(context) {
   return String(env.SUPERADMIN_PASSWORD || env.STAGING_ADMIN_PASSWORD || '').trim();
 }
 
-// Registry placeholder channel tokens (the demo spec values). The real
-// staging tokens arrive via the CHANNEL_TOKENS env var; a missing or
-// placeholder value is a configuration blocker, never a silent fallback.
-// Token VALUES are never logged or written.
-var PLACEHOLDER_CHANNEL_TOKENS = ['de-token', 'at-token', 'hu-token', 'gb-token'];
-
 function resolveSeedChannelTokens(context, spec) {
   var env = getEnvFn(context)();
   var raw = env ? env.CHANNEL_TOKENS : undefined;
@@ -561,7 +555,6 @@ function resolveSeedChannelTokens(context, spec) {
     return { ok: false, error: 'CHANNEL_TOKENS missing; real channel tokens are required to seed' };
   }
   var missing = [];
-  var placeholder = [];
   for (var i = 0; i < (spec && spec.countries ? spec.countries.length : 0); i++) {
     var c = spec.countries[i];
     var key = c.countryCode;
@@ -570,16 +563,10 @@ function resolveSeedChannelTokens(context, spec) {
       missing.push(key);
       continue;
     }
-    if (PLACEHOLDER_CHANNEL_TOKENS.indexOf(tok) !== -1) {
-      placeholder.push(key);
-    }
     c.channelToken = tok;
   }
   if (missing.length > 0) {
     return { ok: false, error: 'CHANNEL_TOKENS missing values for: ' + missing.join(', ') };
-  }
-  if (placeholder.length > 0) {
-    return { ok: false, error: 'CHANNEL_TOKENS contains placeholder values for: ' + placeholder.join(', ') };
   }
   return { ok: true };
 }

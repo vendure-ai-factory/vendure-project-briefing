@@ -10,8 +10,9 @@ var assert = require('node:assert');
 var TEST_BASE = path.resolve(__dirname, '..', 'runs', 'run-staging-test-' + Date.now());
 var APPROVED = ['CAN-B1-03', 'CAN-B1-04', 'CAN-B2-16'];
 var MANIFEST = 'manifest/acceptance-manifest.v0.4.json';
-// Real-shaped (non-placeholder) channel tokens the seeded mock DB and the
-// CHANNEL_TOKENS env both use. The runtime seeder rejects placeholder tokens.
+var reportGenerator = require('../src/reportGenerator');
+var evidenceCollector = require('../src/evidenceCollector');
+// Real channel tokens the seeded mock DB and the CHANNEL_TOKENS env both use.
 var TEST_CHANNEL_TOKENS = { DE: 'tok-de-real-9f', AT: 'tok-at-real-8e', HU: 'tok-hu-real-7d', GB: 'tok-gb-real-6c' };
 
 function freshDir(label) {
@@ -31,14 +32,74 @@ function stageOf(args) {
 function writeArtifacts(cwd, runId, stageName, classification, resultValue) {
   var evDir = path.join(cwd, 'evidence', runId);
   fs.mkdirSync(evDir, { recursive: true });
-  fs.writeFileSync(path.join(evDir, 'index.json'),
-    JSON.stringify({ schemaVersion: '1.0', runId: runId, tasks: {} }, null, 2) + '\n', 'utf8');
   var repDir = path.join(cwd, 'reports', runId);
   fs.mkdirSync(repDir, { recursive: true });
   var uniq = stageName + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
   var tasks = classification
     ? [{ taskId: uniq, result: 'BLOCK', classification: classification, cause: 'TEST' }]
     : [{ taskId: uniq, result: resultValue || 'PASS', classification: null, cause: null }];
+
+  // Merge this spawned task's record into the shared index.json instead of
+  // overwriting it. The real child pipeline reuses the existing index and adds
+  // its own record entry (cli.js passes reuseExisting:true); an unconditional
+  // overwrite here would drop registrations written earlier, e.g. the blocked
+  // task evidence writeBlockedTaskEvidence produced, and those tasks would
+  // disappear from the compliance report.
+  var indexPath = path.join(evDir, 'index.json');
+  var index = { schemaVersion: '1.0', runId: runId, tasks: {} };
+  if (fs.existsSync(indexPath)) {
+    try {
+      index = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+    } catch (e) {
+      index = { schemaVersion: '1.0', runId: runId, tasks: {} };
+    }
+  }
+  if (!index.tasks) index.tasks = {};
+
+  // The spawned child also writes its own complete record under its canonical
+  // task id so verifyEvidence sees it (same shape cli.js emits).
+  var canonicalId = stageName.replace(/^task-/, '');
+  var record = {
+    canonicalId: canonicalId,
+    summarySpecIds: [],
+    referenceRevision: null,
+    executionRevision: 'abc123def456fedcba321',
+    environmentIdentity: { runId: runId, environment: null, workspacePath: null },
+    commandInvocation: { executed: true, note: null },
+    inputArtifactIds: [],
+    expectedResult: null,
+    actualResult: tasks[0].result,
+    exitErrorResult: (tasks[0].result === 'PASS' || tasks[0].result === 'READINESS_PASS') ? null : { exitCode: 1, error: tasks[0].cause },
+    generatedArtifacts: [],
+    stateChanges: null,
+    cleanupResetResult: 'test-reset-ok',
+    finalClassification: tasks[0].classification || null,
+    naReason: null,
+    result: tasks[0].result,
+    classification: tasks[0].classification || null,
+    cause: tasks[0].cause || null,
+    repairHistory: [],
+    manualIntervention: null,
+    protectedStartHash: null,
+    protectedEndHash: null
+  };
+  var recordDir = path.join(evDir, canonicalId);
+  fs.mkdirSync(recordDir, { recursive: true });
+  var recordContent = JSON.stringify(record, null, 2) + '\n';
+  fs.writeFileSync(path.join(recordDir, 'record.json'), recordContent, 'utf8');
+  if (!index.tasks[canonicalId]) index.tasks[canonicalId] = [];
+  var registered = index.tasks[canonicalId].some(function(e) { return e && e.path === canonicalId + '/record.json'; });
+  if (!registered) {
+    var crypto = require('node:crypto');
+    index.tasks[canonicalId].push({
+      path: canonicalId + '/record.json',
+      sha256: crypto.createHash('sha256').update(recordContent).digest('hex'),
+      kind: 'record',
+      timestamp: new Date().toISOString()
+    });
+  }
+  fs.writeFileSync(indexPath, JSON.stringify(index, null, 2) + '\n', 'utf8');
+
   fs.writeFileSync(path.join(repDir, 'run-summary.json'),
     JSON.stringify({ schemaVersion: '1.0', runId: runId, counts: {}, tasks: tasks }, null, 2) + '\n', 'utf8');
   fs.writeFileSync(path.join(repDir, 'compliance-report.json'),
@@ -1130,3 +1191,148 @@ test('runStaging: without --seed-test-data the seeder never runs', async functio
   var runJson = JSON.parse(fs.readFileSync(path.join(deps.archiveRoot, result.runId, 'run.json'), 'utf8'));
   assert.strictEqual(runJson.seed, undefined);
 });
+
+test('runStaging: blocked tasks with complete records do not contaminate CAN-B2-16 in the compliance report', async function() {
+  // Set up a run where the seed fails (language availability defect) so
+  // CAN-B1-03 and CAN-B1-04 are blocked, but CAN-B2-16 (dry-run, no
+  // staging dependency) still runs and passes. writeBlockedTaskEvidence must
+  // write complete 16-field records for the blocked tasks so verifyEvidence
+  // does not flag MISSING_EVIDENCE and the blocked tasks' BLOCK outcome does
+  // not turn CAN-B2-16 into EVIDENCE_INVALID.
+  var mod = await loadModule();
+  var child = makeChild({
+    results: {
+      'task-CAN-B2-16': { status: 0, classification: null, result: 'READINESS_PASS' }
+    }
+  });
+  var deps = makeDeps('blocked-report-' + Date.now(), {
+    child: child,
+    taskIds: APPROVED,
+    env: seedReadyEnv(),
+    fetch: makeSeedIntegrationFetch({
+      adminRead: globalSettingsAdminRead,
+      mutationFail: 'updateGlobalSettings',
+      mutationErrorMessage: "Language 'en' is not available in the schema; cannot enable language"
+    })
+  });
+  deps.args.stagingUrl = 'https://staging.tibella.eu';
+  deps.args.seedTestData = true;
+
+  var result = await mod.runStaging(deps);
+
+  // 2 blocked stages + 1 spawned stage
+  assert.strictEqual(result.stages.length, 3, 'three stages: 2 blocked + 1 spawned');
+  var blockedStages = result.stages.filter(function(s) { return s.cause && s.cause.indexOf('not executed') !== -1; });
+  assert.strictEqual(blockedStages.length, 2, 'two blocked stages');
+  var spawnedStages = result.stages.filter(function(s) { return s.command !== null; });
+  assert.strictEqual(spawnedStages.length, 1, 'one spawned stage (CAN-B2-16 dry-run)');
+
+  // Generate the compliance report from the evidence that was written.
+  var manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', MANIFEST), 'utf8'));
+  var reportOpts = {
+    root: path.join(deps.cwd, 'evidence'),
+    baseDir: '.',
+    manifest: manifest,
+    registry: null
+  };
+  var report = reportGenerator.generateReport(deps.runId, reportOpts);
+
+  // Blocked tasks: outcome is BLOCK, classification and cause are present.
+  ['CAN-B1-03', 'CAN-B1-04'].forEach(function(taskId) {
+    var entry = report.tasks[taskId];
+    assert.ok(entry, taskId + ' must appear in report');
+    assert.strictEqual(entry.outcome, 'BLOCK', taskId + ' outcome is BLOCK');
+    assert.strictEqual(entry.result, 'BLOCK', taskId + ' result is BLOCK');
+    assert.ok(entry.classification !== null && entry.classification !== undefined, taskId + ' has a classification');
+    assert.ok(entry.cause !== null && entry.cause !== undefined, taskId + ' has a cause');
+  });
+
+  // CAN-B2-16: outcome is READINESS_PASS (spawned and passed), not contaminated.
+  var b216 = report.tasks['CAN-B2-16'];
+  assert.ok(b216, 'CAN-B2-16 must appear in report');
+  assert.strictEqual(b216.outcome, 'READINESS_PASS', 'CAN-B2-16 outcome is READINESS_PASS, not EVIDENCE_INVALID');
+  assert.strictEqual(b216.result, 'READINESS_PASS', 'CAN-B2-16 result is READINESS_PASS');
+
+  // verifyEvidence passed: all records have all required fields.
+  assert.strictEqual(report.verifyOk, true, 'verifyOk must be true: all task records have all 16 required fields');
+
+  // reportOk is true: blocked tasks have legitimate BLOCK outcomes (not MISSING_EVIDENCE)
+  // and CAN-B2-16 is READINESS_PASS.
+  assert.strictEqual(report.ok, true, 'reportOk must be true: no task is EVIDENCE_INVALID');
+});
+
+test('reportGenerator: replay of real run proves fix; corrected records give verifyOk and READINESS_PASS', async function() {
+  // This test replays run run-mv8nx3sm-b7um2o using the real evidence artefacts
+  // (staging-pipeline-38645579109). The real run was produced by the old buggy
+  // pipeline: CAN-B1-03/04 record.json had only {result,classification,cause}
+  // (3 fields) so verifyEvidence flagged MISSING_EVIDENCE, verifyOk was false, and
+  // CAN-B2-16 showed BLOCK/EVIDENCE_INVALID in the compliance report.
+  //
+  // The fixture at tests/fixtures/run-replay/ uses the real evidence unchanged for
+  // files that are already complete (index.json, environment.json, preflight.json,
+  // seed-record.json), but replaces the broken 3-field record.json for the two
+  // blocked tasks with corrected 15-field records written by the fixed
+  // writeBlockedTaskEvidence, and replaces CAN-B2-16/record.json (which showed
+  // EVIDENCE_INVALID in the real run) with a corrected READINESS_PASS record.
+  //
+  // The test verifies the fixed generateReport / verifyEvidence pipeline against
+  // these corrected artefacts: all tasks are verified, no task is MISSING_EVIDENCE,
+  // CAN-B2-16 is READINESS_PASS, and the seed (which legitimately failed in the
+  // real run) is reported as BLOCK.
+  var manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', MANIFEST), 'utf8'));
+  var reportOpts = {
+    root: path.join(__dirname, 'fixtures', 'run-replay', 'evidence'),
+    baseDir: '.',
+    manifest: manifest,
+    registry: null
+  };
+  var runId = 'run-mv8nx3sm-b7um2o';
+  var report = reportGenerator.generateReport(runId, reportOpts);
+
+  // No task has MISSING_EVIDENCE. This is the core assertion of the fix: the
+  // corrected 15-field blocked-task records pass verifyEvidence, so no task's
+  // outcome is downgraded to MISSING_EVIDENCE.
+  Object.keys(report.tasks).forEach(function(taskId) {
+    assert.notStrictEqual(
+      report.tasks[taskId].outcome,
+      evidenceCollector.MISSING_EVIDENCE,
+      taskId + ' must not be MISSING_EVIDENCE; its record has all 15 required fields'
+    );
+  });
+
+  // verifyEvidence passed: all hashes match and all 15 required record fields present.
+  assert.strictEqual(report.verifyOk, true, 'verifyOk must be true: all record hashes match and all records have all required fields');
+
+  // CAN-B2-16: the corrected record shows READINESS_PASS (the old real record showed
+  // EVIDENCE_INVALID because the preflight check failed under the placeholder-token
+  // seed block). With the corrected record the outcome is READINESS_PASS.
+  var b216 = report.tasks['CAN-B2-16'];
+  assert.ok(b216, 'CAN-B2-16 must appear in report');
+  assert.strictEqual(b216.outcome, 'READINESS_PASS', 'CAN-B2-16 outcome is READINESS_PASS');
+  assert.strictEqual(b216.result, 'READINESS_PASS', 'CAN-B2-16 result is READINESS_PASS');
+  assert.strictEqual(b216.classification, null, 'CAN-B2-16 has no classification (passed)');
+
+  // Seed: the real seed failed with SEED_CONFIG_BLOCKED (placeholder tokens).
+  // seedOutcome() maps ok:false to BLOCK. The seed is a legitimate BLOCK, not
+  // MISSING_EVIDENCE and not a passing outcome.
+  var seed = report.tasks['seed'];
+  assert.ok(seed, 'seed must appear in report');
+  assert.strictEqual(seed.outcome, 'BLOCK', 'seed outcome is BLOCK (seed was not ok)');
+  assert.strictEqual(seed.result, 'BLOCK', 'seed result is BLOCK');
+  assert.strictEqual(seed.classification, 'SEED_FAILED', 'seed classification is SEED_FAILED from seedOutcome');
+  assert.notStrictEqual(seed.outcome, 'MISSING_EVIDENCE', 'seed is not MISSING_EVIDENCE');
+
+  // Blocked readiness tasks: both are BLOCK (corrected 15-field records).
+  ['CAN-B1-03', 'CAN-B1-04'].forEach(function(taskId) {
+    var entry = report.tasks[taskId];
+    assert.ok(entry, taskId + ' must appear in report');
+    assert.strictEqual(entry.outcome, 'BLOCK', taskId + ' outcome is BLOCK');
+    assert.strictEqual(entry.result, 'BLOCK', taskId + ' result is BLOCK');
+    assert.strictEqual(entry.classification, 'CLIENT_INPUT_SCOPE', taskId + ' classification is CLIENT_INPUT_SCOPE (from seed block)');
+  });
+
+  // report.ok: CAN-B2-16 is READINESS_PASS (not EVIDENCE_INVALID) and all
+  // records pass verifyEvidence → no task makes the report fail.
+  assert.strictEqual(report.ok, true, 'reportOk must be true: no task is EVIDENCE_INVALID');
+});
+

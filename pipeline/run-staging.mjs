@@ -1,7 +1,7 @@
 'use strict';
 
 import { createRequire } from 'node:module';
-import path from 'node:path';
+import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const require = createRequire(import.meta.url);
@@ -41,6 +41,24 @@ const AUTHORIZED_TASK_IDS = ['CAN-B1-03', 'CAN-B1-04', 'CAN-B2-16'];
 // CAN-B2-16 is the shipping dry-run readiness task; the manifest documents
 // its exact invocation as `--task CAN-B2-16 --scope shipping-dryrun`.
 const DRY_RUN_TASK = { taskId: 'CAN-B2-16', scope: 'shipping-dryrun' };
+
+// evidenceCollector is CommonJS; require it once for REQUIRED_TASK_FIELDS.
+const evidenceCollector = require('../src/evidenceCollector.js');
+const REQUIRED_TASK_FIELDS = evidenceCollector.REQUIRED_TASK_FIELDS;
+
+// Manifest loaded once per process lifetime. source.referenceCommit is the
+// pipeline's pinned reference commit (the "reference revision").
+let _manifest = null;
+function getManifest() {
+  if (_manifest === null) {
+    try {
+      _manifest = JSON.parse(require('fs').readFileSync(path.join(__dirname, '..', MANIFEST_PATH), 'utf8'));
+    } catch (e) {
+      _manifest = { tasks: {}, source: {} };
+    }
+  }
+  return _manifest;
+}
 
 /**
  * Build the ordered execution stages from an approved task selection. Each
@@ -884,19 +902,60 @@ function applySeedClassification(seed) {
 /**
  * Write a stub record.json for a blocked task and patch index.json so the
  * compliance report shows result:BLOCK with the correct classification and
- * cause, instead of MISSING_EVIDENCE.
+ * cause, instead of MISSING_EVIDENCE. The record carries all 16 required
+ * fields from REQUIRED_TASK_FIELDS so verifyEvidence does not fail and the
+ * blocked task's legitimate BLOCK outcome does not become EVIDENCE_INVALID
+ * for a different task.
  */
-function writeBlockedTaskEvidence(cfg, blocked) {
+function writeBlockedTaskEvidence(cfg, blocked, executionRevision) {
   var taskInfo = blocked && blocked.summary && blocked.summary.tasks && blocked.summary.tasks[0];
   if (!taskInfo || !taskInfo.taskId) return;
   var taskId = taskInfo.taskId;
   var root = path.join(cfg.cwd, 'evidence', cfg.runId);
   var taskDir = path.join(root, taskId);
-  var record = {
-    result: taskInfo.result || 'BLOCK',
-    classification: taskInfo.classification || null,
-    cause: taskInfo.cause || null
+
+  // Look up task from the manifest to get canonicalId, summarySpecIds,
+  // expectedResult, requiredInputs for the canonical record.
+  var manifest = getManifest();
+  var manifestTask = null;
+  if (manifest && Array.isArray(manifest.tasks)) {
+    manifestTask = manifest.tasks.find(function(t) { return t.canonicalId === taskId; });
+  }
+
+  var referenceRevision = (manifest && manifest.source && manifest.source.referenceCommit) || null;
+  var envId = {
+    runId: cfg.runId,
+    environment: cfg.environment || null,
+    workspacePath: null
   };
+
+  var record = {
+    // Canonical identity (16 required fields, verified by hasRequiredRecordFields).
+    canonicalId: taskId,
+    summarySpecIds: manifestTask ? (manifestTask.summaryIds || []) : [],
+    referenceRevision: referenceRevision,
+    executionRevision: executionRevision || null,
+    environmentIdentity: envId,
+    commandInvocation: { executed: false, note: 'not executed: ' + (taskInfo.cause || blocked.cause || 'seed failed') },
+    inputArtifactIds: manifestTask ? (manifestTask.requiredInputs || []) : [],
+    expectedResult: manifestTask ? manifestTask.expectedResult : null,
+    actualResult: null,
+    exitErrorResult: { exitCode: blocked.exitCode != null ? blocked.exitCode : 1, error: blocked.cause || null },
+    generatedArtifacts: [],
+    stateChanges: null,
+    cleanupResetResult: 'not-applicable',
+    finalClassification: 'BLOCK',
+    naReason: null,
+    // Report extras.
+    result: taskInfo.result || 'BLOCK',
+    classification: taskInfo.classification || blocked.classification || null,
+    cause: taskInfo.cause || blocked.cause || null,
+    repairHistory: [],
+    manualIntervention: null,
+    protectedStartHash: null,
+    protectedEndHash: null
+  };
+
   try {
     cfg.fs.mkdirSync(taskDir, { recursive: true });
     cfg.fs.writeFileSync(path.join(taskDir, 'record.json'), JSON.stringify(record, null, 2) + '\n', 'utf8');
@@ -1302,7 +1361,15 @@ async function runStaging(deps) {
 
 
   let stages = [];
+  let executionRevision;
   if (cfg.mode === MODE_FULL && preflightOk) {
+    // Initialize the evidence directory and index.json before any task stage
+    // runs or gets blocked. The blocked-task evidence writer reads this index;
+    // a missing index causes it to silently skip and the blocked task would show
+    // MISSING_EVIDENCE in the report.
+    try {
+      evidenceCollector.initEvidenceIndex(cfg.runId, {}, { root: cfg.cwd, baseDir: 'evidence', reuseExisting: true });
+    } catch (e) {}
     const planned = buildStagesForTaskIds(cfg.taskIds);
     // only the dry-run task may still run; the two dependent readiness tasks are
     // surfaced as BLOCK stages. CAN-B2-16 (dry run, no staging dependency) may
@@ -1333,7 +1400,12 @@ async function runStaging(deps) {
       } else {
         var blocked = buildBlockedStageForSeed(p, seed);
         stages.push(blocked);
-        writeBlockedTaskEvidence(cfg, blocked);
+        // Cache git head once before the blocked-task evidence loop.
+        if (executionRevision === undefined) {
+          var gh = checkGitHead(cfg);
+          executionRevision = gh.ok ? gh.value : null;
+        }
+        writeBlockedTaskEvidence(cfg, blocked, executionRevision);
       }
     }
   }

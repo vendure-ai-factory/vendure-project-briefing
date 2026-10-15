@@ -235,8 +235,10 @@ function generateReport(runId, options) {
       }
     }
 
-    // A task is MISSING_EVIDENCE (never a passing outcome) when its record has
-    // no result field, or when evidence verification fails.
+    // A task is MISSING_EVIDENCE (never a passing outcome) only when its
+    // evidence is absent OR its record has no result field. A blocked task
+    // that wrote a full record carries result:BLOCK, a real outcome; that
+    // outcome must not be mistaken for MISSING_EVIDENCE.
     var taskOk = vTask.ok && resultValue !== null;
     var outcome;
     if (!taskOk) {
