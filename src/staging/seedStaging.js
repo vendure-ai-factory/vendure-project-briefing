@@ -1247,6 +1247,7 @@ async function ensureChannels(context, state, fetchFn, adminUrl, authToken, secr
     var createChannel = [
       'mutation CreateChannel($input: CreateChannelInput!) {',
       '  createChannel(input: $input) {',
+      '    __typename',
       '    ... on Channel { id code token defaultCurrencyCode }',
       '    ... on ErrorResult { errorCode message }',
       '  }',
@@ -1293,8 +1294,11 @@ async function ensureChannels(context, state, fetchFn, adminUrl, authToken, secr
         defaultShippingZone: data.defaultShippingZone ? { name: data.defaultShippingZone.name } : null
       });
     } else {
-      var cmsg = (data && (data.message || data.errorCode)) || 'createChannel failed';
-      recordMutation(state, 'failed', 'channel', { code: code, error: cmsg, languageCode: chanInput.defaultLanguageCode });
+      var topErrors = resChan.response && resChan.response.body && Array.isArray(resChan.response.body.errors) ? resChan.response.body.errors : [];
+      var cmsg = (topErrors.length > 0 && topErrors[0] && (topErrors[0].message || topErrors[0].errorCode))
+        ? (topErrors[0].message || topErrors[0].errorCode)
+        : ((data && (data.message || data.errorCode)) || 'createChannel failed');
+      recordMutation(state, 'failed', 'channel', { code: code, error: redactValue(cmsg, secrets), languageCode: chanInput.defaultLanguageCode });
     }
   }
   return channelIds;
@@ -1531,6 +1535,31 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
           break;
         }
       }
+      // Assign product to primary channel BEFORE creating variants.
+      // Products 1-4 exist in the default channel; without this, createProductVariants
+      // fails with "No Product with the id N could be found" when called with a country
+      // channel token (vendure-token header) because the product is not visible in that
+      // channel context.  assignProductsToChannel uses AssignProductsToChannelInput
+      // { productIds: [id]!, channelId: id! } — confirmed via introspection.
+      if (!state.dryRun && state.channelIdsByCode && state.channelIdsByCode[primaryCode]) {
+        var preAssignQuery = [
+          'mutation PreAssignProductToChannel($input: AssignProductsToChannelInput!) {',
+          '  assignProductsToChannel(input: $input) { __typename id }',
+          '  assignProductVariantsToChannel(input: { productVariantIds: $variantIds, channelId: $channelId }) { __typename id }',
+          '}'
+        ].join('\n');
+        var preAssignRes = await adminGraphqlRequest(fetchFn, adminUrl, {
+          query: preAssignQuery,
+          variables: {
+            input: { productIds: [productId], channelId: state.channelIdsByCode[primaryCode] },
+            variantIds: [],
+            channelId: state.channelIdsByCode[primaryCode]
+          }
+        }, authToken, secrets, primaryToken);
+        bumpRequests(state);
+        // Non-blocking: if the server denies channel visibility the variant creation
+        // itself will fail with a clear error; do not spam state.blocked here.
+      }
       for (var v = 0; v < product.variants.length; v++) {
         var variant = product.variants[v];
         var sku = variant.sku;
@@ -1743,6 +1772,25 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
       }
     }
 
+    // Assign product to primary channel BEFORE creating variants.
+    if (!state.dryRun && state.channelIdsByCode && state.channelIdsByCode[primaryCode]) {
+      var preAssignQuery2 = [
+        'mutation PreAssignProductToChannel($input: AssignProductsToChannelInput!) {',
+        '  assignProductsToChannel(input: $input) { __typename id }',
+        '  assignProductVariantsToChannel(input: { productVariantIds: $variantIds, channelId: $channelId }) { __typename id }',
+        '}'
+      ].join('\n');
+      var preAssignRes2 = await adminGraphqlRequest(fetchFn, adminUrl, {
+        query: preAssignQuery2,
+        variables: {
+          input: { productIds: [productId], channelId: state.channelIdsByCode[primaryCode] },
+          variantIds: [],
+          channelId: state.channelIdsByCode[primaryCode]
+        }
+      }, authToken, secrets, primaryToken);
+      bumpRequests(state);
+    }
+
     for (var v = 0; v < product.variants.length; v++) {
       var variant = product.variants[v];
       var sku = variant.sku;
@@ -1942,6 +1990,7 @@ async function ensureCustomers(context, state, fetchFn, adminUrl, authToken, sec
     var mutation = [
       'mutation CreateCustomer($input: CreateCustomerInput!, $password: String) {',
       '  createCustomer(input: $input, password: $password) {',
+      '    __typename',
       '    ... on Customer { id emailAddress }',
       '    ... on ErrorResult { errorCode message }',
       '  }',
@@ -1961,11 +2010,18 @@ async function ensureCustomers(context, state, fetchFn, adminUrl, authToken, sec
     }, authToken, secrets);
     bumpRequests(state);
     var data = res.response && res.response.body && res.response.body.data && res.response.body.data.createCustomer;
+    var topCustErrors = res.response && res.response.body && Array.isArray(res.response.body.errors) ? res.response.body.errors : [];
     if (data && data.__typename === 'Customer') {
       recordMutation(state, 'created', 'customer', { email: email, id: data.id });
+    } else if (data && (data.__typename === 'EmailAddressConflictError' || data.errorCode === 'EMAIL_ADDRESS_CONFLICT_ERROR')) {
+      recordMutation(state, 'existing', 'customer', { email: email });
+    } else if (topCustErrors.length > 0 && topCustErrors[0] && String(topCustErrors[0].message || '').indexOf('EmailAddressConflictError') !== -1) {
+      recordMutation(state, 'existing', 'customer', { email: email });
     } else {
-      var msg = (data && (data.message || data.errorCode)) || 'createCustomer failed';
-      recordMutation(state, 'failed', 'customer', { email: email, error: msg });
+      var msg = (topCustErrors.length > 0 && topCustErrors[0] && (topCustErrors[0].message || topCustErrors[0].errorCode))
+        ? (topCustErrors[0].message || topCustErrors[0].errorCode)
+        : ((data && (data.message || data.errorCode)) || 'createCustomer failed');
+      recordMutation(state, 'failed', 'customer', { email: email, error: redactValue(msg, secrets) });
     }
   }
 }
