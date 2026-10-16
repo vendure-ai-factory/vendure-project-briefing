@@ -148,7 +148,7 @@ def wait_health() -> None:
             if len(ids) != 2:
                 raise OpsError("Vendure API/worker container set is incomplete")
             state = run([DOCKER, "inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", *ids]).splitlines()
-            if len(state) != 2 or any(not line.startswith("running ") for line in state):
+            if len(state) != 2 or any(line.split()[0:1] != ["running"] or (len(line.split()) > 1 and line.split()[1] != "healthy") for line in state):
                 raise OpsError("Vendure API/worker containers are not both running")
             with urllib.request.urlopen(STAGING_ORIGIN + "/health", timeout=8) as response:
                 health = json.loads(response.read(65536))
@@ -217,7 +217,7 @@ def logs(target: str) -> None:
     if target not in LOG_TARGETS:
         raise OpsError("logs target must be one of: vendure, worker, postgres")
     project, file, service = LOG_TARGETS[target]
-    output = compose(project, file, "logs", "--no-color", "--timestamps", "--tail", "100", "--since", "2h", service, timeout=120, check=False)
+    output = compose(project, file, "logs", "--no-color", "--timestamps", "--tail", "100", "--since", "2h", service, timeout=120)
     # Docker Compose combines container log text; redact before anything reaches the Runner log/artifact.
     for line in output.splitlines()[-100:]:
         print(redact(line))
