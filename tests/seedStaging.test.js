@@ -2417,3 +2417,187 @@ test('seed: readbackLadder stops at the first failing step and does not change s
   assert.ok(defaultEntry, 'default channel ladder entry must exist');
 });
 
+// ---------------------------------------------------------------------------
+// Regression: readbackLadder must set ok:false when the products field is null
+// (server product-list error) even when data itself is truthy and HTTP 200.
+// Previously ok was only false on top-level errors[]. or missing body.data.
+// ---------------------------------------------------------------------------
+test('seed: readbackLadder marks ok:false when products field is null (server products error)', async function() {
+  var runId = 'run-ladder-prod-missing-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'seeded' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    // Ladder products step: return data.products === null with no top-level
+    // errors[].  This models the staging Shop Admin products-list failure that
+    // returned ok:true for every ladder step in the last run.
+    if (q.indexOf('products(') !== -1 && q.indexOf('take: 1') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({ data: { products: null } })); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  var deEntry = result.readbackLadder.filter(function(l) { return l.channel === 'de'; })[0];
+  assert.ok(deEntry, 'DE ladder entry must exist');
+  // Step a (activeChannel) is unrelated to products and still resolves.
+  assert.strictEqual(deEntry.steps.a.ok, true, 'step a (activeChannel) must be ok');
+  // Step b (products.totalItems) must fail when the products field is null.
+  assert.strictEqual(deEntry.steps.b.ok, false,
+    'step b must be ok:false when products field is null, got: ' + JSON.stringify(deEntry.steps.b));
+  assert.strictEqual(deEntry.stoppedAt, 'b', 'ladder must stop at step b');
+});
+
+
+// ---------------------------------------------------------------------------
+// GraphQL document hygiene: every $variable used in a seed document is
+// declared in the operation header, and every declared variable is sent in the
+// variables object.  A missing declaration (e.g. $variantIds used but never
+// declared) raises a GraphQL validation error: "Variable $variantIds is not
+// defined by operation".  This walks every admin request emitted during a
+// real fresh run and asserts that invariant.
+// ---------------------------------------------------------------------------
+var SEED_GQL_VAR_RE = /\$([A-Za-z_][A-Za-z0-9_]*)/g;
+
+function parseOperationHeader(query) {
+  // header: "mutation Name($a: T, $b: T) {" or "query Name($a: T) {"
+  var m = query.match(/^(?:mutation|query|subscription)\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)/);
+  if (!m) return [];
+  var declText = m[1];
+  var names = [];
+  SEED_GQL_VAR_RE.lastIndex = 0;
+  var dm = null;
+  while ((dm = SEED_GQL_VAR_RE.exec(declText)) !== null) names.push(dm[1]);
+  return names;
+}
+
+function usedVariables(query) {
+  var bodyOnly = query.replace(/^(?:mutation|query|subscription)\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\([^)]*\))?/, "");
+  SEED_GQL_VAR_RE.lastIndex = 0;
+  var names = [];
+  var dm = null;
+  while ((dm = SEED_GQL_VAR_RE.exec(bodyOnly)) !== null) names.push(dm[1]);
+  return names;
+}
+
+test('seed: every $variable in every seed GraphQL document is declared and sent', async function() {
+  var runId = "run-gqlvars-" + Date.now();
+  var root = path.join(__dirname, "..", "runs", runId, "root");
+  fs.mkdirSync(root, { recursive: true });
+  var innerFetch = makeSeedFetch({ kind: "fresh" });
+  var callLog = [];
+  var fetchFn = function(url, init) {
+    callLog.push({ url: String(url), init: init });
+    return innerFetch(url, init);
+  };
+  fetchFn.getCalls = function() { return callLog; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, true, "fresh run must succeed");
+
+  var checked = 0;
+  callLog.forEach(function(call) {
+    if (String(call.url).indexOf("/admin-api") === -1) return;
+    var body = {};
+    try { body = JSON.parse(call.init && call.init.body || "{}"); } catch (e) { return; }
+    var query = body.query || "";
+    if (query.indexOf("Introspect") !== -1 || query.indexOf("mutation Login") !== -1) return;
+    var declared = parseOperationHeader(query);
+    var used = usedVariables(query);
+    var sentVars = body.variables || {};
+    // Every used variable must be declared.
+    used.forEach(function(v) {
+      assert.strictEqual(declared.indexOf(v) !== -1, true,
+        "variable $" + v + " is used but not declared in operation header: " + query);
+    });
+    // Every declared variable must be sent.
+    declared.forEach(function(v) {
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(sentVars, v), true,
+        "declared variable $" + v + " must be present in sent variables, got: " + JSON.stringify(sentVars) + " " + query);
+    });
+    checked += 1;
+  });
+  assert.ok(checked > 0, "at least one admin GraphQL document must be inspected");
+});
+
+
+// ---------------------------------------------------------------------------
+// Existing product with ZERO variants in the target channel(s): the seed must
+// assign the product (default-channel context, no vendure-token) and then
+// create the missing variants.  It must NOT skip them as 'existing'.
+// ---------------------------------------------------------------------------
+test('seed: existing product with zero variants assigns then creates variants', async function() {
+  var runId = 'run-existing-zerovars-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var spec = loadSpec();
+  var baseFetch = makeSeedFetch({ kind: 'fresh' });
+  var allCalls = [];
+  var fetchFn = function(url, init) {
+    var u = String(url);
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    // Product-by-slug: every product EXISTS (so no createProduct).
+    if (q.indexOf('products') !== -1 && q.indexOf('filter') !== -1 && q.indexOf('slug') !== -1) {
+      var slugMatch = body.variables && body.variables.slug;
+      var found = spec.products.filter(function(pp) { return pp.slug === slugMatch; });
+      if (found.length > 0) {
+        allCalls.push({ url: u, init: init });
+        return Promise.resolve({
+          status: 200, headers: { get: function() { return null; } },
+          text: function() {
+            return Promise.resolve(JSON.stringify({
+              data: { products: { items: [{ id: 'prod-' + found[0].slug, slug: found[0].slug, channels: found[0].channels }], totalItems: 1 } }
+            }));
+          }
+        });
+      }
+    }
+    // Variant-by-SKU: return ZERO variants for every product.
+    if (q.indexOf('productVariants') !== -1 && q.indexOf('filter') !== -1 && q.indexOf('sku') !== -1) {
+      allCalls.push({ url: u, init: init });
+      return Promise.resolve({ status: 200, headers: { get: function() { return null; } }, text: function() { return Promise.resolve(JSON.stringify({ data: { productVariants: { items: [], totalItems: 0 } } })); } });
+    }
+    allCalls.push({ url: u, init: init });
+    return baseFetch(url, init);
+  };
+  fetchFn.getCalls = function() { return allCalls; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  // Products are existing, never re-created.
+  var existingProducts = result.existing.filter(function(e) { return e.entity === 'product'; });
+  assert.ok(existingProducts.length > 0, 'existing products must be recorded as existing');
+  assert.strictEqual(result.created.filter(function(c) { return c.entity === 'product'; }).length, 0, 'no product may be created');
+
+  // All variants must be created (zero-variant products must not be skipped).
+  var createdVariants = result.created.filter(function(c) { return c.entity === 'variant'; });
+  var expectedSkuCount = 0;
+  spec.products.forEach(function(pp) { expectedSkuCount += pp.variants.length; });
+  assert.strictEqual(createdVariants.length, expectedSkuCount,
+    'every missing variant must be created, got ' + createdVariants.length + ' of ' + expectedSkuCount);
+  assert.strictEqual(result.existing.filter(function(e) { return e.entity === 'variant'; }).length, 0,
+    'no variant may be recorded as existing');
+
+  // The product assignment runs in the DEFAULT channel context (no vendure-token).
+  var assignCalls = allCalls.filter(function(ac) {
+    var bq = '';
+    try { bq = (JSON.parse(ac.init && ac.init.body || '{}').query || ''); } catch (e) {}
+    return bq.indexOf('PreAssignProductToChannel') !== -1;
+  });
+  assert.ok(assignCalls.length > 0, 'pre-assign must run for existing products');
+  assignCalls.forEach(function(ac) {
+    var h = ac.init && ac.init.headers ? ac.init.headers : {};
+    assert.strictEqual(h['vendure-token'], undefined, 'pre-assign must run in default channel context (no vendure-token)');
+  });
+  assert.strictEqual(result.failed.length, 0, 'zero-variant recovery must produce no failures');
+});
+

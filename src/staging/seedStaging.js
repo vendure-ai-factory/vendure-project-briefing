@@ -1544,16 +1544,14 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
       // { productIds: [id]!, channelId: id! } — confirmed via introspection.
       if (!state.dryRun && state.channelIdsByCode && state.channelIdsByCode[primaryCode]) {
         var preAssignQuery = [
-          'mutation PreAssignProductToChannel($input: AssignProductsToChannelInput!) {',
-          '  assignProductsToChannel(input: $input) { __typename id }',
-          '  assignProductVariantsToChannel(input: { productVariantIds: $variantIds, channelId: $channelId }) { __typename id }',
+          'mutation PreAssignProductToChannel($productId: ID!, $channelId: ID!) {',
+          '  assignProductsToChannel(input: { productIds: [$productId], channelId: $channelId }) { __typename id }',
           '}'
         ].join('\n');
         var preAssignRes = await adminGraphqlRequest(fetchFn, adminUrl, {
           query: preAssignQuery,
           variables: {
-            input: { productIds: [productId], channelId: state.channelIdsByCode[primaryCode] },
-            variantIds: [],
+            productId: productId,
             channelId: state.channelIdsByCode[primaryCode]
           }
         }, authToken, secrets, null);
@@ -1561,33 +1559,25 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
         // assignProductsToChannel must run in the DEFAULT channel context (no
         // vendure-token header) so the product — which only exists in the default
         // channel — is visible.  Response is classified by shape:
-        //   top-level errors array  => failure
-        //   result is an array       => success
-        //   result is an object with errorCode => failure
+        //   top-level errors array               => failed
+        //   array result                         => success
+        //   object with errorCode / Error typename => failed
+        //   anything else (unexpected shape)      => failed
         var paData1 = preAssignRes.response && preAssignRes.response.body && preAssignRes.response.body.data;
+        var assignResult1 = (paData1 && paData1.assignProductsToChannel) || null;
+        var preErr1 = null;
         if (hasTopLevelGraphqlErrors(preAssignRes)) {
-          recordMutation(state, 'failed', 'product', {
-            slug: slug,
-            channel: primaryCode,
-            error: buildCreateDiagnostic(preAssignRes, null, 'assignProductsToChannel failed', secrets)
-          });
-        } else if (!paData1 || !paData1.assignProductsToChannel) {
-          recordMutation(state, 'failed', 'product', {
-            slug: slug,
-            channel: primaryCode,
-            error: buildCreateDiagnostic(preAssignRes, paData1, 'assignProductsToChannel returned no data', secrets)
-          });
-        } else if (!Array.isArray(paData1.assignProductsToChannel) && paData1.assignProductsToChannel.errorCode) {
-          recordMutation(state, 'failed', 'product', {
-            slug: slug,
-            channel: primaryCode,
-            error: buildCreateDiagnostic(preAssignRes, paData1.assignProductsToChannel,
-              'assignProductsToChannel failed', secrets)
-          });
+          preErr1 = buildCreateDiagnostic(preAssignRes, null, 'assignProductsToChannel failed', secrets);
+        } else if (Array.isArray(assignResult1)) {
+          // success: array result (including empty)
+        } else if (assignResult1 && (assignResult1.errorCode || /Error$/.test(String(assignResult1.__typename || '')))) {
+          preErr1 = buildCreateDiagnostic(preAssignRes, assignResult1, 'assignProductsToChannel failed', secrets);
+        } else {
+          preErr1 = buildCreateDiagnostic(preAssignRes, assignResult1, 'assignProductsToChannel unexpected shape', secrets);
         }
-        // On failure: continue to next product (variants are skipped).
-        if (hasTopLevelGraphqlErrors(preAssignRes) || !paData1 || !paData1.assignProductsToChannel ||
-            (!Array.isArray(paData1.assignProductsToChannel) && paData1.assignProductsToChannel.errorCode)) {
+        if (preErr1) {
+          recordMutation(state, 'failed', 'product', { slug: slug, channel: primaryCode, error: preErr1 });
+          // On failure: continue to next product (variants are skipped).
           continue;
         }
       }
@@ -1688,7 +1678,7 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
           var addPriceInfo = variant.price[addCode];
           var addPriceMinor = addPriceInfo ? priceToMinorUnits(addPriceInfo.decimal, addPriceInfo.currencyCode || addCurrency) : null;
           var assignQuery = [
-            'mutation AssignToChannel($input: AssignProductsToChannelInput!) {',
+            'mutation AssignToChannel($input: AssignProductsToChannelInput!, $variantIds: [ID!]!, $channelId: ID!) {',
             '  assignProductsToChannel(input: $input) { id }',
             '  assignProductVariantsToChannel(input: { productVariantIds: $variantIds, channelId: $channelId }) { id }',
             '}'
@@ -1809,44 +1799,34 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
     // Assign product to primary channel BEFORE creating variants.
     if (!state.dryRun && state.channelIdsByCode && state.channelIdsByCode[primaryCode]) {
       var preAssignQuery2 = [
-        'mutation PreAssignProductToChannel($input: AssignProductsToChannelInput!) {',
-        '  assignProductsToChannel(input: $input) { __typename id }',
-        '  assignProductVariantsToChannel(input: { productVariantIds: $variantIds, channelId: $channelId }) { __typename id }',
+        'mutation PreAssignProductToChannel($productId: ID!, $channelId: ID!) {',
+        '  assignProductsToChannel(input: { productIds: [$productId], channelId: $channelId }) { __typename id }',
         '}'
       ].join('\n');
       var preAssignRes2 = await adminGraphqlRequest(fetchFn, adminUrl, {
         query: preAssignQuery2,
         variables: {
-          input: { productIds: [productId], channelId: state.channelIdsByCode[primaryCode] },
-          variantIds: [],
+          productId: productId,
           channelId: state.channelIdsByCode[primaryCode]
         }
       }, authToken, secrets, null);
       bumpRequests(state);
       // Same classification as site 1 above.
       var paData2 = preAssignRes2.response && preAssignRes2.response.body && preAssignRes2.response.body.data;
+      var assignResult2 = (paData2 && paData2.assignProductsToChannel) || null;
+      var preErr2 = null;
       if (hasTopLevelGraphqlErrors(preAssignRes2)) {
-        recordMutation(state, 'failed', 'product', {
-          slug: slug,
-          channel: primaryCode,
-          error: buildCreateDiagnostic(preAssignRes2, null, 'assignProductsToChannel failed', secrets)
-        });
-      } else if (!paData2 || !paData2.assignProductsToChannel) {
-        recordMutation(state, 'failed', 'product', {
-          slug: slug,
-          channel: primaryCode,
-          error: buildCreateDiagnostic(preAssignRes2, paData2, 'assignProductsToChannel returned no data', secrets)
-        });
-      } else if (!Array.isArray(paData2.assignProductsToChannel) && paData2.assignProductsToChannel.errorCode) {
-        recordMutation(state, 'failed', 'product', {
-          slug: slug,
-          channel: primaryCode,
-          error: buildCreateDiagnostic(preAssignRes2, paData2.assignProductsToChannel,
-            'assignProductsToChannel failed', secrets)
-        });
+        preErr2 = buildCreateDiagnostic(preAssignRes2, null, 'assignProductsToChannel failed', secrets);
+      } else if (Array.isArray(assignResult2)) {
+        // success: array result (including empty)
+      } else if (assignResult2 && (assignResult2.errorCode || /Error$/.test(String(assignResult2.__typename || '')))) {
+        preErr2 = buildCreateDiagnostic(preAssignRes2, assignResult2, 'assignProductsToChannel failed', secrets);
+      } else {
+        preErr2 = buildCreateDiagnostic(preAssignRes2, assignResult2, 'assignProductsToChannel unexpected shape', secrets);
       }
-      if (hasTopLevelGraphqlErrors(preAssignRes2) || !paData2 || !paData2.assignProductsToChannel ||
-          (!Array.isArray(paData2.assignProductsToChannel) && paData2.assignProductsToChannel.errorCode)) {
+      if (preErr2) {
+        recordMutation(state, 'failed', 'product', { slug: slug, channel: primaryCode, error: preErr2 });
+        // On failure: continue to next product (variants are skipped).
         continue;
       }
     }
@@ -1949,7 +1929,7 @@ async function ensureProducts(context, state, fetchFn, adminUrl, authToken, secr
 
         // Assign product + variant to the channel
         var assignQuery = [
-          'mutation AssignToChannel($input: AssignProductsToChannelInput!) {',
+          'mutation AssignToChannel($input: AssignProductsToChannelInput!, $variantIds: [ID!]!, $channelId: ID!) {',
           '  assignProductsToChannel(input: $input) { id }',
           '  assignProductVariantsToChannel(input: { productVariantIds: $variantIds, channelId: $channelId }) { id }',
           '}'
@@ -2139,23 +2119,38 @@ async function readbackLadder(context, state, fetchFn, adminUrl, authToken, secr
         }, authToken, callSecrets, ctx.token);
         bumpRequests(state);
         var body = res.response && res.response.body;
+        var data = body && body.data;
         var errMsg = null;
         if (hasTopLevelGraphqlErrors(res)) {
           var topErrors = body.errors;
           var first = topErrors && topErrors[0];
           errMsg = redactValue((first && (first.message || first.errorCode)) || 'GraphQL error', callSecrets);
-        } else if (!body || !body.data) {
+        } else if (!body || !data) {
           errMsg = redactValue('no data in response', callSecrets);
+        } else {
+          // Validate the step's queried field is actually present.  A server
+          // products-list error can return data truthy but products:null, which
+          // must be a failed step, not a silent ok:true.
+          var missingField = null;
+          if (step.key === 'a') {
+            if (!data.activeChannel) missingField = 'activeChannel';
+          } else if (step.key === 'b') {
+            if (!data.products) missingField = 'products';
+          } else if (!data.products || !data.products.items) {
+            missingField = 'products.items';
+          }
+          if (missingField) errMsg = redactValue('missing field in response: ' + missingField, callSecrets);
         }
+        var httpStatus = res.response ? res.response.httpStatus : null;
         if (errMsg) {
-          entry.steps[step.key] = { ok: false, error: errMsg };
+          entry.steps[step.key] = { ok: false, error: errMsg, httpStatus: httpStatus };
           stoppedAt = step.key;
           break;
         } else {
           entry.steps[step.key] = { ok: true };
         }
       } catch (e) {
-        entry.steps[step.key] = { ok: false, error: redactValue((e && e.message) || String(e), callSecrets) };
+        entry.steps[step.key] = { ok: false, error: redactValue((e && e.message) || String(e), callSecrets), httpStatus: null };
         stoppedAt = step.key;
         break;
       }

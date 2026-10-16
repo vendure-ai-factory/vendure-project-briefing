@@ -29,14 +29,14 @@ function stageOf(args) {
   return 'unknown';
 }
 
-function writeArtifacts(cwd, runId, stageName, classification, resultValue) {
+function writeArtifacts(cwd, runId, stageName, classification, resultValue, causeOverride) {
   var evDir = path.join(cwd, 'evidence', runId);
   fs.mkdirSync(evDir, { recursive: true });
   var repDir = path.join(cwd, 'reports', runId);
   fs.mkdirSync(repDir, { recursive: true });
   var uniq = stageName + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
   var tasks = classification
-    ? [{ taskId: uniq, result: 'BLOCK', classification: classification, cause: 'TEST' }]
+    ? [{ taskId: uniq, result: 'BLOCK', classification: classification, cause: causeOverride || 'TEST' }]
     : [{ taskId: uniq, result: resultValue || 'PASS', classification: null, cause: null }];
 
   // Merge this spawned task's record into the shared index.json instead of
@@ -129,7 +129,7 @@ function makeChild(config) {
       var stageName = stageOf(args);
       var stageConfig = results[stageName] ? results[stageName] : {};
       var classification = stageConfig.classification || null;
-      writeArtifacts(cwdVal, runId, stageName, classification, stageConfig.result || null);
+      writeArtifacts(cwdVal, runId, stageName, classification, stageConfig.result || null, stageConfig.cause);
       var status = (stageConfig.status === undefined) ? 0 : stageConfig.status;
       return { status: status, stdout: 'pipeline output line\n', stderr: '' };
     }
@@ -1334,5 +1334,271 @@ test('reportGenerator: replay of real run proves fix; corrected records give ver
   // report.ok: CAN-B2-16 is READINESS_PASS (not EVIDENCE_INVALID) and all
   // records pass verifyEvidence → no task makes the report fail.
   assert.strictEqual(report.ok, true, 'reportOk must be true: no task is EVIDENCE_INVALID');
+});
+
+// ---------------------------------------------------------------------------
+// classifySeedFailure: server products-list integer error
+// The staging Shop API products-list error ("invalid input syntax for type
+// integer: \"undefined\"") is a server-side Postgres problem, NOT a token
+// problem.  It is DEPENDENCY_ENVIRONMENT only when it is the SOLE seed
+// failure; any other seed failure keeps PIPELINE_DEFECT.
+// ---------------------------------------------------------------------------
+// The products-list integer error is NOT dependency/pending — the client ruled
+// it an in-scope target-application defect (TARGET_APP_DEFECT, status BLOCK).
+// Every other seed failure keeps PIPELINE_DEFECT.
+// ---------------------------------------------------------------------------
+test('runStaging: server products-list integer error is TARGET_APP_DEFECT (BLOCK), never dependency', async function() {
+  var mod = await loadModule();
+  var classified = mod.classifySeedFailure({
+    ok: false,
+    reason: null,
+    errors: ['readback error for de: invalid input syntax for type integer: "undefined"'],
+    failed: [{ entity: 'readback', code: 'de', error: 'invalid input syntax for type integer: "undefined"' }],
+    blocked: [],
+    conflicts: []
+  });
+  assert.ok(classified, 'a failed seed must produce a classification');
+  assert.strictEqual(classified.classification, 'TARGET_APP_DEFECT', 'server products-list error is a target-application defect');
+  assert.strictEqual(classified.result, 'BLOCK', 'status must be BLOCK');
+  assert.notStrictEqual(classified.classification, 'DEPENDENCY_ENVIRONMENT', 'must never be dependency/pending');
+  assert.strictEqual(classified.cause.indexOf('repair required') !== -1, true, 'cause states repair required');
+});
+
+test('runStaging: any other seed failure stays PIPELINE_DEFECT', async function() {
+  var mod = await loadModule();
+  var classified = mod.classifySeedFailure({
+    ok: false,
+    reason: null,
+    errors: ['createProductVariants failed: cannot create variant'],
+    failed: [{ entity: 'variant', sku: 'TST-...-1', error: 'createProductVariants failed: cannot create variant' }],
+    blocked: [],
+    conflicts: []
+  });
+  assert.ok(classified, 'a failed seed must produce a classification');
+  assert.strictEqual(classified.classification, 'PIPELINE_DEFECT', 'any other seed failure keeps PIPELINE_DEFECT');
+});
+
+// Mixed case: the products-list integer error PLUS another seed failure
+// (e.g. a variant mutation failure) must be PIPELINE_DEFECT, never
+// TARGET_APP_DEFECT.  The integer error is only the sole-caused target-app
+// defect when nothing else in the seed failed.
+test('runStaging: integer error together with a variant failure is PIPELINE_DEFECT (not TARGET_APP_DEFECT)', async function() {
+  var mod = await loadModule();
+  var classified = mod.classifySeedFailure({
+    ok: false,
+    reason: null,
+    errors: [
+      'readback error for de: invalid input syntax for type integer: "undefined"',
+      'createProductVariants failed: cannot create variant'
+    ],
+    failed: [
+      { entity: 'readback', code: 'de', error: 'invalid input syntax for type integer: "undefined"' },
+      { entity: 'variant', sku: 'TST-...-1', error: 'createProductVariants failed: cannot create variant' }
+    ],
+    blocked: [],
+    conflicts: []
+  });
+  assert.ok(classified, 'a failed seed must produce a classification');
+  assert.strictEqual(classified.classification, 'PIPELINE_DEFECT',
+    'integer error plus another failure must be a Pipeline defect, got: ' + classified.classification);
+  assert.notStrictEqual(classified.classification, 'TARGET_APP_DEFECT', 'must not be TARGET_APP_DEFECT');
+  assert.notStrictEqual(classified.classification, 'DEPENDENCY_ENVIRONMENT', 'must never be dependency/pending');
+});
+
+// The integer-error readback entry is NOT another failure, but the variant
+// mutation entry in failed[] IS.  hasOtherSeedFailure must detect it via the
+// array scan and return true, making the overall classification PIPELINE_DEFECT
+// (not TARGET_APP_DEFECT).  This is the real-shape scenario where runSeedStep
+// returns failed as an array of entries.
+test('runStaging: variant mutation entry in failed[] (readback integer-error also present) is PIPELINE_DEFECT', async function() {
+  var mod = await loadModule();
+  var classified = mod.classifySeedFailure({
+    ok: false,
+    reason: null,
+    errors: ['readback error for de: invalid input syntax for type integer: "undefined"'],
+    failed: [
+      { entity: 'readback', code: 'de', error: 'invalid input syntax for type integer: "undefined"' },
+      { entity: 'variant', sku: 'TST-...-1', error: 'createProductVariants failed: cannot create variant' }
+    ],
+    blocked: [],
+    conflicts: []
+  });
+  assert.ok(classified, 'a failed seed must produce a classification');
+  assert.strictEqual(classified.classification, 'PIPELINE_DEFECT',
+    'variant entry in failed[] (not just integer error) must be a Pipeline defect, got: ' + classified.classification);
+  assert.notStrictEqual(classified.classification, 'TARGET_APP_DEFECT',
+    'must not be TARGET_APP_DEFECT: hasOtherSeedFailure catches variant entry in failed[]');
+  assert.notStrictEqual(classified.classification, 'DEPENDENCY_ENVIRONMENT', 'must never be dependency/pending');
+});
+
+// Mixed: integer-error readback entries PLUS a genuine variant mutation failure
+// entry -> PIPELINE_DEFECT (hasOtherSeedFailure detects the variant entry).
+test('runStaging: integer error in readback plus separate variant mutation entry is PIPELINE_DEFECT', async function() {
+  var mod = await loadModule();
+  var classified = mod.classifySeedFailure({
+    ok: false, reason: null,
+    errors: ['readback error for de: invalid input syntax for type integer: "undefined"'],
+    failed: [
+      { entity: 'readback', code: 'de', error: 'invalid input syntax for type integer: "undefined"' },
+      { entity: 'variant', sku: 'TST-...-1', error: 'createProductVariants failed: cannot create variant' }
+    ],
+    blocked: [], conflicts: []
+  });
+  assert.strictEqual(classified.classification, 'PIPELINE_DEFECT',
+    'readback integer-error entries + separate variant entry must be Pipeline defect, got: ' + classified.classification);
+});
+
+// Real shape: 4 readback entries (one per channel) with the integer error and
+// zero other failures.  All failed[] entries are entity==='readback' with the
+// integer error -> otherFailures is empty -> TARGET_APP_DEFECT.
+test('runStaging: 4 readback integer-error entries with zero other failures is TARGET_APP_DEFECT', async function() {
+  var mod = await loadModule();
+  var classified = mod.classifySeedFailure({
+    ok: false, reason: null,
+    errors: ['readback error: invalid input syntax for type integer: "undefined"'],
+    failed: [
+      { entity: 'readback', code: 'de', error: 'invalid input syntax for type integer: "undefined"' },
+      { entity: 'readback', code: 'at', error: 'invalid input syntax for type integer: "undefined"' },
+      { entity: 'readback', code: 'hu', error: 'invalid input syntax for type integer: "undefined"' },
+      { entity: 'readback', code: 'gb', error: 'invalid input syntax for type integer: "undefined"' }
+    ],
+    blocked: [], conflicts: []
+  });
+  assert.strictEqual(classified.classification, 'TARGET_APP_DEFECT',
+    '4 readback integer-error entries with zero other failures must be TARGET_APP_DEFECT, got: ' + classified.classification);
+});
+
+// Legacy shape: failed is a positive number, not an array.  A non-zero
+// count means mutations failed but no error string was recorded.  Treat as
+// another seed failure (hasOtherSeedFailure returns true).
+test('runStaging: numeric failed count > 0 without errors[] is PIPELINE_DEFECT', async function() {
+  var mod = await loadModule();
+  var classified = mod.classifySeedFailure({
+    ok: false,
+    reason: null,
+    errors: [],
+    failed: 3,
+    blocked: [],
+    conflicts: []
+  });
+  assert.ok(classified, 'a failed seed must produce a classification');
+  assert.strictEqual(classified.classification, 'PIPELINE_DEFECT',
+    'non-zero numeric failed count without errors[] must be a Pipeline defect, got: ' + classified.classification);
+});
+
+// ---------------------------------------------------------------------------
+// Seed fetch variant used by the TARGET_APP_DEFECT full-run tests: every
+// request behaves exactly like the standard seeded integration fetch, except
+// the Shop API readback products query (take:5) returns the server
+// products-list integer error as GraphQL errors. This makes the products-list
+// integer error the ONLY seed failure.
+// ---------------------------------------------------------------------------
+function makeAppDefectSeedFetch(baseOpts) {
+  var inner = makeSeedIntegrationFetch(baseOpts);
+  return function seedAppDefectFetch(url, init) {
+    var u = String(url);
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    var isShop = u.indexOf('/shop-api') !== -1;
+    // The readback query is a plain query to the Shop API with products take:5.
+    // Return products: [] (empty array, as a real server does when the query
+    // fails).  With items:[], the code's body.data.products.items check fails
+    // (undefined, falsy) and goes to the else branch BUT does not push a
+    // second error because body.data.products is truthy and the items check
+    // itself is the falsy guard.  The ONLY entry in state.errors is the
+    // GraphQL integer error -> hasOtherSeedFailure=false -> TARGET_APP_DEFECT.
+    if (isShop && q.indexOf('products(options: { take: 5 })') !== -1) {
+      return seedResponse({
+        data: {
+          activeChannel: { code: '__default_channel__', currencyCode: 'EUR' },
+          products: { items: [] }
+        },
+        errors: [{ message: 'invalid input syntax for type integer: "undefined"' }]
+      });
+    }
+    return inner(url, init);
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Task 2 + 3: full mocked run with the TARGET_APP_DEFECT seed.
+// The compliance report must have verifyOk:true and reportOk:true, and the
+// class / cause text must appear in run-summary.json and compliance-report.md.
+// The ONLY seed failure is the integer error, so CAN-B1-03 and CAN-B1-04 must
+// still execute (not "not executed: seed failed"); each task records the error
+// from its own request and gets its own classification.
+// ---------------------------------------------------------------------------
+test('runStaging: TARGET_APP_DEFECT seed yields a compliant report and runs the dependent tasks', async function() {
+  var mod = await loadModule();
+
+  // Tasks each record their own request-level classification (the integer
+  // error from their own request), matching the real CAN-B1-03/04 readback
+  // behavior: both dependent tasks still EXECUTE because the seed's ONLY
+  // failure is the products-list integer error.
+  var child = makeChild({
+    results: {
+      'task-CAN-B1-03': { status: 1, classification: 'TARGET_APP_DEFECT', result: 'BLOCK', cause: "repair required: Shop API products list fails server-side" },
+      'task-CAN-B1-04': { status: 1, classification: 'TARGET_APP_DEFECT', result: 'BLOCK', cause: "repair required: Shop API orders list fails server-side" },
+      'task-CAN-B2-16': { status: 0, classification: null, result: 'READINESS_PASS' }
+    }
+  });
+  var deps = makeDeps('seed-appdefect-' + Date.now(), {
+    child: child,
+    taskIds: APPROVED,
+    env: seedReadyEnv(),
+    fetch: makeAppDefectSeedFetch({ adminRead: seedReadyAdminRead })
+  });
+  deps.args.stagingUrl = 'https://staging.tibella.eu';
+  deps.args.shopApiUrl = 'https://staging.tibella.eu/shop-api';
+  deps.args.seedTestData = true;
+
+  var result = await mod.runStaging(deps);
+
+  // 1) The seed is TARGET_APP_DEFECT (sole integer-error failure; any failed[]
+  // entries are readback readback entries for the integer error, which are
+  // consequences, not separate failures).
+  assert.ok(result, 'runStaging completes');
+  var summary = JSON.parse(fs.readFileSync(path.join(deps.cwd, 'reports', deps.runId, 'run-summary.json'), 'utf8'));
+  assert.ok(summary.seed, 'run-summary must include seed');
+  assert.strictEqual(summary.seed.ok, false, 'the integer error makes the seed fail');
+  assert.strictEqual(summary.seed.classification, 'TARGET_APP_DEFECT',
+    'sole integer error must classify as TARGET_APP_DEFECT, got: ' + summary.seed.classification);
+  assert.ok(summary.seed.cause.indexOf('repair required') !== -1, 'cause text appears in run-summary: ' + summary.seed.cause);
+  assert.ok(summary.seed.cause.indexOf('repair required') !== -1,
+    'cause names the defect in run-summary: ' + summary.seed.cause);
+
+  // 2) Dependent tasks still EXECUTE (they are not "not executed: seed failed").
+  assert.strictEqual(child.spawnCalls.length, 3, 'all three tasks execute (no seed block)');
+  var b103 = result.stages.find(function(s) { return s.name === 'task-CAN-B1-03'; });
+  var b104 = result.stages.find(function(s) { return s.name === 'task-CAN-B1-04'; });
+  assert.ok(b103, 'CAN-B1-03 executes');
+  assert.ok(b104, 'CAN-B1-04 executes');
+  result.stages.forEach(function(s) {
+    assert.notStrictEqual(s.cause, 'not executed: seed failed', s.name + ' must not be a seed block');
+  });
+  // Each task gets its OWN classification from its own request.
+  assert.strictEqual(b103.classification, 'TARGET_APP_DEFECT', 'CAN-B1-03 classification from its own request');
+  assert.strictEqual(b104.classification, 'TARGET_APP_DEFECT', 'CAN-B1-04 classification from its own request');
+
+  // 3) Compliance report: verifyOk true, reportOk true, class + cause in both
+  //    run-summary and compliance-report.md.
+  var manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', MANIFEST), 'utf8'));
+  var report = reportGenerator.generateReport(deps.runId, {
+    root: path.join(deps.cwd, 'evidence'),
+    baseDir: '.',
+    manifest: manifest,
+    registry: null
+  });
+  assert.strictEqual(report.verifyOk, true, 'verifyOk must be true: all records verified');
+  assert.strictEqual(report.ok, true, 'reportOk must be true: BLOCK outcomes are legitimate, no EVIDENCE_INVALID');
+  assert.ok(report.tasks['CAN-B1-03'] && report.tasks['CAN-B1-03'].outcome === 'BLOCK', 'CAN-B1-03 in report is BLOCK');
+  assert.ok(report.tasks['CAN-B1-04'] && report.tasks['CAN-B1-04'].outcome === 'BLOCK', 'CAN-B1-04 in report is BLOCK');
+
+  var md = reportGenerator.renderMarkdownReport(report);
+  assert.ok(md.indexOf('TARGET_APP_DEFECT') !== -1, 'class text appears in compliance-report.md');
+  assert.ok(md.toLowerCase().indexOf('repair required') !== -1 || md.indexOf('seed failed') !== -1,
+    'cause text appears in compliance-report.md');
+  assert.ok(md.indexOf('verifyOk: true') !== -1, 'markdown carries verifyOk');
+  assert.ok(md.indexOf('reportOk: true') !== -1, 'markdown carries reportOk');
 });
 

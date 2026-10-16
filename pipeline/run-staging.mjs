@@ -29,6 +29,7 @@ const SHOP_API_PATH = '/shop-api';
 const CLASS_DEPENDENCY = 'DEPENDENCY_ENVIRONMENT';
 const CLASS_CLIENT_INPUT = 'CLIENT_INPUT_SCOPE';
 const CLASS_PIPELINE_DEFECT = 'PIPELINE_DEFECT';
+const CLASS_TARGET_APP_DEFECT = 'TARGET_APP_DEFECT';
 
 // Canonical task IDs explicitly approved by the client for the authorized
 // staging run. Source: docs/client/acceptance-manifest-v0.4-reconciled.md
@@ -804,6 +805,18 @@ function classifySeedFailure(seed) {
     };
   }
 
+  // The staging Shop API products-list integer error is an in-scope
+  // target-application defect (client-ruled), NEVER an environment/pending
+  // failure -- but only when it is the SOLE seed failure.  Any other seed
+  // failure (including together with the integer error) is a Pipeline defect.
+  if (looksLikeServerProductsListError(joined) && !hasOtherSeedFailure(seed)) {
+    return {
+      classification: CLASS_TARGET_APP_DEFECT,
+      result: 'BLOCK',
+      cause: "repair required: Shop API products list fails server-side (Postgres: product.id != $3 with $3='undefined')"
+    };
+  }
+
   // GraphQL validation / schema / wrong-type / seed-spec input defects.
   if (isSchemaOrGraphqlText(joined)) {
     return {
@@ -878,6 +891,56 @@ function isSchemaOrGraphqlText(text) {
     if (SEED_SCHEMA_GQL_PATTERNS[i].test(s)) return true;
   }
   return false;
+}
+
+var SEED_SERVER_PRODUCTS_LIST_PATTERN = /invalid input syntax for type integer/i;
+
+function looksLikeServerProductsListError(text) {
+  return SEED_SERVER_PRODUCTS_LIST_PATTERN.test(String(text));
+}
+
+/**
+ * True when the seed has any failure message that is NOT the server
+ * products-list integer error (so that error is not the sole cause).
+ * Inspects the raw seed fields directly because some paths reduce the seed
+ * to counts (failed/blocked/conflicts are numbers) while others keep arrays.
+ */
+function hasOtherSeedFailure(seed) {
+  function other(v) {
+    if (typeof v === 'string' && v !== '' && !looksLikeServerProductsListError(v)) return true;
+    return false;
+  }
+  function scan(entry) {
+    if (!entry) return false;
+    if (other(entry.error) || other(entry.message) || other(entry.reason) || other(entry.detail)) return true;
+    return false;
+  }
+  if (other(seed.error) || other(seed.reason)) return true;
+  var errs = seed.errors;
+  if (Array.isArray(errs)) {
+    for (var i = 0; i < errs.length; i++) {
+      if (typeof errs[i] === 'string' && errs[i] !== '' && !looksLikeServerProductsListError(errs[i])) return true;
+    }
+  } else if (typeof errs === 'string' && errs !== '' && !looksLikeServerProductsListError(errs)) {
+    return true;
+  }
+  return ['failed', 'blocked', 'conflicts'].some(function(arrName) {
+    var arr = seed[arrName];
+    if (Array.isArray(arr)) {
+      for (var j = 0; j < arr.length; j++) {
+        if (scan(arr[j])) return true;
+      }
+      return false;
+    }
+    // arr is a count (number).  A non-zero count means mutations/entities failed
+    // that recordMutation'd without a string in errors[].  Treat as another failure;
+    // if errors[] is non-empty hasOtherSeedFailure already gave the right answer.
+    if (typeof arr === 'number' && arr > 0) {
+      return !(Array.isArray(errs) && errs.length > 0);
+    }
+    // Not an array, not a number (null, undefined, etc.) — nothing to scan.
+    return false;
+  });
 }
 
 /**
@@ -1128,7 +1191,7 @@ function writeAggregatedSummary(cfg, preflight, stages, seed) {
   if (seed && seed.errors && Array.isArray(seed.errors)) {
     seed.errors.forEach(function(e) {
       if (typeof e === 'string' && e.indexOf('invalid input syntax for type integer') !== -1) {
-        seedNotes.push('Follow-up: real staging still returns the integer error on CAN-B1-03; confirm the real channel tokens with the client (human action, not code).');
+        seedNotes.push("repair required: Shop API products list fails server-side (Postgres: product.id != $3 with $3='undefined'); in-scope target-application defect (TARGET_APP_DEFECT).");
       }
     });
   }
@@ -1137,11 +1200,19 @@ function writeAggregatedSummary(cfg, preflight, stages, seed) {
     seed.blocked.forEach(function(b) {
       if (b.error && b.error.indexOf && b.error.indexOf('invalid input syntax for type integer') !== -1) {
         if (seedNotes.length === 0) {
-          seedNotes.push('Follow-up: real staging still returns the integer error on CAN-B1-03; confirm the real channel tokens with the client (human action, not code).');
+          seedNotes.push("repair required: Shop API products list fails server-side (Postgres: product.id != $3 with $3='undefined'); in-scope target-application defect (TARGET_APP_DEFECT).");
         }
       }
     });
   }
+  // Keep all seed fields intact except override failed to a count for the
+  // public record.  hasOtherSeedFailure (called before this function) reads
+  // seed.failed directly as an array; that is unchanged here.
+  var seedForSummary = seed
+    ? { ...seed,
+        failed: Array.isArray(seed.failed) ? seed.failed.length
+          : (typeof seed.failed === 'number' ? seed.failed : 0) }
+    : undefined;
   const summary = {
     schemaVersion: '1.0',
     runId: cfg.runId,
@@ -1150,7 +1221,7 @@ function writeAggregatedSummary(cfg, preflight, stages, seed) {
     completedAt: new Date().toISOString(),
     preflightOk: preflight.ok === true,
     anyPipelineDefect: anyDefect,
-    seed: seed || undefined,
+    seed: seedForSummary,
     stages: stageRows,
     tasks: allTasks,
     notes: seedNotes
@@ -1253,8 +1324,8 @@ function runSeedStep(cfg, seedModule) {
       created: (result && Array.isArray(result.created)) ? result.created.length : 0,
       existing: (result && Array.isArray(result.existing)) ? result.existing.length : 0,
       conflicts: (result && Array.isArray(result.conflicts)) ? result.conflicts.length : 0,
-      failed: (result && Array.isArray(result.failed)) ? result.failed.length : 0,
-      errors: (result && Array.isArray(result.errors)) ? result.errors : []
+      errors: (result && Array.isArray(result.errors)) ? result.errors : [],
+      failed: (result && Array.isArray(result.failed)) ? result.failed : [],
     });
   }, function(err) {
     return applySeedClassification({
@@ -1266,7 +1337,7 @@ function runSeedStep(cfg, seedModule) {
       created: 0,
       existing: 0,
       conflicts: 0,
-      failed: 0,
+      failed: [],
       errors: [(err && err.message) || String(err)]
     });
   });
@@ -1387,9 +1458,17 @@ async function runStaging(deps) {
     var seedHasOnlyCustomerBlock = seedFailed && seed && seed.blocked &&
       seed.blocked.length > 0 &&
       seed.blocked.every(function(b) { return b.entity === 'customer'; });
+    // seedHasOnlyAppDefect: the ONLY seed failure is the client-ruled
+    // target-application Shop API products-list integer error.  The catalog
+    // was seeded (products/variants created); the failure is the readback of
+    // that catalog, so the dependent readiness tasks CAN-B1-03/CAN-B1-04 can
+    // still run -- each records the integer error from its own request and is
+    // classified on its own evidence, and the dry-run task runs as usual.
+    var seedHasOnlyAppDefect = seedFailed && seed && seed.classification === CLASS_TARGET_APP_DEFECT;
     // seedCanProvideFixtures: true when seed hasn't failed, OR when it only
-    // failed on customer (catalog steps ran and created fixtures).
-    var seedCanProvideFixtures = !seedFailed || seedHasOnlyCustomerBlock;
+    // failed on customer (catalog steps ran and created fixtures), OR when the
+    // only failure is the target-app products-list defect (catalog created).
+    var seedCanProvideFixtures = !seedFailed || seedHasOnlyCustomerBlock || seedHasOnlyAppDefect;
     for (let i = 0; i < planned.length; i += 1) {
       const p = planned[i];
       // Tasks run when the seed provided fixtures (successful or customer-only block).
