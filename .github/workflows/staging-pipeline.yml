@@ -144,6 +144,7 @@ jobs:
           STAGING_ADMIN_PASSWORD: ${{ secrets.STAGING_ADMIN_PASSWORD }}
           SEED_TEST_CUSTOMER_PASSWORD: ${{ secrets.SEED_TEST_CUSTOMER_PASSWORD }}
           CHANNEL_TOKENS: ${{ secrets.CHANNEL_TOKENS }}
+          VENDURE_STAGING_REPO_TOKEN: ${{ secrets.VENDURE_STAGING_REPO_TOKEN }}
         run: |
           set -euo pipefail
           set +x
