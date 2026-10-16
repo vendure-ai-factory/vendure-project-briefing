@@ -134,7 +134,7 @@ def compose(project: str, file: Path, *args: str, timeout: int = 120, check: boo
     return run([DOCKER, "compose", "--project-name", project, "--file", str(file), *args], timeout=timeout, check=check)
 
 def verify_compose_image(image: str) -> None:
-    services = compose(APP_PROJECT, APP_COMPOSE, "config", "--services").splitlines()
+    services = compose(APP_PROJECT, APP_COMPOSE, "--env-file", str(APP_ENV), "config", "--services").splitlines()
     images = compose(APP_PROJECT, APP_COMPOSE, "--env-file", str(APP_ENV), "config", "--images").splitlines()
     if set(services) != set(APP_SERVICES) or len(images) != 2 or any(item != image for item in images):
         raise OpsError("staging Compose target no longer matches the two approved Vendure services")
@@ -144,7 +144,7 @@ def wait_health() -> None:
     last_error = "not ready"
     while time.monotonic() < deadline:
         try:
-            ids = compose(APP_PROJECT, APP_COMPOSE, "ps", "-q", "vendure", "vendure-worker").splitlines()
+            ids = compose(APP_PROJECT, APP_COMPOSE, "--env-file", str(APP_ENV), "ps", "-q", "vendure", "vendure-worker").splitlines()
             if len(ids) != 2:
                 raise OpsError("Vendure API/worker container set is incomplete")
             state = run([DOCKER, "inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", *ids]).splitlines()
@@ -217,7 +217,7 @@ def logs(target: str) -> None:
     if target not in LOG_TARGETS:
         raise OpsError("logs target must be one of: vendure, worker, postgres")
     project, file, service = LOG_TARGETS[target]
-    output = compose(project, file, "logs", "--no-color", "--timestamps", "--tail", "100", "--since", "2h", service, timeout=120)
+    output = compose(project, file, *( ("--env-file", str(APP_ENV)) if project == APP_PROJECT else () ), "logs", "--no-color", "--timestamps", "--tail", "100", "--since", "2h", service, timeout=120)
     # Docker Compose combines container log text; redact before anything reaches the Runner log/artifact.
     for line in output.splitlines()[-100:]:
         print(redact(line))
