@@ -86,7 +86,7 @@ def image_from_env() -> str:
     if APP_ENV.is_symlink() or not APP_ENV.is_file():
         raise OpsError("staging deploy.env missing or symlinked")
     st = APP_ENV.stat()
-    if st.st_uid != 0 or (st.st_mode & 0o077) != 0:
+    if st.st_uid != 0 or (st.st_mode & 0o777) != 0o600:
         raise OpsError("staging deploy.env must be root-owned and mode 0600")
     values = [line.partition("=")[2].strip() for line in APP_ENV.read_text().splitlines()
               if line.startswith("APP_IMAGE=")]
@@ -170,7 +170,7 @@ def wait_health() -> None:
 def deploy(image: str) -> None:
     if not DIGEST_RE.fullmatch(image):
         raise OpsError("image must be the approved GHCR repository followed by @sha256:<64 lowercase hex>")
-    if APP_COMPOSE.is_symlink() or not APP_COMPOSE.is_file() or APP_COMPOSE.stat().st_uid != 0:
+    if APP_COMPOSE.is_symlink() or not APP_COMPOSE.is_file() or APP_COMPOSE.stat().st_uid != 0 or (APP_COMPOSE.stat().st_mode & 0o022) != 0:
         raise OpsError("staging Compose file missing, symlinked, or not root-owned")
     before = image_from_env()
     lock_fd = os.open("/run/lock/pipeline-staging-ops.lock", os.O_CREAT | os.O_RDWR, 0o600)
