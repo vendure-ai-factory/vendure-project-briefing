@@ -1,0 +1,4 @@
+ERROR: invalid input syntax for type integer: "john.doe@example.com"
+DETAIL: Failing row contains (null, null, 2024-01-01, t, null).
+CONTEXT: unnamed portal parameter $3
+STATEMENT: SELECT * FROM "product" WHERE "product"."enabled" = $1 AND "product"."id" != $2 AND "product"."category_id" = $3 LIMIT $4

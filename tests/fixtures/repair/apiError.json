@@ -1,0 +1,18 @@
+{
+  "errors": [
+    {
+      "message": "invalid input syntax for type integer: \"undefined\"",
+      "path": ["products", "filter", "id"],
+      "extensions": {
+        "code": "BAD_USER_INPUT",
+        "exception": {
+          "stacktrace": [
+            "Error: invalid input syntax for type integer: \"undefined\"",
+            "    at NpgsqlTypeHandler ReadWithILSpy (~/node_modules/@nopg/core/src/NpgsqlTypeHandler.ts:123:45)"
+          ]
+        }
+      }
+    }
+  ],
+  "data": null
+}

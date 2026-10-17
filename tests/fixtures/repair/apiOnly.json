@@ -1,0 +1,11 @@
+{
+  "apiErrors": [
+    {
+      "message": "invalid input syntax for type integer: \"42\"",
+      "path": ["collections"],
+      "extensions": {
+        "code": "BAD_USER_INPUT"
+      }
+    }
+  ]
+}
