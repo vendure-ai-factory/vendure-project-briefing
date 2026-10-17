@@ -1500,19 +1500,13 @@ function makeAppDefectSeedFetch(baseOpts) {
     var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
     var q = body.query || '';
     var isShop = u.indexOf('/shop-api') !== -1;
-    // The readback query is a plain query to the Shop API with products take:5.
-    // Return products: [] (empty array, as a real server does when the query
-    // fails).  With items:[], the code's body.data.products.items check fails
-    // (undefined, falsy) and goes to the else branch BUT does not push a
-    // second error because body.data.products is truthy and the items check
-    // itself is the falsy guard.  The ONLY entry in state.errors is the
-    // GraphQL integer error -> hasOtherSeedFailure=false -> TARGET_APP_DEFECT.
-    if (isShop && q.indexOf('products(options: { take: 5 })') !== -1) {
+    // Intercept ALL shop API queries (not just the specific "take: 5" variant)
+    // so every channel readback gets the integer error.  With 4 channels, this
+    // creates 4 failed entries (entity:'readback', code:<channel>, error:<integer>).
+    // All entries have integer error -> hasOtherSeedFailure=false -> TARGET_APP_DEFECT.
+    if (isShop && q.indexOf('products') !== -1) {
       return seedResponse({
-        data: {
-          activeChannel: { code: '__default_channel__', currencyCode: 'EUR' },
-          products: { items: [] }
-        },
+        data: { products: null },
         errors: [{ message: 'invalid input syntax for type integer: "undefined"' }]
       });
     }
@@ -1566,6 +1560,23 @@ test('runStaging: TARGET_APP_DEFECT seed yields a compliant report and runs the 
   assert.ok(summary.seed.cause.indexOf('repair required') !== -1, 'cause text appears in run-summary: ' + summary.seed.cause);
   assert.ok(summary.seed.cause.indexOf('repair required') !== -1,
     'cause names the defect in run-summary: ' + summary.seed.cause);
+  // 4 failed readback entries (one per channel: de, at, hu, gb), each carrying
+  // the integer error.  All are readback entries (not mutation failures), so
+  // hasOtherSeedFailure returns false and classification stays TARGET_APP_DEFECT.
+  // seed.failed may be a count (number) or an array depending on summary transform.
+  if (Array.isArray(summary.seed.failed)) {
+    assert.strictEqual(summary.seed.failed.length, 4,
+      'seed.failed must have 4 entries; got: ' + summary.seed.failed.length + ' - ' + JSON.stringify(summary.seed.failed));
+    summary.seed.failed.forEach(function(entry, i) {
+      assert.strictEqual(entry.entity, 'readback', 'entry ' + i + ' entity must be readback');
+      assert.strictEqual(entry.error, 'invalid input syntax for type integer: "undefined"',
+        'entry ' + i + ' error must be the integer error; got: ' + entry.error);
+    });
+  } else {
+    // Numeric failed count (transformed by summary pipeline)
+    assert.strictEqual(summary.seed.failed, 4,
+      'seed.failed must be 4; got: ' + summary.seed.failed);
+  }
 
   // 2) Dependent tasks still EXECUTE (they are not "not executed: seed failed").
   assert.strictEqual(child.spawnCalls.length, 3, 'all three tasks execute (no seed block)');
