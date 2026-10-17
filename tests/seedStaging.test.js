@@ -6,6 +6,7 @@ var path = require('path');
 var fs = require('fs');
 
 var seedStaging = require('../src/staging/seedStaging');
+var runStaging = require('../pipeline/run-staging.mjs');
 var SPECDIR = path.join(__dirname, '..', 'pipeline', 'seed', 'staging-seed.v1.json');
 
 var SENTINEL_PASSWORD = 'sup3r-s3cret-admin-pw-sentinel';
@@ -59,6 +60,7 @@ function seededChannelsData(spec) {
     var ch = { id: 'chan-' + c.channelCode, code: c.channelCode, token: token, availableCurrencyCodes: [c.currencyCode] };
     ch[channelField()] = c.currencyCode;
     ch.defaultLanguageCode = spec.countries && spec.countries[0] ? spec.countries[0].defaultLanguageCode : 'en';
+    ch.defaultLanguageCode = spec.countries && spec.countries[0] ? spec.countries[0].defaultLanguageCode : 'en';
     ch.defaultTaxZone = { id: 'zone-' + (c.zoneName || '').toLowerCase(), name: (c.zoneName || '') };
     ch.defaultShippingZone = { id: 'zone-' + (c.zoneName || '').toLowerCase(), name: (c.zoneName || '') };
     return ch;
@@ -97,8 +99,8 @@ function preReadData() {
       code: '__default_channel__',
       defaultCurrencyCode: 'USD',
       defaultLanguageCode: 'en',
-      defaultTaxZone: null,
-      defaultShippingZone: null
+      defaultTaxZone: { id: 'zone-eu', name: 'EU' },
+      defaultShippingZone: { id: 'zone-eu', name: 'EU' }
     },
     countries: { totalItems: 0 },
     zones: { totalItems: 0 },
@@ -108,6 +110,20 @@ function preReadData() {
     shippingMethods: { totalItems: 0 },
     paymentMethods: { totalItems: 0 }
   } };
+}
+
+/**
+ * Same shape as preReadData(), but with a NULL default tax/shipping zone on the
+ * activeChannel.  Used only by the ensureDefaultChannelTaxZone tests, which
+ * simulate a default channel that still needs its tax zone set (so updateChannel
+ * must run).  The shared, healthy preReadData() already carries a zone and keeps
+ * every other test mutation-free.
+ */
+function preReadDataNullZone() {
+  var d = preReadData();
+  d.data.activeChannel.defaultTaxZone = null;
+  d.data.activeChannel.defaultShippingZone = null;
+  return d;
 }
 
 function introspectionData() {
@@ -141,7 +157,10 @@ function introspectionData() {
     Country: { name: 'Country', fields: outputFields(['id', 'code', 'enabled']), inputFields: [] },
     GlobalSettings: { name: 'GlobalSettings', fields: outputFields(['availableLanguages', 'pricesIncludeTax']), inputFields: [] },
     UpdateGlobalSettingsInput: { name: 'UpdateGlobalSettingsInput', fields: [], inputFields: inputFields(['availableLanguages']) },
-    UpdateChannelInput: { name: 'UpdateChannelInput', fields: [], inputFields: inputFields(['id', 'defaultLanguageCode']) }
+    UpdateChannelInput: { name: 'UpdateChannelInput', fields: [], inputFields: inputFields([
+      'id', 'defaultLanguageCode', 'pricesIncludeTax', 'defaultTaxZoneId',
+      'defaultShippingZoneId', 'defaultCurrencyCode', 'currencyCode', 'availableCurrencyCodes'
+    ]) }
   } };
 }
 
@@ -2454,6 +2473,262 @@ test('seed: readbackLadder marks ok:false when products field is null (server pr
   assert.strictEqual(deEntry.steps.b.ok, false,
     'step b must be ok:false when products field is null, got: ' + JSON.stringify(deEntry.steps.b));
   assert.strictEqual(deEntry.stoppedAt, 'b', 'ladder must stop at step b');
+});
+
+
+// ---------------------------------------------------------------------------
+// Ladder integer error: the confirmed staging response shape for the
+// products-list integer error is:
+//   {"errors":[{"message":"invalid input syntax for type integer: \"undefined\"","path":["products"]}],"data":null}
+// This must produce ok:false on the products step.
+// ---------------------------------------------------------------------------
+test('seed: readbackLadder ok:false for integer error on products step (real staging response shape)', async function() {
+  var runId = 'run-ladder-integer-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'seeded' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    // Real staging response shape: integer error with path on products field.
+    if (q.indexOf('products(') !== -1 && q.indexOf('take: 1') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        headers: { get: function() { return null; } },
+        text: function() {
+          return Promise.resolve(JSON.stringify({
+            errors: [{ message: 'invalid input syntax for type integer: "undefined"', path: ['products'] }],
+            data: null
+          }));
+        }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+
+  var deEntry = result.readbackLadder.filter(function(l) { return l.channel === 'de'; })[0];
+  assert.ok(deEntry, 'DE ladder entry must exist');
+  // The products step (step b) must be ok:false with the integer error.
+  assert.strictEqual(deEntry.steps.b.ok, false,
+    'step b must be ok:false for integer error on products, got: ' + JSON.stringify(deEntry.steps.b));
+  assert.strictEqual(deEntry.steps.b.error.indexOf('invalid input syntax') !== -1, true,
+    'error message must contain integer error text');
+  assert.strictEqual(deEntry.stoppedAt, 'b', 'ladder must stop at step b');
+  // Ladder failure does not change seed.ok (ladder is diagnostic only).
+  assert.strictEqual(result.ok, true, 'ladder failure must not change seed.ok');
+});
+
+
+// ---------------------------------------------------------------------------
+// ensureDefaultChannelTaxZone: null tax zone -> updateChannel called, recorded 'updated'
+// ---------------------------------------------------------------------------
+test('seed: ensureDefaultChannelTaxZone null tax zone triggers updateChannel and records updated', async function() {
+  var runId = 'run-taxzone-null-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var updateChannelCalled = false;
+  // Override channels() to return the __default_channel__ with null tax zone,
+  // and updateChannel to return success with tax/shipping zones set.
+  var inner = makeSeedFetch({ kind: 'seeded' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    var v = body.variables || {};
+    // Return defaultTaxZone AFTER updateChannel is called (to avoid infinite retry).
+    // The updateChannel response sets ctx.state.channel.defaultTaxZone, but the
+    // second channels(options...) call in the retry loop overwrites ctx.state.channel
+    // with fresh data (no defaultTaxZone) unless we include it in the response.
+    var tzResponse = updateChannelCalled ? { id: 'zone-eu', name: 'EU' } : undefined;
+    if (q.indexOf('activeChannel') !== -1) {
+      return Promise.resolve({
+        status: 200, ok: true,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify(preReadDataNullZone())); }
+      });
+    }
+    if (q.indexOf('channels') !== -1 && q.indexOf('__default_channel__') !== -1) {
+      return Promise.resolve({
+        status: 200, ok: true,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({
+          data: { channels: { items: [{ id: 'chan-default', code: '__default_channel__', defaultTaxZone: tzResponse }], totalItems: 1 } }
+        })); }
+      });
+    }
+    if (q.indexOf('updateChannel') !== -1) {
+      updateChannelCalled = true;
+      return Promise.resolve({
+        status: 200, ok: true,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({
+          data: { updateChannel: { __typename: 'Channel', id: 'chan-default', code: '__default_channel__',
+            defaultTaxZone: { id: 'zone-eu', name: 'EU' }, defaultShippingZone: { id: 'zone-eu', name: 'EU' } } }
+        })); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  var updatedChannels = result.created.filter(function(c) { return c.entity === 'channel' && c.reason === 'defaultTaxZone'; });
+  assert.strictEqual(result.ok, true, 'seed must succeed');
+  assert.ok(updatedChannels.length > 0, 'channel defaultTaxZone update must be recorded in created, got: ' + JSON.stringify(result.created));
+  assert.strictEqual(updatedChannels[0].kind, 'updated', 'must be kind updated');
+});
+
+test('seed: ensureDefaultChannelTaxZone already set -> records existing, no mutation', async function() {
+  var runId = 'run-taxzone-existing-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'seeded' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    var v = body.variables || {};
+    if (q.indexOf('channels(options') !== -1 && v.filter && v.filter.code && v.filter.code._eq === '__default_channel__') {
+      return Promise.resolve({
+        status: 200, ok: true,
+        headers: { get: function() { return null; } },
+        json: function() { return Promise.resolve({
+          data: { channels: { items: [{ id: 'chan-default', code: '__default_channel__', defaultTaxZone: { id: 'zone-eu', name: 'EU' }, defaultShippingZone: { id: 'zone-eu', name: 'EU' } }], totalItems: 1 } }
+        }); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  assert.strictEqual(result.ok, true, 'seed must succeed');
+  assert.strictEqual(result.created.length, 0, 'no new entries when tax zone is already set');
+});
+
+test('seed: ensureDefaultChannelTaxZone updateChannel error -> records failed with redacted message', async function() {
+  var runId = 'run-taxzone-error-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  var inner = makeSeedFetch({ kind: 'seeded' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    var v = body.variables || {};
+    if (q.indexOf('activeChannel') !== -1) {
+      return Promise.resolve({
+        status: 200, ok: true,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify(preReadDataNullZone())); }
+      });
+    }
+    if (q.indexOf('channels') !== -1 && q.indexOf('__default_channel__') !== -1) {
+      return Promise.resolve({
+        status: 200, ok: true,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({
+          data: { channels: { items: [{ id: 'chan-default', code: '__default_channel__' }], totalItems: 1 } }
+        })); }
+      });
+    }
+    if (q.indexOf('updateChannel') !== -1) {
+      return Promise.resolve({
+        status: 200, ok: true,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({
+          errors: [{ message: 'updateChannel denied: ' + SENTINEL_AUTH, path: ['updateChannel'] }],
+          data: { updateChannel: null }
+        })); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  // Seed may still pass if the tax zone failure is not critical, or it may fail.
+  // The key check: there must be a 'failed' entry for the channel with the tax-zone reason.
+  var failedChannel = result.failed.filter(function(f) { return f.entity === 'channel' && f.reason === 'defaultTaxZone'; });
+  assert.ok(failedChannel.length > 0, 'updateChannel failure must be recorded as failed, got: ' + JSON.stringify(result.failed));
+  assert.strictEqual(failedChannel[0].error.indexOf(SENTINEL_AUTH), -1,
+    'secret value must be redacted in failed error, got: ' + failedChannel[0].error);
+});
+
+
+// ---------------------------------------------------------------------------
+// Classification: integer error + channel mutation failure -> PIPELINE_DEFECT
+// hasOtherSeedFailure returns true when any failed entry has a non-integer error,
+// so classifySeedFailure returns PIPELINE_DEFECT (not TARGET_APP_DEFECT).
+// ---------------------------------------------------------------------------
+test('seed: classifySeedFailure integer error + channel failure -> PIPELINE_DEFECT (not TARGET_APP_DEFECT)', async function() {
+  // This test verifies that when the seed has BOTH the integer error (sole
+  // products-list defect) AND a non-integer error from ensureDefaultChannelTaxZone
+  // (updateChannel failure recorded in state.failed), classifySeedFailure returns
+  // PIPELINE_DEFECT because there IS another failure beyond the integer error.
+  var runId = 'run-pipeline-defect-' + Date.now();
+  var root = path.join(__dirname, '..', 'runs', runId, 'root');
+  fs.mkdirSync(root, { recursive: true });
+  // Use conflict kind so channel tokens don't match the default, causing
+  // verifyReadback to record a channel failure in state.failed.
+  var inner = makeSeedFetch({ kind: 'conflict' });
+  var fetchFn = function(url, init) {
+    var body = init && init.body ? (function() { try { return JSON.parse(init.body); } catch (e) { return {}; } })() : {};
+    var q = body.query || '';
+    var v = body.variables || {};
+    // Intercept products(take: 1) for the ladder integer error.
+    if (q.indexOf('products(') !== -1 && q.indexOf('take:') !== -1) {
+    return Promise.resolve({
+    status: 200, ok: true,
+    headers: { get: function() { return null; } },
+    json: function() { return Promise.resolve({
+    errors: [{ message: 'invalid input syntax for type integer: "undefined"', path: ['products'] }],
+    data: null
+    }); }
+    });
+    }
+    if (q.indexOf('activeChannel') !== -1) {
+    return Promise.resolve({
+    status: 200, ok: true,
+    headers: { get: function() { return null; } },
+    text: function() { return Promise.resolve(JSON.stringify(preReadDataNullZone())); }
+    });
+    }
+    // Return default channel WITHOUT taxZone so ensureDefaultChannelTaxZone
+    // calls updateChannel, which then fails with a non-integer GraphQL error.
+    if (q.indexOf('channels') !== -1 && q.indexOf('__default_channel__') !== -1) {
+    return Promise.resolve({
+    status: 200, ok: true,
+    headers: { get: function() { return null; } },
+    text: function() { return Promise.resolve(JSON.stringify({
+    data: { channels: { items: [{ id: 'chan-default', code: '__default_channel__', token: 'wrong-token' }], totalItems: 1 } }
+    })); }
+    });
+    }
+    if (q.indexOf('updateChannel') !== -1) {
+      return Promise.resolve({
+        status: 200, ok: true,
+        headers: { get: function() { return null; } },
+        text: function() { return Promise.resolve(JSON.stringify({
+          errors: [{ message: 'updateChannel denied: zone constraint', path: ['updateChannel'] }],
+          data: { updateChannel: null }
+        })); }
+      });
+    }
+    return inner(url, init);
+  };
+  fetchFn.getCalls = inner.getCalls || function() { return []; };
+  var built = makeContext({ runId: runId, fetch: fetchFn, root: root, cwd: root });
+  var result = await seed(seedStaging.seedStaging, built.context, {});
+  // seed.ok must be false because state.failed has entries.
+  assert.strictEqual(result.ok, false, 'seed must be ok:false when failed entries exist, got: ' + result.ok);
+  // At least one failed entry (from updateChannel or verifyReadback channel mismatch).
+  assert.ok(result.failed.length > 0, 'failed entries must be present, got: ' + JSON.stringify(result.failed));
+  runStaging.applySeedClassification(result);
+  // Classification must be PIPELINE_DEFECT because there is a non-integer-error
+  // failure (updateChannel GraphQL error or verifyReadback channel mismatch).
+  assert.strictEqual(result.classification, 'PIPELINE_DEFECT',
+    'classification must be PIPELINE_DEFECT when non-integer error exists alongside integer error, got: ' + result.classification);
 });
 
 

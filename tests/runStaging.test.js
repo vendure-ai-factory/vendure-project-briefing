@@ -908,7 +908,7 @@ function emptyAdminRead(query) {
     customers: { items: [], totalItems: 0 }
   };
   if (query.indexOf('activeChannel') !== -1) {
-    data.activeChannel = { code: '__default_channel__', defaultCurrencyCode: 'USD', defaultLanguageCode: 'en', defaultTaxZone: null, defaultShippingZone: null };
+    data.activeChannel = { code: '__default_channel__', defaultCurrencyCode: 'USD', defaultLanguageCode: 'en', defaultTaxZone: { id: 'zone-eu', name: 'EU' }, defaultShippingZone: { id: 'zone-eu', name: 'EU' } };
   }
   // preRead probe does not nest counts under a key; they are top-level totals
   return { data: data };
@@ -1484,6 +1484,52 @@ test('runStaging: numeric failed count > 0 without errors[] is PIPELINE_DEFECT',
   assert.ok(classified, 'a failed seed must produce a classification');
   assert.strictEqual(classified.classification, 'PIPELINE_DEFECT',
     'non-zero numeric failed count without errors[] must be a Pipeline defect, got: ' + classified.classification);
+});
+
+// ---------------------------------------------------------------------------
+// classifyStage: DEPENDENCY_ENVIRONMENT task-level classification with the
+// integer error must be reclassified to TARGET_APP_DEFECT (moved before
+// firstTaskProblem check so it intercepts even classified/blocked tasks).
+// A task with a real network/5xx error must stay DEPENDENCY_ENVIRONMENT.
+// ---------------------------------------------------------------------------
+test('runStaging: classifyStage DEPENDENCY_ENVIRONMENT + integer error -> TARGET_APP_DEFECT', async function() {
+  var mod = await loadModule();
+  var outcome = {
+    summary: {
+      tasks: [{
+        id: 'task-CAN-B1-03',
+        result: 'BLOCK',
+        classification: 'DEPENDENCY_ENVIRONMENT',
+        cause: 'STAGING_SERVER_ERROR: invalid input syntax for type integer: "undefined"'
+      }]
+    },
+    exitCode: 1
+  };
+  mod.classifyStage(outcome);
+  assert.strictEqual(outcome.classification, 'TARGET_APP_DEFECT',
+    'DEP_ENV task with integer error must become TARGET_APP_DEFECT, got: ' + outcome.classification);
+  assert.ok(outcome.cause.indexOf('repair required') !== -1,
+    'cause must say repair required, got: ' + outcome.cause);
+});
+
+test('runStaging: classifyStage DEPENDENCY_ENVIRONMENT + real network error -> stays DEPENDENCY_ENVIRONMENT', async function() {
+  var mod = await loadModule();
+  var outcome = {
+    summary: {
+      tasks: [{
+        id: 'task-CAN-B1-03',
+        result: 'FAIL',
+        classification: 'DEPENDENCY_ENVIRONMENT',
+        cause: 'STAGING_SERVER_ERROR: Internal Server Error (HTTP 500)'
+      }]
+    },
+    exitCode: 1
+  };
+  mod.classifyStage(outcome);
+  assert.strictEqual(outcome.classification, 'DEPENDENCY_ENVIRONMENT',
+    'DEP_ENV task with real 5xx must stay DEPENDENCY_ENVIRONMENT, got: ' + outcome.classification);
+  assert.ok(outcome.cause.indexOf('Internal Server Error') !== -1,
+    'cause must preserve original error, got: ' + outcome.cause);
 });
 
 // ---------------------------------------------------------------------------

@@ -841,7 +841,12 @@ function buildCreateDiagnostic(res, data, defaultMsg, secrets) {
  */
 function hasTopLevelGraphqlErrors(res) {
   var body = res && res.response && res.response.body;
-  return !!(body && Array.isArray(body.errors) && body.errors.length > 0);
+  // GraphQL errors in body (HTTP 200 or any status with GraphQL error envelope).
+  if (body && Array.isArray(body.errors) && body.errors.length > 0) return true;
+  // Non-2xx HTTP status is an error even without GraphQL errors[].
+  var status = res && res.response ? res.response.httpStatus : null;
+  if (status !== null && status !== undefined && (status < 200 || status >= 300)) return true;
+  return false;
 }
 
 /**
@@ -1355,6 +1360,103 @@ async function ensureChannelLanguage(context, state, fetchFn, adminUrl, authToke
   }
   var uMsg = (mdata && (mdata.message || mdata.errorCode)) || 'updateChannel returned no usable data';
   recordMutation(state, 'failed', 'channel', { code: code, reason: 'language', error: uMsg });
+}
+
+/**
+ * Ensure the DEFAULT channel (the activeChannel without a channel token, code
+ * __default_channel__) has a defaultTaxZone and defaultShippingZone set.
+ * This is required because admin mutations sent without a vendure-token run
+ * in the default channel context, and without a tax zone the error
+ * "The active tax zone could not be determined" blocks product/variant pricing.
+ * The EU zone (zoneIds['EU']) is used as the default.  Idempotent: if the
+ * default channel already has a tax zone set, records 'existing' and does not
+ * mutate.  Records 'updated' when a mutation was needed.  On failure or when
+ * updateChannel is unavailable, records a 'failed' entry with the redacted
+ * error.  Safe to call even when the default channel id is unknown (skips
+ * silently in that case).
+ */
+async function ensureDefaultChannelTaxZone(context, state, fetchFn, adminUrl, authToken, secrets, introspection, zoneIds) {
+  // Can only proceed if we have the default channel data from preRead.
+  var preReadData = (state.preRead && state.preRead.ok === false) ? null : state.preRead;
+  var activeChannel = preReadData && preReadData.activeChannel ? preReadData.activeChannel : null;
+  if (!activeChannel) return;
+  // If defaultTaxZone is already set, nothing to do.
+  if (activeChannel.defaultTaxZone && (activeChannel.defaultTaxZone.id || activeChannel.defaultTaxZone.name)) return;
+  // EU zone must exist (created by ensureZones before this is called).
+  var euZoneId = zoneIds && zoneIds['EU'] ? zoneIds['EU'] : null;
+  if (!euZoneId) {
+    recordMutation(state, 'failed', 'channel', { code: '__default__', reason: 'defaultTaxZone', error: 'EU zone not found; cannot set default tax zone on default channel' });
+    return;
+  }
+  // Check schema: updateChannel must accept defaultTaxZoneId and defaultShippingZoneId.
+  var updateChannelAvail = hasMutation(introspection, 'updateChannel');
+  var hasTaxZoneInput = hasInputField(introspection, 'UpdateChannelInput', 'defaultTaxZoneId');
+  var hasShippingZoneInput = hasInputField(introspection, 'UpdateChannelInput', 'defaultShippingZoneId');
+  if (!updateChannelAvail || !hasTaxZoneInput || !hasShippingZoneInput) {
+    recordMutation(state, 'failed', 'channel', { code: '__default__', reason: 'defaultTaxZone', error: 'updateChannel does not support defaultTaxZoneId/defaultShippingZoneId in schema; cannot set default tax zone on default channel' });
+    return;
+  }
+  // Get the default channel id. We need to re-query because preRead only has code, not id.
+  var defaultChannelId = null;
+  try {
+    var chanQuery = '{ channels(options: { filter: { code: { eq: "__default_channel__" } } }) { items { id code } } }';
+    var cr = await adminGraphqlRequest(fetchFn, adminUrl, { query: chanQuery, variables: {} }, authToken, secrets);
+    bumpRequests(state);
+    if (cr.response && cr.response.ok && cr.response.body && cr.response.body.data && cr.response.body.data.channels && cr.response.body.data.channels.items && cr.response.body.data.channels.items.length > 0) {
+      defaultChannelId = cr.response.body.data.channels.items[0].id;
+    }
+  } catch (e) {
+    recordMutation(state, 'failed', 'channel', { code: '__default__', reason: 'defaultTaxZone', error: 'could not read default channel id: ' + ((e && e.message) || String(e)) });
+    return;
+  }
+  if (!defaultChannelId) {
+    recordMutation(state, 'failed', 'channel', { code: '__default__', reason: 'defaultTaxZone', error: 'default channel id not found' });
+    return;
+  }
+  if (state.dryRun) {
+    recordMutation(state, 'created', 'channel', { code: '__default__', reason: 'defaultTaxZone', planned: true, plan: 'set defaultTaxZoneId=' + euZoneId + ', defaultShippingZoneId=' + euZoneId + ' on __default_channel__' });
+    return;
+  }
+  var mutation = [
+    'mutation UpdateDefaultChannelTaxZone($input: UpdateChannelInput!) {',
+    '  updateChannel(input: $input) {',
+    '    ... on Channel { id code defaultTaxZone { id name } defaultShippingZone { id name } }',
+    '    ... on ErrorResult { errorCode message }',
+    '  }',
+    '}'
+  ].join('\n');
+  var mutationInput = { id: defaultChannelId, defaultTaxZoneId: euZoneId, defaultShippingZoneId: euZoneId };
+  var res = await adminGraphqlRequest(fetchFn, adminUrl, { query: mutation, variables: { input: mutationInput } }, authToken, secrets);
+  bumpRequests(state);
+  var mbody = res.response && res.response.body;
+  var mdata = mbody && mbody.data && mbody.data.updateChannel;
+  var gqlErrors = (mbody && mbody.errors && mbody.errors.length > 0) ? mbody.errors.map(function(e) { return e.message; }).join('; ') : null;
+  if (res.networkError) {
+    recordMutation(state, 'failed', 'channel', { code: '__default__', reason: 'defaultTaxZone', error: 'updateChannel network error: ' + res.networkError });
+    return;
+  }
+  if (gqlErrors) {
+    recordMutation(state, 'failed', 'channel', { code: '__default__', reason: 'defaultTaxZone', error: redactValue(gqlErrors, secrets) });
+    return;
+  }
+  if (mdata && mdata.id && !(mdata.errorCode || mdata.message)) {
+    recordMutation(state, 'updated', 'channel', {
+      code: '__default__',
+      reason: 'defaultTaxZone',
+      kind: 'updated',
+      id: mdata.id,
+      defaultTaxZone: (mdata.defaultTaxZone && mdata.defaultTaxZone.name) || euZoneId,
+      defaultShippingZone: (mdata.defaultShippingZone && mdata.defaultShippingZone.name) || euZoneId
+    });
+    // Update preRead so subsequent checks see the new zone.
+    if (state.preRead && state.preRead.activeChannel) {
+      state.preRead.activeChannel.defaultTaxZone = mdata.defaultTaxZone || { id: euZoneId, name: 'EU' };
+      state.preRead.activeChannel.defaultShippingZone = mdata.defaultShippingZone || { id: euZoneId, name: 'EU' };
+    }
+    return;
+  }
+  var uMsg = (mdata && (mdata.message || mdata.errorCode)) || 'updateChannel returned no usable data';
+  recordMutation(state, 'failed', 'channel', { code: '__default__', reason: 'defaultTaxZone', error: uMsg });
 }
 
 /**
@@ -2487,6 +2589,13 @@ async function seedStaging(context, options) {
 
   // 3. Tax category + tax rates
   await ensureTax(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, zoneIds);
+
+  // 3.5 DEFAULT channel tax zone: before any country channel is created or any
+  // product/variant operation runs, ensure the DEFAULT channel has a default
+  // tax zone and shipping zone.  Admin mutations sent without a vendure-token
+  // run in the DEFAULT channel context; without a tax zone the error
+  // "The active tax zone could not be determined" blocks product/variant pricing.
+  await ensureDefaultChannelTaxZone(context, state, fetchFn, adminUrl, authToken, allSecrets, introspectResult, zoneIds);
 
   // 4. Channels
   var channelIds = await ensureChannels(context, state, fetchFn, adminUrl, authToken, allSecrets, spec, introspectResult, zoneIds);

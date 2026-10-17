@@ -711,6 +711,24 @@ function classifyStage(outcome) {
       ? problem.classification
       : CLASS_PIPELINE_DEFECT;
     outcome.cause = problem.cause || problem.result || 'task failed';
+    // The staging Shop API products-list integer error is an in-scope
+    // target-application defect (client-ruled).  Detect it at the task level
+    // even when the task summary carries DEPENDENCY_ENVIRONMENT or another
+    // non-target classification, so CAN-B1-03/CAN-B1-04 blocked/classified
+    // tasks correctly reflect the TARGET_APP_DEFECT cause.
+    if (looksLikeServerProductsListError(outcome.cause || '') ||
+        looksLikeServerProductsListError(outcome.classification || '')) {
+      outcome.classification = CLASS_TARGET_APP_DEFECT;
+      outcome.cause = "repair required: Shop API products list fails server-side (Postgres: product.id != $3 with $3='undefined')";
+    }
+    return;
+  }
+  // Chain-level cause (no specific problem task) may still carry the integer
+  // error and must be reclassified the same way.
+  if (looksLikeServerProductsListError(outcome.cause || '') ||
+      looksLikeServerProductsListError(outcome.classification || '')) {
+    outcome.classification = CLASS_TARGET_APP_DEFECT;
+    outcome.cause = "repair required: Shop API products list fails server-side (Postgres: product.id != $3 with $3='undefined')";
     return;
   }
   outcome.cause = summary.cause || null;
@@ -1205,13 +1223,16 @@ function writeAggregatedSummary(cfg, preflight, stages, seed) {
       }
     });
   }
-  // Keep all seed fields intact except override failed to a count for the
+  // Keep all seed fields intact except override failed/blocked to counts for the
   // public record.  hasOtherSeedFailure (called before this function) reads
-  // seed.failed directly as an array; that is unchanged here.
+  // seed.failed and seed.blocked directly as arrays; those are unchanged here.
   var seedForSummary = seed
     ? { ...seed,
         failed: Array.isArray(seed.failed) ? seed.failed.length
-          : (typeof seed.failed === 'number' ? seed.failed : 0) }
+          : (typeof seed.failed === 'number' ? seed.failed : 0),
+        blocked: Array.isArray(seed.blocked) ? seed.blocked.length
+          : (typeof seed.blocked === 'number' ? seed.blocked : 0),
+        blockedEntries: seed.blocked || [] }
     : undefined;
   const summary = {
     schemaVersion: '1.0',
@@ -1562,6 +1583,7 @@ export {
   classifySeedFailure,
   applySeedClassification,
   buildBlockedStageForSeed,
+  classifyStage,
   CLASS_DEPENDENCY,
   CLASS_CLIENT_INPUT,
   CLASS_PIPELINE_DEFECT

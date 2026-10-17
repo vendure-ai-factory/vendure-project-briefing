@@ -233,6 +233,43 @@ function generateReport(runId, options) {
       } else {
         resultValue = null;
       }
+      // seedTaskOk: seed task counts as passing only when both the evidence
+      // was readable (vTask.ok) AND the seed itself succeeded (seedValue.ok).
+      var seedTaskOk = (seedValue && seedValue.ok === true) && vTask.ok && resultValue !== null;
+      var seedOutcomeValue = resultValue !== null ? resultValue : MISSING_EVIDENCE;
+      var seedEntry = {
+        ok: seedTaskOk,
+        outcome: seedOutcomeValue,
+        result: resultValue,
+        coverage: record.coverage || null,
+        coverageAssertions: record.coverageAssertions || null,
+        classification: record.classification || null,
+        cause: record.cause || null,
+        repairHistory: record.repairHistory || [],
+        manualIntervention: record.manualIntervention || null,
+        protectedStartHash: startHash,
+        protectedEndHash: endHash,
+        protectedHashesMatch: hashesMatch,
+        endHashMatchesPinned: endMatchesPinned,
+        files: vTask.files
+      };
+      if (seedValue && Array.isArray(seedValue.blocked) && seedValue.blocked.length > 0) {
+        seedEntry.blockedEntries = seedValue.blocked;
+      }
+      report.tasks[taskId] = seedEntry;
+      report.protectedPathHashes.tasks[taskId] = {
+        start: startHash,
+        end: endHash,
+        match: hashesMatch,
+        endMatchesPinned: endMatchesPinned
+      };
+      // Seed task contributes to report.ok only when evidence was verifiable.
+      // The seed's own ok:false status is carried in outcome (BLOCK), not report.ok.
+      var seedForAllTasksOk = vTask.ok && resultValue !== null;
+      if (!seedForAllTasksOk) {
+        allTasksOk = false;
+      }
+      continue;
     }
 
     // A task is MISSING_EVIDENCE (never a passing outcome) only when its
@@ -367,6 +404,14 @@ function renderMarkdownReport(report) {
     lines.push('- result: ' + (entry.result || 'n/a'));
     lines.push('- classification: ' + (entry.classification || 'n/a'));
     lines.push('- cause: ' + (entry.cause || 'n/a'));
+    if (entry.blockedEntries && entry.blockedEntries.length > 0) {
+      lines.push('- blocked: ' + entry.blockedEntries.length + ' entity/entities');
+      entry.blockedEntries.forEach(function(b) {
+        var entity = b.entity || 'unknown';
+        var error = b.error || 'n/a';
+        lines.push('  - entity: ' + entity + '; error: ' + error);
+      });
+    }
     lines.push('- protectedStartHash: ' + (entry.protectedStartHash || 'n/a'));
     lines.push('- protectedEndHash: ' + (entry.protectedEndHash || 'n/a'));
     lines.push('- protectedHashesMatch: ' + (entry.protectedHashesMatch === null ? 'n/a' : entry.protectedHashesMatch));

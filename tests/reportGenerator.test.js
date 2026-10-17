@@ -269,7 +269,7 @@ test('reportGenerator: a failed seed (kind seed, ok:false) reports BLOCK, never 
   var report = reportModule.generateReport(runId, opts());
   var entry = report.tasks['seed'];
   assert.ok(entry, 'seed task must be present');
-  assert.strictEqual(entry.ok, true, 'seed evidence file verified -> task ok');
+  assert.strictEqual(entry.ok, false, 'seed ok:false -> task not ok even with readable evidence');
   assert.strictEqual(entry.outcome, reportModule.RESULT_BLOCK);
   assert.strictEqual(entry.outcome === reportModule.RESULT_PASS, false, 'a failed seed must never be a passing outcome');
   assert.strictEqual(entry.classification, 'SEED_FAILED');
@@ -290,6 +290,39 @@ test('reportGenerator: tampered seed evidence stays MISSING_EVIDENCE', function(
   var entry = report.tasks['seed'];
   assert.strictEqual(entry.ok, false);
   assert.strictEqual(entry.outcome, evidenceCollector.MISSING_EVIDENCE);
+  removeRun(runId);
+  done();
+});
+
+test('reportGenerator: seed.blocked entries appear in compliance-report.md', function(t, done) {
+  wipeAll();
+  var runId = 'rg-seedblocked-' + Date.now();
+  evidenceCollector.initEvidenceIndex(runId, {}, opts());
+  // A seed that ran but was blocked on customer creation (HMAC derivation
+  // requires SEED_TEST_CUSTOMER_PASSWORD which was absent).  The blocked[]
+  // array must appear in the generated compliance-report.md.
+  evidenceCollector.writeEvidenceFile(runId, 'seed', 'seed-record.json',
+    JSON.stringify({
+      ok: false,
+      reason: 'SEED_FAILED',
+      blocked: [
+        { entity: 'customer', error: 'SEED_TEST_CUSTOMER_PASSWORD missing; HMAC derivation requires it' },
+        { entity: 'customer', error: 'SEED_TEST_CUSTOMER_PASSWORD missing; HMAC derivation requires it' }
+      ]
+    }, null, 2),
+    Object.assign({ kind: 'seed' }, opts()));
+
+  var report = reportModule.generateReport(runId, opts());
+  var entry = report.tasks['seed'];
+  assert.ok(entry, 'seed task must be present');
+  assert.strictEqual(entry.ok, false, 'seed is not ok when blocked entries exist');
+  assert.strictEqual(entry.blockedEntries.length, 2, 'blockedEntries must have 2 entries');
+
+  var md = reportModule.renderMarkdownReport(report);
+  assert.ok(md.indexOf('blocked: 2 entity/entities') !== -1,
+    'blocked count must appear in markdown, got: ' + md);
+  assert.ok(md.indexOf('entity: customer; error:') !== -1,
+    'blocked entity/error details must appear in markdown');
   removeRun(runId);
   done();
 });
