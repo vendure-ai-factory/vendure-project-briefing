@@ -60,6 +60,19 @@ jobs:
           test -r /opt/pipeline-archive
           test -w /opt/pipeline-archive
 
+      - name: Verify bounded staging log access via Runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_user="$(id -un)"
+          if [[ "$runner_user" != "gha-runner" ]]; then
+            echo "::error::Expected the self-hosted job to run as gha-runner; got $runner_user"
+            exit 1
+          fi
+          sudo -n /usr/local/sbin/pipeline-staging-ops logs vendure
+          sudo -n /usr/local/sbin/pipeline-staging-ops logs worker
+          sudo -n /usr/local/sbin/pipeline-staging-ops logs postgres
+
       - name: Check staging health endpoint
         shell: bash
         run: |
