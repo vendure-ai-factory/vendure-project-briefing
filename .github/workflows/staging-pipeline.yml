@@ -69,7 +69,7 @@ jobs:
             echo "::error::Expected the self-hosted job to run as gha-runner; got $runner_user"
             exit 1
           fi
-          sudo -n /usr/local/sbin/pipeline-staging-ops logs vendure/worker
+          for target in vendure worker postgres; do sudo -n /usr/local/sbin/pipeline-staging-ops logs "$target" >/dev/null; done
 
       - name: Check staging health endpoint
         shell: bash
