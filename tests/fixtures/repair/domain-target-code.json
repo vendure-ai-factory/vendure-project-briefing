@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "message": "TypeError: Cannot read properties of undefined (reading 'id')\n    at computeId (~/checkout-worker/index.js:42:8)\n    at run (~/checkout-worker/dist/main.js:115:3)\n    at processTicksAndRejections (node:internal/process/task_hooks:37:5)",
+      "path": ["product"],
+      "extensions": {}
+    }
+  ]
+}

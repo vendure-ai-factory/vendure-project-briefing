@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "message": "403 Forbidden: Access to this resource is denied",
+      "path": null,
+      "extensions": {}
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "errors": [
+    {
+      "message": "Field \"filter\" is not defined on type \"ProductConnection\"; did you mean \"filters\"?",
+      "path": ["products"],
+      "extensions": {
+        "code": "GRAPHQL_VALIDATION_FAILED"
+      }
+    }
+  ]
+}

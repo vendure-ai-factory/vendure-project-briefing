@@ -1,0 +1,12 @@
+{
+  "errors": [
+    {
+      "message": "relation \"nonexistent\" does not exist",
+      "path": null,
+      "extensions": {
+        "code": "42P01"
+      }
+    }
+  ],
+  "logExcerpt": "ERROR: relation \"nonexistent\" does not exist\nSQLSTATE: 42P01\nSTATEMENT: SELECT * FROM nonexistent WHERE id = $1"
+}

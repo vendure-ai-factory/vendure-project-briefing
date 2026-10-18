@@ -1,0 +1,12 @@
+{
+  "errors": [
+    {
+      "message": "invalid input syntax for type integer: \"xyz\"",
+      "path": ["products"],
+      "extensions": {
+        "code": "22P02"
+      }
+    }
+  ],
+  "logExcerpt": "ERROR: invalid input syntax for type integer: \"xyz\"\nSQLSTATE: 22P02\nCONTEXT: unnamed portal parameter $2\nSTATEMENT: SELECT * FROM \"product\" WHERE \"id\" = $2"
+}

@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "message": "TypeError: Cannot read properties of undefined (reading 'id')\n    at resolver (~/src/plugins/vendor-dashboard/vendor.resolver.ts:55:11)\n    at processTicksAndRejections (node:internal/process/task_hooks:37:5)",
+      "path": null,
+      "extensions": {}
+    }
+  ]
+}

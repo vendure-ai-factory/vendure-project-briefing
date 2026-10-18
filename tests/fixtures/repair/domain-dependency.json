@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "message": "TypeError: Cannot read properties of undefined (reading 'id')\n    at NpgsqlConnector.connect (~/node_modules/@nopg/core/connector.js:88:15)\n    at async VendorDashboard.resolver (~/src/plugins/vendor-dashboard/vendor.resolver.ts:134:5)\n    at run (~/src/run.js:115:3)",
+      "path": null,
+      "extensions": {}
+    }
+  ]
+}

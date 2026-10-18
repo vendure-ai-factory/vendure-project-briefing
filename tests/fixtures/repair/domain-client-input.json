@@ -1,0 +1,11 @@
+{
+  "errors": [
+    {
+      "message": "Variable \"$id\" got invalid value undefined; Expected non-nullable type \"ID!\"",
+      "path": ["variableValues", "$id"],
+      "extensions": {
+        "code": "GRAPHQL_VALIDATION_FAILED"
+      }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "message": "Error: Cannot find module\n    at Module._resolveFilename (node:internal/modules:613:15)\n    at resolver (/app/dist/plugins/nail-customization/index.ts:80:5)",
+      "path": null,
+      "extensions": {}
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "message": "TypeError: Cannot read properties of undefined (reading 'id')\n    at loadCheckpoint (~/src/evidenceCollector.js:88:15)\n    at async execute (~/src/executor.js:115:3)\n    at run (~/src/run.js:220:10)",
+      "path": null,
+      "extensions": {}
+    }
+  ]
+}
