@@ -1,4 +1,5 @@
 'use strict';
+'use strict';
 
 var fs = require('fs');
 var path = require('path');
@@ -249,12 +250,11 @@ function scoreMatch(match, finding, allPatterns) {
  */
 function getPackageDependencies(targetRoot) {
   var pkgPath = path.join(targetRoot, 'package.json');
+  var deps = {};
   try {
     var content = fs.readFileSync(pkgPath, 'utf8');
     var pkg = JSON.parse(content);
-    var deps = {};
 
-    // Collect dependencies, devDependencies, peerDependencies with exact versions
     var sources = ['dependencies', 'devDependencies', 'peerDependencies'];
     for (var i = 0; i < sources.length; i++) {
       var source = sources[i];
@@ -263,17 +263,271 @@ function getPackageDependencies(targetRoot) {
         for (var j = 0; j < keys.length; j++) {
           var name = keys[j];
           var version = pkg[source][name];
-          // Only include exact versions (no ranges like ^, ~, etc.)
           if (version && !/^[\^~>=<]/.test(version)) {
             deps[name] = version;
           }
         }
       }
     }
-    return deps;
   } catch (err) {
+    deps = {};
+  }
+  // Prefer exact installed versions from the lockfile for anything that was
+  // pinned with a range in package.json.
+  var lockVersions = getLockfileVersions(targetRoot);
+  var lockKeys = Object.keys(lockVersions);
+  for (var li = 0; li < lockKeys.length; li++) {
+    deps[lockKeys[li]] = lockVersions[lockKeys[li]];
+  }
+  return deps;
+}
+
+/**
+ * Protected paths the locator must never search or read.
+ */
+var PROTECTED_PATHS = [
+  'manifest/acceptance-manifest.v0.4.json',
+  'manifest/inputs-registry.json',
+  'evaluation-demo/migration-input'
+];
+
+function isProtectedPath(absPath) {
+  var norm = path.normalize(absPath).replace(/\\/g, '/');
+  for (var i = 0; i < PROTECTED_PATHS.length; i++) {
+    var p = PROTECTED_PATHS[i];
+    if (norm === p || norm.indexOf('/' + p) !== -1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Parse finding.stack into [{ file, line }] frames.
+ * Accepts a string stack trace or an array of { file, line } objects.
+ */
+function extractStackFrames(finding) {
+  if (!finding || !finding.stack) return [];
+  var frames = [];
+  var stack = finding.stack;
+  if (typeof stack === 'string') {
+    var lines = stack.split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var match = /\(([^()]+):(\d+):\d+\)/.exec(lines[i]) ||
+        /^\s*at\s+([^:]+):(\d+):\d+/.exec(lines[i]) ||
+        /([^\s()]+\.(?:js|mjs|ts|cjs)):(\d+)/.exec(lines[i]);
+      if (match) {
+        frames.push({ file: match[1], line: parseInt(match[2], 10) });
+      }
+    }
+  } else if (Array.isArray(stack)) {
+    for (var j = 0; j < stack.length; j++) {
+      var f = stack[j];
+      if (f && f.file && f.line) {
+        frames.push({ file: String(f.file), line: parseInt(f.line, 10) });
+      }
+    }
+  }
+  return frames;
+}
+
+/**
+ * Resolve a stack frame file path against targetRoot or the repo root,
+ * falling back to interpreting it as an absolute path.
+ */
+function isSecretsName(absPath) {
+  var base = path.basename(absPath);
+  if (/^\.env\b/.test(base)) return true;
+  if (/\.pem$/.test(base)) return true;
+  if (/^id_/.test(base)) return true;
+  return false;
+}
+
+/**
+ * Resolve a stack frame file path against targetRoot or the repo root,
+ * falling back to interpreting it as an absolute path.
+ * Rejects: path traversal (..), protected paths, .git dirs, secrets names,
+ * paths resolving outside the respective root.
+ */
+function resolveFramePath(frameFile, targetRoot, repoRoot) {
+  if (!frameFile) return null;
+  if (frameFile.indexOf('..') !== -1) return null;
+
+  var roots = [];
+  if (targetRoot) roots.push({ root: targetRoot, label: 'target' });
+  if (repoRoot) roots.push({ root: repoRoot, label: 'pipeline' });
+
+  for (var i = 0; i < roots.length; i++) {
+    var r = roots[i];
+    var abs = path.resolve(r.root, frameFile);
+
+    var realAbs;
+    try { realAbs = fs.realpathSync(abs); }
+    catch (e) {
+      // non-existent or broken symlink — skip
+      return null;
+    }
+
+    var realNorm = realAbs.replace(/\\/g, '/');
+    var rootNorm = r.root.replace(/\\/g, '/');
+
+    if (!realNorm.startsWith(rootNorm + '/') && realNorm !== rootNorm) {
+      continue;
+    }
+    if (realNorm.includes('/.git/') || realNorm.endsWith('/.git')) return null;
+    if (isSecretsName(realAbs)) return null;
+    if (isProtectedPath(realAbs)) return null;
+
+    try { if (fs.statSync(realAbs).isFile()) return realAbs; } catch (e) { /* skip */ }
+  }
+
+  if (path.isAbsolute(frameFile)) {
+    var absRaw = path.resolve(frameFile);
+    var realRaw;
+    try { realRaw = fs.realpathSync(absRaw); }
+    catch (e) { return null; }
+    var realRawNorm = realRaw.replace(/\\/g, '/');
+    if (realRawNorm.includes('/.git/') || realRawNorm.endsWith('/.git')) return null;
+    if (isSecretsName(realRaw)) return null;
+    if (isProtectedPath(realRaw)) return null;
+    try { if (fs.statSync(realRaw).isFile()) return realRaw; } catch (e) { /* skip */ }
+  }
+
+  return null;
+}
+
+/**
+ * Context lines around a line number with a caller-specified window.
+ */
+function getWideContextLines(filePath, targetLine, before, after) {
+  var lines = [];
+  try {
+    var content = fs.readFileSync(filePath, 'utf8');
+    var all = content.split('\n');
+    var start = Math.max(0, targetLine - 1 - before);
+    var end = Math.min(all.length - 1, targetLine - 1 + after);
+    for (var i = start; i <= end; i++) {
+      lines.push({ line: all[i], lineNumber: i + 1 });
+    }
+  } catch (e) {
+    return [];
+  }
+  return lines;
+}
+
+/**
+ * Walk up from __dirname to find the repository root (a dir containing
+ * both src/ and pipeline/).
+ */
+function findRepoRoot() {
+  var dir = path.resolve(__dirname);
+  for (var i = 0; i < 10; i++) {
+    if (fs.existsSync(path.join(dir, 'pipeline')) && fs.existsSync(path.join(dir, 'src'))) {
+      return dir;
+    }
+    var parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * Read exact installed versions from the target's lockfile (package-lock.json),
+ * covering both the legacy dependencies map and the packages map.
+ */
+function getLockfileVersions(targetRoot) {
+  var versions = {};
+  var lockPath = path.join(targetRoot, 'package-lock.json');
+  try {
+    var lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    var deps = lock.dependencies || {};
+    var depKeys = Object.keys(deps);
+    for (var i = 0; i < depKeys.length; i++) {
+      if (deps[depKeys[i]] && deps[depKeys[i]].version) {
+        versions[depKeys[i]] = deps[depKeys[i]].version;
+      }
+    }
+    var packages = lock.packages || {};
+    var pkgKeys = Object.keys(packages);
+    for (var j = 0; j < pkgKeys.length; j++) {
+      var name = pkgKeys[j].replace(/^node_modules\//, '');
+      if (name && name.indexOf('/') === -1 && packages[pkgKeys[j]] && packages[pkgKeys[j]].version &&
+          !versions[name]) {
+        versions[name] = packages[pkgKeys[j]].version;
+      }
+    }
+  } catch (e) {
     return {};
   }
+  return versions;
+}
+
+/**
+ * Collect files for the pattern search: target src/, migrations/, config
+ * files, package.json and (for domain=pipeline) this repo's src/ and
+ * pipeline/, always skipping protected paths.
+ */
+function addConfigFiles(targetRoot, targets, searched) {
+  try {
+    var entries = fs.readdirSync(targetRoot, { withFileTypes: true });
+    for (var i = 0; i < entries.length; i++) {
+      var e = entries[i];
+      var full = path.join(targetRoot, e.name);
+      if (e.isFile() && /\.config\.(?:js|cjs|mjs|ts|json)$/.test(e.name)) {
+        if (searched.indexOf(full) === -1) {
+          targets.push(full);
+          searched.push(full);
+        }
+      } else if (e.isDirectory() && e.name === 'config') {
+        var found = findSourceFiles(full, searched);
+        for (var j = 0; j < found.length; j++) {
+          targets.push(found[j]);
+        }
+      }
+    }
+  } catch (err) { /* ignore unreadable dirs */ }
+}
+
+function collectSearchTargets(targetRoot, finding, searched) {
+  var targets = [];
+  // Target src/
+  var srcDir = path.join(targetRoot, 'src');
+  if (fs.existsSync(srcDir)) {
+    targets = targets.concat(findSourceFiles(srcDir, searched));
+  }
+  // Migrations dir
+  var migrationsDir = path.join(targetRoot, 'migrations');
+  if (fs.existsSync(migrationsDir)) {
+    targets = targets.concat(findSourceFiles(migrationsDir, searched));
+  }
+  // Config files and config/ dir
+  addConfigFiles(targetRoot, targets, searched);
+  // package.json itself
+  var pkgJson = path.join(targetRoot, 'package.json');
+  try {
+    if (fs.statSync(pkgJson).isFile() && searched.indexOf(pkgJson) === -1) {
+      targets.push(pkgJson);
+      searched.push(pkgJson);
+    }
+  } catch (e) { /* no package.json */ }
+  // For domain=pipeline, also search THIS repo's src/ and pipeline/.
+  if (finding && finding.domain === 'pipeline') {
+    var repoRoot = findRepoRoot();
+    if (repoRoot) {
+      ['src', 'pipeline'].forEach(function(sub) {
+        var dir = path.join(repoRoot, sub);
+        if (!fs.existsSync(dir)) return;
+        var found = findSourceFiles(dir, []);
+        for (var i = 0; i < found.length; i++) {
+          if (isProtectedPath(found[i])) continue;
+          targets.push(found[i]);
+          if (searched.indexOf(found[i]) === -1) searched.push(found[i]);
+        }
+      });
+    }
+  }
+  return targets;
 }
 
 /**
@@ -409,34 +663,61 @@ async function locateCandidates(options) {
   }
 
   var patterns = deriveSearchPatterns(finding);
+  var frames = extractStackFrames(finding);
+
+  // (1) Stack-driven search: load the frame files first with a wide (+-30 line)
+  // context window.  The observed failure sites rank above pattern-only hits.
+  if (frames.length > 0) {
+    var repoRoot = findRepoRoot();
+    for (var fi = 0; fi < frames.length; fi++) {
+      var frame = frames[fi];
+      var frameFile = resolveFramePath(frame.file, targetRoot, repoRoot);
+      if (!frameFile || isProtectedPath(frameFile)) {
+        continue;
+      }
+      var frameContext = getWideContextLines(frameFile, frame.line, 30, 30);
+      if (frameContext.length === 0) {
+        continue;
+      }
+      candidates.push({
+        source: 'stack',
+        package: null,
+        file: frameFile,
+        line: frame.line,
+        snippet: frameContext,
+        score: 1000 - fi,
+        reasons: ['finding.stack frame'],
+        why: 'frame in finding.stack at ' + frameFile + ':' + frame.line
+      });
+    }
+  }
+
   if (patterns.length === 0) {
     return { candidates: candidates, searched: searched };
   }
 
-  // Search targetRoot/src first
-  var srcDir = path.join(targetRoot, 'src');
-  if (fs.existsSync(srcDir)) {
-    var sourceFiles = findSourceFiles(srcDir, searched);
+  // (2)+(3)+(4) Pattern search over src/, migrations/, config files,
+  // package.json and (for domain=pipeline) this repo's src/ and pipeline/.
+  var searchTargets = collectSearchTargets(targetRoot, finding, searched);
+  for (var st = 0; st < searchTargets.length; st++) {
+    var filePath = searchTargets[st];
+    var matches = searchFileForPatterns(filePath, patterns);
 
-    for (var i = 0; i < sourceFiles.length; i++) {
-      var filePath = sourceFiles[i];
-      var matches = searchFileForPatterns(filePath, patterns);
+    for (var mj = 0; mj < matches.length; mj++) {
+      var match = matches[mj];
+      var context = getContextLines(filePath, match.lineNumber, match.matchedPattern);
+      var score = scoreMatch({ line: match.line, lineNumber: match.lineNumber, matchedPattern: match.matchedPattern, file: filePath }, finding, patterns);
 
-      for (var j = 0; j < matches.length; j++) {
-        var match = matches[j];
-        var context = getContextLines(filePath, match.lineNumber, match.matchedPattern);
-        var score = scoreMatch({ line: match.line, lineNumber: match.lineNumber, matchedPattern: match.matchedPattern, file: filePath }, finding, patterns);
-
-        candidates.push({
-          source: 'target',
-          package: null,
-          file: filePath,
-          line: match.lineNumber,
-          snippet: context.snippet,
-          score: score,
-          reasons: [match.matchedPattern]
-        });
-      }
+      candidates.push({
+        source: 'target',
+        package: null,
+        file: filePath,
+        line: match.lineNumber,
+        snippet: context.snippet,
+        score: score,
+        reasons: [match.matchedPattern],
+        why: 'pattern "' + match.matchedPattern + '" matched in ' + filePath + ':' + match.lineNumber
+      });
     }
   }
 
@@ -444,7 +725,7 @@ async function locateCandidates(options) {
   candidates.sort(function(a, b) { return b.score - a.score; });
 
   // Check if we have a strong match (score >= 6)
-  var hasStrongMatch = candidates.length > 0 && candidates[0].score >= 6;
+  var hasStrongMatch = candidates.length > 0 && (candidates[0].score >= 6 || candidates[0].source === 'stack');
 
   // If no strong match, search in package dependencies
   if (!hasStrongMatch) {
@@ -494,7 +775,8 @@ async function locateCandidates(options) {
                           line: pkgMatch.lineNumber,
                           snippet: pkgContext.snippet,
                           score: pkgScore,
-                          reasons: [pkgMatch.matchedPattern]
+                          reasons: [pkgMatch.matchedPattern],
+                          why: 'pattern "' + pkgMatch.matchedPattern + '" matched in dependency ' + pkgName + '@' + pkgVersion
                         });
                         if (searched.indexOf(full) === -1) {
                           searched.push(full);

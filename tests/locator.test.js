@@ -421,3 +421,166 @@ test('locator: DIFFERENT fixture (order resolver with Not) ranks correctly', asy
   fs.rmSync(targetRoot, { recursive: true, force: true });
   fs.rmSync(pkgDir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// Fixture 1 — SOURCE BUG: bug is in the target's own src/.
+// finding.stack drives the search; a +-30-line snippet and 'why' required.
+// ---------------------------------------------------------------------------
+test('locator: source-bug fixture — stack frames load +-30-line snippets and rank first', async function() {
+  var workspaceDir = createTempDir();
+  var targetRoot = createTempDir();
+
+  fs.writeFileSync(path.join(targetRoot, 'package.json'), JSON.stringify({ name: 'test-target', version: '1.0.0', dependencies: {} }, null, 2));
+
+  var srcDir = path.join(targetRoot, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+
+  // Create a source file with enough lines that the +-30 context is meaningful.
+  // The bug is on line 50.
+  var lines = [];
+  for (var l = 1; l <= 60; l++) {
+    if (l === 50) {
+      lines.push('  const filter = { id: { notEq: `${someVar}` } };');
+    } else if (l === 20) {
+      lines.push('async function productsQuery(root, args, ctx) {');  // match by path name
+    } else {
+      lines.push('// line ' + l);
+    }
+  }
+  fs.writeFileSync(path.join(srcDir, 'products-query.ts'), lines.join('\n'));
+
+  var fakeFetch = function(name, version, dir) { return Promise.resolve(createTempDir()); };
+
+  // finding with a stack that points to line 50 of products-query.ts
+  var finding = {
+    operator: '!=',
+    column: 'id',
+    path: 'products',
+    stack: [
+      { file: path.join(srcDir, 'products-query.ts'), line: 50 },
+      { file: path.join(srcDir, 'index.ts'), line: 10 }
+    ]
+  };
+
+  var result = await locator.locateCandidates({
+    finding: finding,
+    targetRoot: targetRoot,
+    fetchPackage: fakeFetch,
+    maxCandidates: 5,
+    runId: 'test-src-bug-' + Date.now(),
+    workspaceDir: workspaceDir
+  });
+
+  var stackCandidates = result.candidates.filter(function(c) { return c.source === 'stack'; });
+  assert.ok(stackCandidates.length >= 1, 'should have at least one stack candidate; got: ' + stackCandidates.length);
+
+  // First stack candidate must be the line-50 frame (highest score)
+  var top = stackCandidates[0];
+  assert.strictEqual(top.file.indexOf('products-query.ts') !== -1, true, 'top candidate should be products-query.ts');
+  assert.strictEqual(top.line, 50, 'top candidate should be at line 50 from stack');
+  assert.ok(Array.isArray(top.snippet) && top.snippet.length > 0, 'snippet must not be empty');
+  assert.ok(top.snippet.length <= 61, 'snippet should have at most +-30 context lines; got: ' + top.snippet.length);
+  assert.ok(top.why && typeof top.why === 'string' && top.why.length > 0, 'why must be a non-empty string; got: ' + top.why);
+  assert.strictEqual(top.reasons.indexOf('finding.stack frame') !== -1, true, 'reasons should include stack frame');
+
+  // Stack candidate must outrank any pattern-only candidate
+  var patternCandidates = result.candidates.filter(function(c) { return c.source === 'target'; });
+  if (patternCandidates.length > 0) {
+    assert.ok(top.score > patternCandidates[0].score, 'stack candidate should outrank pattern-only candidates (score ' + top.score + ' vs ' + patternCandidates[0].score + ')');
+  }
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Fixture 2 — DEPENDENCY BUG: bug is in a package dependency.
+// finding.stack may be empty; lockfile version must be used; 'why' required.
+// ---------------------------------------------------------------------------
+test('locator: dependency-bug fixture — lockfile version used and why field present', async function() {
+  var workspaceDir = createTempDir();
+  var targetRoot = createTempDir();
+
+  // package.json uses a range (^1.0.0) — locator must upgrade from lockfile
+  fs.writeFileSync(path.join(targetRoot, 'package.json'), JSON.stringify({
+    name: 'test-target',
+    version: '1.0.0',
+    dependencies: { 'fake-inventory-svc': '^1.0.0' }
+  }, null, 2));
+
+  // package-lock.json pins the exact installed version
+  fs.writeFileSync(path.join(targetRoot, 'package-lock.json'), JSON.stringify({
+    dependencies: {
+      'fake-inventory-svc': { version: '1.2.3', resolved: 'https://registry.npmjs.org/fake-inventory-svc/-/fake-inventory-svc-1.2.3.tgz', integrity: 'sha abc' }
+    },
+    packages: {
+      'node_modules/fake-inventory-svc': { version: '1.2.3' }
+    }
+  }, null, 2));
+
+  var srcDir = path.join(targetRoot, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'index.js'), '// no matching patterns here\n');
+
+  // Create the fake dependency with inventory bug pattern
+  var pkgDir = createTempDir();
+  var distDir = path.join(pkgDir, 'dist');
+  fs.mkdirSync(distDir, { recursive: true });
+
+  var svcCode = [
+    '// fake-inventory-svc v1.2.3',
+    'async function inventory(ctx, args) {',
+    '  const storeId = await this.storeService.getStoreId(ctx);',
+    "  const filter = { store: { ne: `${storeId}` }, enabled: true };",
+    '  return this.db.query(filter);',
+    '}'
+  ].join('\n');
+  fs.writeFileSync(path.join(distDir, 'inventory-svc.js'), svcCode);
+  fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: 'fake-inventory-svc', version: '1.2.3' }, null, 2));
+
+  var fetchCalls = [];
+  var fakeFetch = function(name, version, dir) {
+    fetchCalls.push({ name: name, version: version });
+    return Promise.resolve(pkgDir);
+  };
+
+  // finding with NO stack (fall through to pattern search on dependency)
+  var finding = {
+    operator: '!=',
+    column: 'store.id',
+    path: 'inventory'
+  };
+
+  var result = await locator.locateCandidates({
+    finding: finding,
+    targetRoot: targetRoot,
+    fetchPackage: fakeFetch,
+    maxCandidates: 5,
+    runId: 'test-dep-bug-' + Date.now(),
+    workspaceDir: workspaceDir
+  });
+
+  // The package MUST have been fetched with the lockfile version (1.2.3), not the range (^1.0.0)
+  var depCalls = fetchCalls.filter(function(f) { return f.name === 'fake-inventory-svc'; });
+  assert.strictEqual(depCalls.length > 0, true, 'fake-inventory-svc should have been fetched');
+  assert.strictEqual(depCalls[0].version, '1.2.3', 'version must come from lockfile (1.2.3), not package.json range (^1.0.0); got: ' + depCalls[0].version);
+
+  // Must find a dependency candidate
+  var depCandidates = result.candidates.filter(function(c) { return c.source === 'dependency'; });
+  assert.ok(depCandidates.length > 0, 'should have dependency candidates from the inventory-svc fixture');
+
+  // Every dependency candidate must carry a non-empty 'why' string
+  depCandidates.forEach(function(c, i) {
+    assert.ok(c.why && typeof c.why === 'string' && c.why.length > 0, 'dependency candidate [' + i + '] why must be non-empty string; got: ' + c.why);
+  });
+
+  // Candidate entries must have 'source', 'package', 'file', 'line', 'snippet', 'score', 'reasons', 'why'
+  var top = result.candidates[0];
+  assert.ok(top.package && top.package.indexOf('fake-inventory-svc') !== -1, 'top package should be fake-inventory-svc; got: ' + top.package);
+  assert.strictEqual(typeof top.score, 'number', 'score must be a number');
+  assert.ok(Array.isArray(top.reasons) && top.reasons.length > 0, 'reasons must be a non-empty array');
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+  fs.rmSync(pkgDir, { recursive: true, force: true });
+});
