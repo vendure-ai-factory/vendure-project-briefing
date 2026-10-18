@@ -2182,8 +2182,72 @@ async function ensureCustomers(context, state, fetchFn, adminUrl, authToken, sec
  *   (d) products(options:{take:1}) { items { id variants { id } } }
  *   (e) products(options:{take:1}) { items { id variants { price currencyCode } } }
  */
+/**
+ * Build the stored record for one readback ladder step.  Adds read-only
+ * diagnostics (query text, request header NAMES without values, whether an
+ * Authorization header was sent, http status, and the first 300 chars of the
+ * response body) while preserving the exact existing ok/error semantics.
+ */
+function ladderStepRecord(step, res, callSecrets) {
+  var record = {
+    ok: true,
+    query: step.query
+  };
+  var body = res.response && res.response.body;
+  var data = body && body.data;
+  var errMsg = null;
+  if (hasTopLevelGraphqlErrors(res)) {
+    var topErrors = body.errors;
+    var first = topErrors && topErrors[0];
+    errMsg = redactValue((first && (first.message || first.errorCode)) || 'GraphQL error', callSecrets);
+  } else if (!body || !data) {
+    errMsg = redactValue('no data in response', callSecrets);
+  } else {
+    var missingField = null;
+    if (step.key === 'a') {
+      if (!data.activeChannel) missingField = 'activeChannel';
+    } else if (step.key === 'b') {
+      if (!data.products) missingField = 'products';
+    } else if (!data.products || !data.products.items) {
+      missingField = 'products.items';
+    }
+    if (missingField) errMsg = redactValue('missing field in response: ' + missingField, callSecrets);
+  }
+  record.httpStatus = res.response ? res.response.httpStatus : null;
+  var req = res.request || {};
+  var headers = (req.headers && typeof req.headers === 'object') ? req.headers : {};
+  var names = Object.keys(headers);
+  record.requestHeaders = names.slice().sort();
+  record.authorizationSent = names.some(function(h) {
+    return String(h).toLowerCase() === 'authorization' || String(h).toLowerCase() === 'vendure-auth-token';
+  });
+  var text = res.response && res.response.text ? String(res.response.text) : '';
+  record.responseBody = redactValue(text.slice(0, 300), callSecrets);
+  if (errMsg) {
+    record.ok = false;
+    record.error = errMsg;
+  }
+  return record;
+}
+
 async function readbackLadder(context, state, fetchFn, adminUrl, authToken, secrets, spec, channelTokenById) {
   state.readbackLadder = [];
+
+  // The ladder reads back through the Shop API (the same endpoint/URL the readback
+  // check uses), with the channel's vendure-token header and NO admin
+  // Authorization.  The confirmed failure is a Shop API products-list error,
+  // so probing the Admin API would miss it.
+  var shopBase = null;
+  if (context && context.shopApiUrl) shopBase = context.shopApiUrl;
+  if (!shopBase) {
+    var stagingBase = (context && context.runEnvRecord && context.runEnvRecord.stagingUrl) ||
+      (context && context.stagingUrl);
+    if (typeof stagingBase === 'string' && stagingBase.length > 0) {
+      shopBase = stagingBase.replace(/\/+$/, '') + '/shop-api';
+    } else {
+      shopBase = adminUrl.replace(/\/admin-api$/, '/shop-api');
+    }
+  }
 
   var contexts = [];
   for (var ci = 0; ci < spec.countries.length; ci++) {
@@ -2215,44 +2279,22 @@ async function readbackLadder(context, state, fetchFn, adminUrl, authToken, secr
         continue;
       }
       try {
-        var res = await adminGraphqlRequest(fetchFn, adminUrl, {
+        var res = await adminGraphqlRequest(fetchFn, shopBase, {
           query: step.query,
           variables: {}
-        }, authToken, callSecrets, ctx.token);
+        }, null, callSecrets, ctx.token);
         bumpRequests(state);
-        var body = res.response && res.response.body;
-        var data = body && body.data;
-        var errMsg = null;
-        if (hasTopLevelGraphqlErrors(res)) {
-          var topErrors = body.errors;
-          var first = topErrors && topErrors[0];
-          errMsg = redactValue((first && (first.message || first.errorCode)) || 'GraphQL error', callSecrets);
-        } else if (!body || !data) {
-          errMsg = redactValue('no data in response', callSecrets);
-        } else {
-          // Validate the step's queried field is actually present.  A server
-          // products-list error can return data truthy but products:null, which
-          // must be a failed step, not a silent ok:true.
-          var missingField = null;
-          if (step.key === 'a') {
-            if (!data.activeChannel) missingField = 'activeChannel';
-          } else if (step.key === 'b') {
-            if (!data.products) missingField = 'products';
-          } else if (!data.products || !data.products.items) {
-            missingField = 'products.items';
-          }
-          if (missingField) errMsg = redactValue('missing field in response: ' + missingField, callSecrets);
-        }
-        var httpStatus = res.response ? res.response.httpStatus : null;
-        if (errMsg) {
-          entry.steps[step.key] = { ok: false, error: errMsg, httpStatus: httpStatus };
+        var stepRecord = ladderStepRecord(step, res, callSecrets);
+        stepRecord.endpoint = 'shop';
+        if (!stepRecord.ok) {
+          entry.steps[step.key] = stepRecord;
           stoppedAt = step.key;
           break;
-        } else {
-          entry.steps[step.key] = { ok: true };
         }
+        entry.steps[step.key] = stepRecord;
       } catch (e) {
-        entry.steps[step.key] = { ok: false, error: redactValue((e && e.message) || String(e), callSecrets), httpStatus: null };
+        entry.steps[step.key] = { ok: false, error: redactValue((e && e.message) || String(e), callSecrets), httpStatus: null,
+          query: step.query, requestHeaders: [], authorizationSent: false, responseBody: '', endpoint: 'shop' };
         stoppedAt = step.key;
         break;
       }
@@ -2786,6 +2828,9 @@ module.exports = {
   gitHeadOf: gitHeadOf,
   referenceCommitOf: referenceCommitOf,
   protectedPathsHashOf: protectedPathsHashOf,
+  readbackLadder: readbackLadder,
+  adminGraphqlRequest: adminGraphqlRequest,
+  hasTopLevelGraphqlErrors: hasTopLevelGraphqlErrors,
   SEED_HOST_NOT_ALLOWED: 'SEED_HOST_NOT_ALLOWED',
   SEED_CONFLICT: 'SEED_CONFLICT',
   ADMIN_CREDENTIALS_MISSING: 'ADMIN_CREDENTIALS_MISSING',

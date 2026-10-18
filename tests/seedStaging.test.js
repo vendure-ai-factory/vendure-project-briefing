@@ -2523,6 +2523,71 @@ test('seed: readbackLadder ok:false for integer error on products step (real sta
 
 
 // ---------------------------------------------------------------------------
+// Regression: real local HTTP server (node:http + real fetch, no mocks of
+// fetch or response objects).  The confirmed staging Shop API error body is
+//   {"errors":[{"message":"invalid input syntax for type integer: \"undefined\"","path":["products"]}],"data":null}
+// at HTTP 200.  The real readbackLadder must mark the products steps ok:false
+// and set stoppedAt, recording error and httpStatus on the failing step.
+// ---------------------------------------------------------------------------
+test('seed: readbackLadder hits the SHOP API and stops at step b on the shop integer error body', async function() {
+  var http = require('node:http');
+  var ERR_BODY = JSON.stringify({
+    errors: [{ message: 'invalid input syntax for type integer: "undefined"', path: ['products'] }],
+    data: null
+  });
+  var PRODUCTS_OK = JSON.stringify({ data: { activeChannel: { code: 'de', defaultCurrencyCode: 'EUR' }, products: { items: [{ id: 'p1', name: 'x' }], totalItems: 1 } } });
+  var server = http.createServer(function(req, res) {
+    var chunks = [];
+    req.on('data', function(c) { chunks.push(c); });
+    req.on('end', function() {
+      var raw = Buffer.concat(chunks).toString('utf8');
+      var query = '';
+      try { query = (JSON.parse(raw || '{}').query) || ''; } catch (e) {}
+      res.writeHead(200, { 'content-type': 'application/json' });
+      if (String(req.url).indexOf('/shop-api') !== -1 && query.indexOf('products') !== -1) {
+        // /shop-api products -> the real integer error body at HTTP 200.
+        res.end(ERR_BODY);
+      } else {
+        // /admin-api (or any other path) -> normal data, incl. full product data.
+        res.end(PRODUCTS_OK);
+      }
+    });
+  });
+  await new Promise(function(resolve) { server.listen(0, '127.0.0.1', resolve); });
+  var port = server.address().port;
+  try {
+    var spec = loadSpec();
+    var state = { dryRun: false, requests: 0 };
+    var channelTokenById = {};
+    spec.countries.forEach(function(c) { channelTokenById[c.channelCode] = c.channelToken; });
+    var adminUrl = 'http://127.0.0.1:' + port + '/admin-api';
+    // Real global fetch against the local server; no mocked fetch or response.
+    await seedStaging.readbackLadder({ env: {} }, state, global.fetch, adminUrl, 'auth-tok', [], spec, channelTokenById);
+
+    assert.ok(state.readbackLadder, 'ladder must be recorded');
+    assert.strictEqual(state.readbackLadder.length, 5, 'five ladder contexts (de/at/hu/gb/__default__)');
+    state.readbackLadder.forEach(function(entry) {
+      assert.strictEqual(entry.steps.a.ok, true, entry.channel + ': step a (activeChannel) is ok');
+      assert.strictEqual(entry.steps.a.endpoint, 'shop', entry.channel + ': step a is a shop read');
+      // The products step must be ok:false with the real error body from /shop-api.
+      var b = entry.steps.b;
+      assert.strictEqual(b.ok, false, entry.channel + ': step b must be ok:false, got: ' + JSON.stringify(b));
+      assert.strictEqual(b.endpoint, 'shop', entry.channel + ': step b is a shop read');
+      assert.strictEqual(b.httpStatus, 200, entry.channel + ': step b must record httpStatus 200, got: ' + b.httpStatus);
+      assert.ok(b.error.indexOf('invalid input syntax for type integer') !== -1,
+        entry.channel + ': step b error must contain the integer error text, got: ' + b.error);
+      assert.strictEqual(entry.stoppedAt, 'b', entry.channel + ': ladder must stop at step b, got: ' + entry.stoppedAt);
+      assert.strictEqual(Object.keys(entry.steps).length, 2, entry.channel + ': only steps a and b recorded (stops at first failure)');
+      // The ladder must NOT query the admin products path in a way that could
+      // pass: an admin-only success can no longer produce ok:true here.
+    });
+  } finally {
+    server.close();
+  }
+});
+
+
+// ---------------------------------------------------------------------------
 // ensureDefaultChannelTaxZone: null tax zone -> updateChannel called, recorded 'updated'
 // ---------------------------------------------------------------------------
 test('seed: ensureDefaultChannelTaxZone null tax zone triggers updateChannel and records updated', async function() {

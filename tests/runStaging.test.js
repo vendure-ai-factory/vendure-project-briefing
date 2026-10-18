@@ -1492,24 +1492,34 @@ test('runStaging: numeric failed count > 0 without errors[] is PIPELINE_DEFECT',
 // firstTaskProblem check so it intercepts even classified/blocked tasks).
 // A task with a real network/5xx error must stay DEPENDENCY_ENVIRONMENT.
 // ---------------------------------------------------------------------------
-test('runStaging: classifyStage DEPENDENCY_ENVIRONMENT + integer error -> TARGET_APP_DEFECT', async function() {
+test('runStaging: classifyStage DEPENDENCY_ENVIRONMENT + integer error in exitErrorResult.error -> TARGET_APP_DEFECT', async function() {
   var mod = await loadModule();
   var outcome = {
     summary: {
       tasks: [{
         id: 'task-CAN-B1-03',
+        taskId: 'CAN-B1-03',
         result: 'BLOCK',
         classification: 'DEPENDENCY_ENVIRONMENT',
-        cause: 'STAGING_SERVER_ERROR: invalid input syntax for type integer: "undefined"'
+        cause: 'STAGING_SERVER_ERROR',
+        exitErrorResult: {
+          exitCode: 1,
+          error: 'GraphQL error: invalid input syntax for type integer: "undefined" path:products'
+        }
       }]
     },
     exitCode: 1
   };
   mod.classifyStage(outcome);
   assert.strictEqual(outcome.classification, 'TARGET_APP_DEFECT',
-    'DEP_ENV task with integer error must become TARGET_APP_DEFECT, got: ' + outcome.classification);
+    'DEP_ENV task with integer error in exitErrorResult.error must become TARGET_APP_DEFECT, got: ' + outcome.classification);
   assert.ok(outcome.cause.indexOf('repair required') !== -1,
     'cause must say repair required, got: ' + outcome.cause);
+  // The task row in the summary must carry the corrected classification/cause.
+  assert.strictEqual(outcome.summary.tasks[0].classification, 'TARGET_APP_DEFECT',
+    'task row classification must be TARGET_APP_DEFECT');
+  assert.ok(outcome.summary.tasks[0].cause.indexOf('repair required') !== -1,
+    'task row cause must be repair required');
 });
 
 test('runStaging: classifyStage DEPENDENCY_ENVIRONMENT + real network error -> stays DEPENDENCY_ENVIRONMENT', async function() {
@@ -1518,18 +1528,25 @@ test('runStaging: classifyStage DEPENDENCY_ENVIRONMENT + real network error -> s
     summary: {
       tasks: [{
         id: 'task-CAN-B1-03',
+        taskId: 'CAN-B1-03',
         result: 'FAIL',
         classification: 'DEPENDENCY_ENVIRONMENT',
-        cause: 'STAGING_SERVER_ERROR: Internal Server Error (HTTP 500)'
+        cause: 'STAGING_SERVER_ERROR',
+        exitErrorResult: {
+          exitCode: 1,
+          error: 'GraphQL error: Java heap space when resolving variants path:products.variants'
+        }
       }]
     },
     exitCode: 1
   };
   mod.classifyStage(outcome);
   assert.strictEqual(outcome.classification, 'DEPENDENCY_ENVIRONMENT',
-    'DEP_ENV task with real 5xx must stay DEPENDENCY_ENVIRONMENT, got: ' + outcome.classification);
-  assert.ok(outcome.cause.indexOf('Internal Server Error') !== -1,
+    'DEP_ENV task with real differing error must stay DEPENDENCY_ENVIRONMENT, got: ' + outcome.classification);
+  assert.ok(outcome.cause.indexOf('STAGING_SERVER_ERROR') !== -1,
     'cause must preserve original error, got: ' + outcome.cause);
+  assert.strictEqual(outcome.summary.tasks[0].classification, 'DEPENDENCY_ENVIRONMENT',
+    'task row classification must stay DEPENDENCY_ENVIRONMENT');
 });
 
 // ---------------------------------------------------------------------------
@@ -1640,6 +1657,13 @@ test('runStaging: TARGET_APP_DEFECT seed yields a compliant report and runs the 
   // 3) Compliance report: verifyOk true, reportOk true, class + cause in both
   //    run-summary and compliance-report.md.
   var manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', MANIFEST), 'utf8'));
+  // 3b) The aggregated run-summary notes must be deduplicated: the 4 readback
+  //     integer-error entries all produce the same repair note, so only one
+  //     unique string may appear.
+  assert.ok(Array.isArray(summary.notes), 'run-summary must include notes');
+  assert.strictEqual(summary.notes.length, 1,
+    'notes must be deduplicated to unique strings, got ' + summary.notes.length + ' - ' + JSON.stringify(summary.notes));
+  assert.ok(summary.notes[0].indexOf('repair required') !== -1, 'unique note names the repair');
   var report = reportGenerator.generateReport(deps.runId, {
     root: path.join(deps.cwd, 'evidence'),
     baseDir: '.',
@@ -1648,6 +1672,15 @@ test('runStaging: TARGET_APP_DEFECT seed yields a compliant report and runs the 
   });
   assert.strictEqual(report.verifyOk, true, 'verifyOk must be true: all records verified');
   assert.strictEqual(report.ok, true, 'reportOk must be true: BLOCK outcomes are legitimate, no EVIDENCE_INVALID');
+  // 4) The seed row in the compliance report must use the same classification and
+  //    cause as run-summary (not the generic SEED_FAILED), with SEED_FAILED only
+  //    for real pipeline seed failures. Here the seed is a TARGET_APP_DEFECT.
+  var seedRow = report.tasks['seed'];
+  assert.ok(seedRow, 'report must include the seed task row');
+  assert.strictEqual(seedRow.classification, 'TARGET_APP_DEFECT',
+    'seed row classification must match run-summary, got: ' + seedRow.classification);
+  assert.ok(seedRow.cause.indexOf('repair required') !== -1,
+    'seed row cause must carry the repair-required cause, got: ' + seedRow.cause);
   assert.ok(report.tasks['CAN-B1-03'] && report.tasks['CAN-B1-03'].outcome === 'BLOCK', 'CAN-B1-03 in report is BLOCK');
   assert.ok(report.tasks['CAN-B1-04'] && report.tasks['CAN-B1-04'].outcome === 'BLOCK', 'CAN-B1-04 in report is BLOCK');
 

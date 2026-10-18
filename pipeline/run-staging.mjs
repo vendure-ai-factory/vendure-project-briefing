@@ -610,13 +610,136 @@ function runStage(cfg, stage) {
     cause: null,
     summary: readStageSummary(cfg, stage.summaryFile)
   };
+  // Attach the task record error text (record.json exitErrorResult.error and
+  // executor-error.json) to each summary task so classifyStage can look at the
+  // real error even when the task cause is only a token like STAGING_SERVER_ERROR.
+  attachTaskRecordErrors(cfg, outcome);
   if (result.status === null) {
     outcome.classification = CLASS_PIPELINE_DEFECT;
     outcome.cause = 'SPAWN_FAILED';
   } else {
     classifyStage(outcome);
+    // Persist any task-level reclassification back into the record so the
+    // compliance-report.json/.md task rows carry the same classification/cause.
+    persistStageClassification(cfg, outcome);
   }
   return outcome;
+}
+
+/**
+ * Read the evidence record.json exitErrorResult + executor-error.json error text
+ * for each task in the stage summary and attach it to the task so classifyStage
+ * sees the real error text, not just the (possibly generic) cause.
+ */
+function attachTaskRecordErrors(cfg, outcome) {
+  var summary = outcome && outcome.summary;
+  if (!summary || !Array.isArray(summary.tasks)) return;
+  for (var i = 0; i < summary.tasks.length; i++) {
+    var t = summary.tasks[i];
+    if (!t) continue;
+    var taskId = t.taskId || t.id;
+    if (!taskId) continue;
+    if (t.exitErrorResult && typeof t.exitErrorResult === 'object') continue;
+    var rec = readTaskRecord(cfg, taskId);
+    if (rec && rec.exitErrorResult && typeof rec.exitErrorResult === 'object') {
+      t.exitErrorResult = rec.exitErrorResult;
+    } else {
+      var exErr = readExecutorError(cfg, taskId);
+      if (exErr !== null) {
+        t.executorError = exErr;
+        t.exitErrorResult = { exitCode: null, error: exErr };
+      }
+    }
+  }
+}
+
+function readTaskRecord(cfg, taskId) {
+  var file = path.join(cfg.cwd, 'evidence', cfg.runId, taskId, 'record.json');
+  if (!cfg.fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(cfg.fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+function readExecutorError(cfg, taskId) {
+  var file = path.join(cfg.cwd, 'evidence', cfg.runId, taskId, 'executor-error.json');
+  if (!cfg.fs.existsSync(file)) return null;
+  try {
+    var data = JSON.parse(cfg.fs.readFileSync(file, 'utf8'));
+    if (data && typeof data.error === 'string' && data.error !== '') return data.error;
+    if (data && typeof data.message === 'string' && data.message !== '') return data.message;
+    var probes = data && data.probes;
+    if (probes && typeof probes === 'object') {
+      var keys = Object.keys(probes);
+      for (var i = 0; i < keys.length; i++) {
+        var p = probes[keys[i]];
+        if (p && typeof p.error === 'string' && p.error !== '') return p.error;
+      }
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * After classification, write any task-level TARGET_APP_DEFECT reclassification
+ * back into the task's record.json (classification/cause/finalClassification) so
+ * the compliance report rows show the same defect as run-summary.json.
+ */
+function persistStageClassification(cfg, outcome) {
+  var summary = outcome && outcome.summary;
+  if (!summary || !Array.isArray(summary.tasks)) return;
+  for (var i = 0; i < summary.tasks.length; i++) {
+    var t = summary.tasks[i];
+    if (!t) continue;
+    if (t.classification !== CLASS_TARGET_APP_DEFECT) continue;
+    if (t.result === 'PASS' || t.result === 'RESULT_PASS' || t.result === 'READINESS_PASS') continue;
+    var taskId = t.taskId || t.id;
+    if (!taskId) continue;
+    var file = path.join(cfg.cwd, 'evidence', cfg.runId, taskId, 'record.json');
+    if (!cfg.fs.existsSync(file)) continue;
+    try {
+      var record = JSON.parse(cfg.fs.readFileSync(file, 'utf8'));
+      if (record.classification === CLASS_TARGET_APP_DEFECT && record.cause === t.cause) continue;
+      record.classification = CLASS_TARGET_APP_DEFECT;
+      record.cause = t.cause;
+      record.finalClassification = 'BLOCK';
+      rewriteEvidenceEntry(cfg, taskId, 'record.json', record);
+    } catch (e) {}
+  }
+}
+
+/**
+ * Rewrite an evidence file and update its index entry sha in place.
+ * writeEvidenceFile APPENDS a duplicate index entry, leaving the old hash
+ * stale and failing verifyEvidence; this replaces and re-hashes the entry.
+ */
+function rewriteEvidenceEntry(cfg, taskId, filename, record) {
+  var crypto = require('node:crypto');
+  var content = JSON.stringify(record, null, 2);
+  var sha = crypto.createHash('sha256').update(content + '\n', 'utf8').digest('hex');
+  var absPath = path.join(cfg.cwd, 'evidence', cfg.runId, taskId, filename);
+  cfg.fs.writeFileSync(absPath, content + '\n', 'utf8');
+  var indexPath = path.join(cfg.cwd, 'evidence', cfg.runId, 'index.json');
+  if (!cfg.fs.existsSync(indexPath)) return;
+  try {
+    var index = JSON.parse(cfg.fs.readFileSync(indexPath, 'utf8'));
+    var relPath = (taskId + '/' + filename).replace(/\\/g, '/');
+    var entries = index.tasks && index.tasks[taskId];
+    if (Array.isArray(entries)) {
+      for (var i = 0; i < entries.length; i++) {
+        if (entries[i] && entries[i].path === relPath) {
+          if (entries[i].sha256 === sha) { return; }
+          entries[i].sha256 = sha;
+          entries[i].timestamp = new Date().toISOString();
+        }
+      }
+    }
+    cfg.fs.writeFileSync(indexPath, JSON.stringify(index, null, 2) + '\n', 'utf8');
+  } catch (e) {}
 }
 
 function copyDir(cfg, src, dest) {
@@ -675,6 +798,60 @@ function isPassResult(v) {
   return v === 'PASS' || v === 'RESULT_PASS' || v === 'READINESS_PASS';
 }
 
+/**
+ * Gather every diagnostic string from a task problem so the classifier can
+ * inspect the cause, the result, and the task record error text
+ * (record.json exitErrorResult.error / executor-error.json) together.
+ */
+function taskProblemText(t) {
+  var parts = [];
+  function push(v) {
+    if (typeof v === 'string' && v !== '') parts.push(v);
+    else if (v && typeof v === 'object' && typeof v.message === 'string' && v.message !== '') parts.push(v.message);
+  }
+  if (!t || typeof t !== 'object') return parts.join('|');
+  push(t.cause);
+  push(t.result);
+  push(t.reason);
+  push(t.error);
+  push(t.message);
+  push(t.detail);
+  // record.json exitErrorResult.error / executor-error.json error text attached
+  // by runStage from the evidence record.
+  if (t.exitErrorResult && typeof t.exitErrorResult === 'object') {
+    push(t.exitErrorResult.error);
+    push(t.exitErrorResult.message);
+  }
+  if (Array.isArray(t.errors)) {
+    for (var i = 0; i < t.errors.length; i++) push(t.errors[i]);
+  }
+  ['executorError', 'executorOutput', 'stderr', 'stdout'].forEach(function(field) {
+    push(t[field]);
+  });
+  return parts.join('|');
+}
+
+/**
+ * Gather diagnostic strings at stage level (used when no specific problem task
+ * exists, e.g. a chain summary carrying only a classification/cause).
+ */
+function outcomeErrorText(outcome) {
+  var parts = [];
+  function push(v) {
+    if (typeof v === 'string' && v !== '') parts.push(v);
+  }
+  if (!outcome || typeof outcome !== 'object') return parts.join('|');
+  push(outcome.cause);
+  push(outcome.classification);
+  push(outcome.error);
+  push(outcome.message);
+  if (outcome.exitErrorResult && typeof outcome.exitErrorResult === 'object') {
+    push(outcome.exitErrorResult.error);
+    push(outcome.exitErrorResult.message);
+  }
+  return parts.join('|');
+}
+
 function firstTaskProblem(summary) {
   const tasks = summary && summary.tasks;
   if (!Array.isArray(tasks)) return null;
@@ -715,18 +892,29 @@ function classifyStage(outcome) {
     // target-application defect (client-ruled).  Detect it at the task level
     // even when the task summary carries DEPENDENCY_ENVIRONMENT or another
     // non-target classification, so CAN-B1-03/CAN-B1-04 blocked/classified
-    // tasks correctly reflect the TARGET_APP_DEFECT cause.
+    // tasks correctly reflect the TARGET_APP_DEFECT cause.  The task cause may
+    // only be a generic token (e.g. STAGING_SERVER_ERROR); the integer error
+    // text is then only in the task record (record.json exitErrorResult.error /
+    // executor-error.json), which runStage attached as exitErrorResult, so the
+    // classifier inspects that text too, not just the cause.
+    var problemText = taskProblemText(problem);
     if (looksLikeServerProductsListError(outcome.cause || '') ||
-        looksLikeServerProductsListError(outcome.classification || '')) {
+        looksLikeServerProductsListError(outcome.classification || '') ||
+        looksLikeServerProductsListError(problemText)) {
       outcome.classification = CLASS_TARGET_APP_DEFECT;
       outcome.cause = "repair required: Shop API products list fails server-side (Postgres: product.id != $3 with $3='undefined')";
+      // Write the corrected classification/cause back onto the task row so the
+      // aggregated run-summary.json tasks[] and the record echo the same defect.
+      problem.classification = outcome.classification;
+      problem.cause = outcome.cause;
     }
     return;
   }
   // Chain-level cause (no specific problem task) may still carry the integer
   // error and must be reclassified the same way.
   if (looksLikeServerProductsListError(outcome.cause || '') ||
-      looksLikeServerProductsListError(outcome.classification || '')) {
+      looksLikeServerProductsListError(outcome.classification || '') ||
+      looksLikeServerProductsListError(outcomeErrorText(outcome))) {
     outcome.classification = CLASS_TARGET_APP_DEFECT;
     outcome.cause = "repair required: Shop API products list fails server-side (Postgres: product.id != $3 with $3='undefined')";
     return;
@@ -1204,12 +1392,20 @@ function writeAggregatedSummary(cfg, preflight, stages, seed) {
     }
   }
   const anyDefect = stages.some(function(s) { return s.classification === CLASS_PIPELINE_DEFECT; });
-  // Collect any actual integer-error note from the seed evidence.
+  // Collect any actual integer-error note from the seed evidence.  Unique strings only.
   var seedNotes = [];
+  var REPAIR_NOTE = "repair required: Shop API products list fails server-side (Postgres: product.id != $3 with $3='undefined'); in-scope target-application defect (TARGET_APP_DEFECT).";
+  var noteSeen = {};
+  function note(pushCandidate) {
+    if (typeof pushCandidate !== 'string' || pushCandidate === '') return;
+    if (noteSeen[pushCandidate]) return;
+    noteSeen[pushCandidate] = true;
+    seedNotes.push(pushCandidate);
+  }
   if (seed && seed.errors && Array.isArray(seed.errors)) {
     seed.errors.forEach(function(e) {
       if (typeof e === 'string' && e.indexOf('invalid input syntax for type integer') !== -1) {
-        seedNotes.push("repair required: Shop API products list fails server-side (Postgres: product.id != $3 with $3='undefined'); in-scope target-application defect (TARGET_APP_DEFECT).");
+        note(REPAIR_NOTE);
       }
     });
   }
@@ -1217,9 +1413,7 @@ function writeAggregatedSummary(cfg, preflight, stages, seed) {
   if (seed && seed.blocked) {
     seed.blocked.forEach(function(b) {
       if (b.error && b.error.indexOf && b.error.indexOf('invalid input syntax for type integer') !== -1) {
-        if (seedNotes.length === 0) {
-          seedNotes.push("repair required: Shop API products list fails server-side (Postgres: product.id != $3 with $3='undefined'); in-scope target-application defect (TARGET_APP_DEFECT).");
-        }
+        note(REPAIR_NOTE);
       }
     });
   }
@@ -1336,7 +1530,7 @@ function runSeedStep(cfg, seedModule) {
     }
   };
   return seedModule.seedStaging(context, { dryRun: !!cfg.seedDryRun }).then(function(result) {
-    return applySeedClassification({
+    var seed = applySeedClassification({
       ran: true,
       dryRun: !!cfg.seedDryRun,
       ok: !!(result && result.ok),
@@ -1348,8 +1542,13 @@ function runSeedStep(cfg, seedModule) {
       errors: (result && Array.isArray(result.errors)) ? result.errors : [],
       failed: (result && Array.isArray(result.failed)) ? result.failed : [],
     });
+    // Persist the derived classification/cause onto the seed evidence so the
+    // compliance report's seed row shows the same classification as the
+    // run-summary notes (SEED_FAILED only for real pipeline seed failures).
+    writeSeedClassificationEvidence(cfg, seed);
+    return seed;
   }, function(err) {
-    return applySeedClassification({
+    var seed = applySeedClassification({
       ran: true,
       dryRun: !!cfg.seedDryRun,
       ok: false,
@@ -1361,7 +1560,27 @@ function runSeedStep(cfg, seedModule) {
       failed: [],
       errors: [(err && err.message) || String(err)]
     });
+    writeSeedClassificationEvidence(cfg, seed);
+    return seed;
   });
+}
+
+/**
+ * Merge the pipeline-derived seed classification/cause back into the evidence
+ * seed record (evidence/<runId>/seed/seed-record.json) so generateReport's
+ * seed row uses the same classification as run-summary.json.  Never removes
+ * existing fields; only adds classification/cause.
+ */
+function writeSeedClassificationEvidence(cfg, seed) {
+  if (!seed || !cfg || !cfg.cwd || !cfg.runId) return;
+  var file = path.join(cfg.cwd, 'evidence', cfg.runId, 'seed', 'seed-record.json');
+  if (!cfg.fs.existsSync(file)) return;
+  try {
+    var record = JSON.parse(cfg.fs.readFileSync(file, 'utf8'));
+    record.classification = seed.classification != null ? seed.classification : record.classification;
+    record.cause = seed.cause != null ? seed.cause : record.cause;
+    rewriteEvidenceEntry(cfg, 'seed', 'seed-record.json', record);
+  } catch (e) {}
 }
 
 /**
@@ -1582,6 +1801,7 @@ export {
   validateMode,
   classifySeedFailure,
   applySeedClassification,
+  runSeedStep,
   buildBlockedStageForSeed,
   classifyStage,
   CLASS_DEPENDENCY,

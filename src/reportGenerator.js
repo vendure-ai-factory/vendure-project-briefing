@@ -150,10 +150,13 @@ function seedOutcome(seedEvidence) {
       cause: null
     };
   }
+  // Use the same classification/cause the pipeline derived (written back to the
+  // seed evidence by run-staging).  Fall back to SEED_FAILED only for real
+  // pipeline seed failures that carry no classification at all.
   return {
     result: RESULT_BLOCK,
-    classification: 'SEED_FAILED',
-    cause: seedEvidence.reason || seedEvidence.error || 'SEED_FAILED'
+    classification: seedEvidence.classification || 'SEED_FAILED',
+    cause: seedEvidence.cause || seedEvidence.reason || seedEvidence.error || 'SEED_FAILED'
   };
 }
 
