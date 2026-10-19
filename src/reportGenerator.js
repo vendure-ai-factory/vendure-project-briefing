@@ -3,8 +3,12 @@
 var evidenceCollector = require('./evidenceCollector');
 var terminalState = require('./terminalState');
 var protectedPathsModule = require('./protectedPaths');
+var verifierModule = require('./repair/verifier');
 var path = require('path');
 var childProcess = require('child_process');
+
+var redactSecrets = verifierModule.redactSecrets;
+var redactEmails = verifierModule.redactEmails;
 
 var verifyEvidence = evidenceCollector.verifyEvidence;
 var loadIndex = evidenceCollector.loadIndex;
@@ -24,13 +28,31 @@ var RESULT_NA = 'NA';
 var RUN_LEVEL_END = 'run-level';
 
 /**
+ * Schema version constants.
+ */
+var SCHEMA_VERSION_1_0 = '1.0';
+var SCHEMA_VERSION_1_1 = '1.1';
+
+/**
+ * Repair outcome values (schema 1.1).
+ */
+var OUTCOME_FIXED = 'FIXED';
+var OUTCOME_NOT_FIXED = 'NOT_FIXED';
+var OUTCOME_BLOCKED = 'BLOCKED';
+var OUTCOME_NOT_RUN = 'NOT_RUN';
+
+/**
+ * Budget defaults.
+ */
+var BUDGET_PER_SIGNATURE = 3;
+var BUDGET_GLOBAL = 15;
+
+/**
  * Git log from a reference commit to HEAD. Returns an array of short lines.
  * Failure to run git returns an empty array (never throws into the report).
  */
 function getGitLog(fromRef, options) {
   if (!fromRef) return [];
-  // Git log always runs from the repository root (process.cwd()); options.root
-  // here is the EVIDENCE root, not the repo, so never use it for this call.
   var repoRoot = process.cwd();
   try {
     var out = childProcess.execFileSync('git', ['log', '--oneline', fromRef + '..HEAD'], {
@@ -57,7 +79,6 @@ function buildComplianceMetadata(report, index, options) {
 
   var repairCommits = getGitLog(index ? index.referenceCommit : null, options || {});
 
-  // Aggregate repairHistory across task records.
   var repairHistory = [];
   var taskIds = Object.keys((index && index.tasks) || {});
   for (var i = 0; i < taskIds.length; i++) {
@@ -65,8 +86,6 @@ function buildComplianceMetadata(report, index, options) {
     for (var j = 0; j < entries.length; j++) {
       var e = entries[j];
       if (e && e.kind === 'record' && e.path && e.sha256) {
-        // record.json is re-read when proving a row; here we only know the
-        // record file exists. repairHistory is read directly from the record.
         var rec = readTaskRecordFor(options, index.runId, taskIds[i]);
         if (rec && Array.isArray(rec.repairHistory) && rec.repairHistory.length > 0) {
           repairHistory.push({ taskId: taskIds[i], attempts: rec.repairHistory.length });
@@ -150,14 +169,55 @@ function seedOutcome(seedEvidence) {
       cause: null
     };
   }
-  // Use the same classification/cause the pipeline derived (written back to the
-  // seed evidence by run-staging).  Fall back to SEED_FAILED only for real
-  // pipeline seed failures that carry no classification at all.
   return {
     result: RESULT_BLOCK,
     classification: seedEvidence.classification || 'SEED_FAILED',
     cause: seedEvidence.cause || seedEvidence.reason || seedEvidence.error || 'SEED_FAILED'
   };
+}
+
+/**
+ * Collect secret values from options.secrets for use in redaction.
+ */
+function collectSecretsForRedaction(options) {
+  var values = [];
+  if (options && options.secrets && typeof options.secrets === 'object') {
+    var keys = Object.keys(options.secrets);
+    for (var i = 0; i < keys.length; i++) {
+      var v = options.secrets[keys[i]];
+      if (typeof v === 'string' && v.length > 0) values.push(v);
+    }
+  }
+  return values;
+}
+
+/**
+ * Redact secrets and emails from a string.
+ */
+function safeRedact(text, secretValues) {
+  var result = redactSecrets(text, secretValues);
+  return redactEmails(result);
+}
+
+/**
+ * Redact secrets and emails from a value (object, array, or string).
+ */
+function redactValue(val, secretValues) {
+  if (typeof val === 'string') {
+    return safeRedact(val, secretValues);
+  }
+  if (Array.isArray(val)) {
+    return val.map(function(item) { return redactValue(item, secretValues); });
+  }
+  if (val !== null && typeof val === 'object') {
+    var out = {};
+    var keys = Object.keys(val);
+    for (var i = 0; i < keys.length; i++) {
+      out[keys[i]] = redactValue(val[keys[i]], secretValues);
+    }
+    return out;
+  }
+  return val;
 }
 
 /**
@@ -175,20 +235,25 @@ function seedOutcome(seedEvidence) {
  * index.json) and any mismatch is flagged.
  *
  * @param {string} runId - run identifier
- * @param {Object} options - { root, baseDir, manifest, registry } passed
- *   through to evidence collector functions; manifest/registry enrich the
- *   compliance metadata.
+ * @param {Object} options - { root, baseDir, manifest, registry, repairMode,
+ *   repairData, secrets } passed through to evidence collector functions;
+ *   manifest/registry enrich the compliance metadata; repairMode (boolean)
+ *   enables schema 1.1 repair reporting; repairData provides repair loop
+ *   output; secrets is an object of secret values for redaction.
  * @returns {Object} report
  */
 function generateReport(runId, options) {
   options = options || {};
+  var repairMode = options.repairMode === true;
   var root = resolveRoot(options);
   var verify = verifyEvidence(runId, options);
   var loaded = loadIndex(root, runId);
   var index = loaded && loaded.index ? loaded.index : null;
 
+  var schemaVersion = repairMode ? SCHEMA_VERSION_1_1 : SCHEMA_VERSION_1_0;
+
   var report = {
-    schemaVersion: '1.0',
+    schemaVersion: schemaVersion,
     runId: runId,
     executionRevision: index ? index.executionRevision : null,
     referenceCommit: index ? index.referenceCommit : null,
@@ -201,8 +266,6 @@ function generateReport(runId, options) {
     tasks: {}
   };
 
-  // Compliance metadata required by the client on 2 Oct 2026: protected path
-  // list, reference hashes, execution HEAD, reference commit, repair commits.
   report.compliance = buildComplianceMetadata(report, index, options);
 
   var taskIds = Object.keys(verify.tasks || {});
@@ -211,8 +274,6 @@ function generateReport(runId, options) {
 
   for (var i = 0; i < taskIds.length; i++) {
     var taskId = taskIds[i];
-    // The reserved "run-level" key holds run-level evidence files (e.g. the
-    // protected-end hash) and is not a canonical task; never score it.
     if (taskId === RUN_LEVEL_END) {
       continue;
     }
@@ -222,11 +283,6 @@ function generateReport(runId, options) {
     var startHash = record.protectedStartHash !== undefined ? record.protectedStartHash : null;
     var endHash = record.protectedEndHash !== undefined ? record.protectedEndHash : null;
 
-    // Seed evidence (kind "seed") is accepted directly: ok:true -> the
-    // passing outcome; any other seed evidence -> BLOCK (never a passing
-    // outcome). The seed record does not carry the canonical record result
-    // field, so the outcome is derived here instead of falling through to
-    // MISSING_EVIDENCE.
     if (isSeedTaskId(taskId)) {
       var seedValue = readSeedEvidence(options, index, taskId);
       var seedDecision = seedOutcome(seedValue);
@@ -236,8 +292,6 @@ function generateReport(runId, options) {
       } else {
         resultValue = null;
       }
-      // seedTaskOk: seed task counts as passing only when both the evidence
-      // was readable (vTask.ok) AND the seed itself succeeded (seedValue.ok).
       var seedTaskOk = (seedValue && seedValue.ok === true) && vTask.ok && resultValue !== null;
       var seedOutcomeValue = resultValue !== null ? resultValue : MISSING_EVIDENCE;
       var seedEntry = {
@@ -252,8 +306,8 @@ function generateReport(runId, options) {
         manualIntervention: record.manualIntervention || null,
         protectedStartHash: startHash,
         protectedEndHash: endHash,
-        protectedHashesMatch: hashesMatch,
-        endHashMatchesPinned: endMatchesPinned,
+        protectedHashesMatch: null,
+        endHashMatchesPinned: null,
         files: vTask.files
       };
       if (seedValue && Array.isArray(seedValue.blocked) && seedValue.blocked.length > 0) {
@@ -263,11 +317,9 @@ function generateReport(runId, options) {
       report.protectedPathHashes.tasks[taskId] = {
         start: startHash,
         end: endHash,
-        match: hashesMatch,
-        endMatchesPinned: endMatchesPinned
+        match: null,
+        endMatchesPinned: null
       };
-      // Seed task contributes to report.ok only when evidence was verifiable.
-      // The seed's own ok:false status is carried in outcome (BLOCK), not report.ok.
       var seedForAllTasksOk = vTask.ok && resultValue !== null;
       if (!seedForAllTasksOk) {
         allTasksOk = false;
@@ -275,10 +327,6 @@ function generateReport(runId, options) {
       continue;
     }
 
-    // A task is MISSING_EVIDENCE (never a passing outcome) only when its
-    // evidence is absent OR its record has no result field. A blocked task
-    // that wrote a full record carries result:BLOCK, a real outcome; that
-    // outcome must not be mistaken for MISSING_EVIDENCE.
     var taskOk = vTask.ok && resultValue !== null;
     var outcome;
     if (!taskOk) {
@@ -287,9 +335,6 @@ function generateReport(runId, options) {
       outcome = resultValue;
     }
 
-    // A per-task protectedEndHash of "run-level" means the run-level end hash
-    // is written after the loop (single-task runs carry the real hash). It is
-    // never treated as a mismatch; only a genuine start/end differ flags.
     var deferredEnd = (endHash === RUN_LEVEL_END);
     var comparable = (startHash !== null || endHash !== null) && !deferredEnd;
     var hashesMatch = !comparable ? null : (startHash === endHash);
@@ -324,8 +369,6 @@ function generateReport(runId, options) {
       endMatchesPinned: endMatchesPinned
     };
 
-    // A task whose outcome is MISSING_EVIDENCE (no result field, bad hashes,
-    // or failed verification) makes the run report not clean.
     if (!taskOk) {
       allTasksOk = false;
     }
@@ -333,15 +376,139 @@ function generateReport(runId, options) {
 
   report.protectedPathMismatch = mismatchTasks;
   report.ok = verify.ok && mismatchTasks.length === 0 && allTasksOk;
+
+  // Schema 1.1: populate report.repair when repair mode is enabled.
+  // When repair mode is off, report.repair is completely absent.
+  if (repairMode) {
+    var repairData = options.repairData || {};
+    var secretValues = collectSecretsForRedaction(options);
+
+    var attemptsData = repairData.attempts || [];
+
+    // Collect anyFixed / anyNotFixed from task outcomes.
+    var anyFixed = false;
+    var anyNotFixed = false;
+    var taskIdsAll = Object.keys(report.tasks || {});
+    for (var ti = 0; ti < taskIdsAll.length; ti++) {
+      var tent = report.tasks[taskIdsAll[ti]];
+      if (tent.outcome === RESULT_PASS || tent.outcome === RESULT_READINESS_PASS) {
+        anyFixed = true;
+      } else if (tent.outcome === RESULT_BLOCK) {
+        anyNotFixed = true;
+      }
+    }
+
+    // Check for manual target edits — overrides to BLOCKED.
+    var hasManualEdits = (repairData.manualTargetEdits > 0);
+    var blockedByManual = false;
+    if (hasManualEdits) {
+      blockedByManual = true;
+      // Inject MANUAL_TARGET_EDIT_DETECTED blocker.
+      var manualBlocker = {
+        code: 'MANUAL_TARGET_EDIT_DETECTED',
+        message: 'Manual edits to target detected; pipeline outcome is BLOCKED.',
+        evidence: redactValue({ manualTargetEdits: repairData.manualTargetEdits }, secretValues)
+      };
+      repairData = Object.assign({}, repairData, {
+        blockers: (repairData.blockers || []).concat([manualBlocker])
+      });
+    }
+
+    var blockersRaw = repairData.blockers || [];
+    // Redact blocker evidence and message for JSON storage.
+    var blockersForJson = blockersRaw.map(function(blk) {
+      return {
+        code: blk.code || 'UNKNOWN',
+        message: safeRedact(String(blk.message || ''), secretValues),
+        evidence: redactValue(blk.evidence || {}, secretValues)
+      };
+    });
+
+    var blocked = blockersRaw.length > 0;
+    var outcome;
+    if (blocked) {
+      outcome = OUTCOME_BLOCKED;
+    } else if (anyFixed && !anyNotFixed) {
+      outcome = OUTCOME_FIXED;
+    } else if (anyNotFixed) {
+      outcome = OUTCOME_NOT_FIXED;
+    } else {
+      outcome = OUTCOME_NOT_RUN;
+    }
+
+    // Compute budgets from attempts.
+    var totalUsed = attemptsData.length;
+
+    // Redact attempts' message and diffExcerpt for JSON.
+    var attemptsForJson = attemptsData.map(function(a) {
+      var redactedA = {
+        n: a.n,
+        signature: a.signature || '',
+        domain: a.domain || '',
+        repairKind: a.repairKind || '',
+        status: a.status || '',
+        checks: a.checks || '',
+        branch: a.branch || '',
+        headSha: a.headSha || '',
+        buildRunUrl: safeRedact(String(a.buildRunUrl || ''), secretValues),
+        imageDigest: a.imageDigest || '',
+        deployed: a.deployed ? true : false,
+        retestVerdicts: Array.isArray(a.retestVerdicts) ? a.retestVerdicts.slice() : [],
+        verifyStatus: a.verifyStatus || ''
+      };
+      if (a.message) {
+        redactedA.message = safeRedact(String(a.message), secretValues);
+      }
+      return redactedA;
+    });
+
+    // Redact sectionB targetChanges diffExcerpt for JSON storage.
+    var sectionB = repairData.sectionB || { targetChanges: [] };
+    var targetChangesForJson = (sectionB.targetChanges || []).map(function(tc) {
+      var redactedTc = {
+        branch: tc.branch || '',
+        commit: tc.commit || '',
+        repairKind: tc.repairKind || '',
+        filesChanged: Array.isArray(tc.filesChanged) ? tc.filesChanged.slice() : [],
+        diffStat: tc.diffStat || ''
+      };
+      if (tc.diffExcerpt) {
+        var redacted = safeRedact(String(tc.diffExcerpt), secretValues);
+        if (redacted.length > 4000) redacted = redacted.substring(0, 4000) + '\n... (truncated)';
+        redactedTc.diffExcerpt = redacted;
+      }
+      return redactedTc;
+    });
+
+    report.repair = {
+      schemaVersion: SCHEMA_VERSION_1_1,
+      enabled: true,
+      outcome: outcome,
+      sectionA: { pipelineChanges: (repairData.sectionA && repairData.sectionA.pipelineChanges) || [] },
+      sectionB: { targetChanges: targetChangesForJson },
+      attempts: attemptsForJson,
+      deploy: repairData.deploy || null,
+      rollback: repairData.rollback !== undefined ? repairData.rollback : null,
+      blockers: blockersForJson,
+      budgets: {
+        used: totalUsed,
+        global: BUDGET_GLOBAL,
+        perSignature: BUDGET_PER_SIGNATURE
+      },
+      manualTargetEdits: 0
+    };
+  }
+
   return report;
 }
 
 /**
  * Render a report object to Markdown for human-facing compliance-report.md files.
  * Emits task rows with outcome and protected-hash match info.
+ * options.secrets is used for diffExcerpt redaction in the markdown output.
  */
-function renderMarkdownReport(report) {
-  if (!report) return '# Report (empty)\n';
+function renderMarkdownReport(report, options) {
+  options = options || {};
   var lines = [];
   lines.push('# Acceptance Report');
   lines.push('');
@@ -358,6 +525,84 @@ function renderMarkdownReport(report) {
     lines.push('- protectedPathMismatch: ' + report.protectedPathMismatch.join(', '));
   }
   lines.push('');
+
+  // Schema 1.1 repair sections under report.repair.
+  if (report.repair && report.repair.schemaVersion === SCHEMA_VERSION_1_1) {
+    var repair = report.repair;
+    lines.push('## A. Pipeline changes');
+    lines.push('');
+    var pipelineChanges = (repair.sectionA && repair.sectionA.pipelineChanges) || [];
+    if (pipelineChanges.length === 0) {
+      lines.push('_no pipeline changes_');
+    } else {
+      pipelineChanges.forEach(function(pc) {
+        lines.push('- path: ' + (pc.path || 'n/a'));
+        lines.push('  description: ' + (pc.description || 'n/a'));
+        lines.push('  commit: ' + (pc.commit || 'n/a'));
+      });
+    }
+    lines.push('');
+    lines.push('## B. Target changes made by the Pipeline');
+    lines.push('');
+    var targetChanges = (repair.sectionB && repair.sectionB.targetChanges) || [];
+    if (targetChanges.length === 0) {
+      lines.push('_no target changes_');
+    } else {
+      targetChanges.forEach(function(tc) {
+        lines.push('- branch: ' + (tc.branch || 'n/a'));
+        lines.push('  commit: ' + (tc.commit || 'n/a'));
+        lines.push('  repairKind: ' + (tc.repairKind || 'n/a'));
+        lines.push('  filesChanged: ' + ((tc.filesChanged && tc.filesChanged.length > 0) ? tc.filesChanged.join(', ') : 'none'));
+        lines.push('  diffStat: ' + (tc.diffStat || 'n/a'));
+        if (tc.diffExcerpt) {
+          lines.push('  diffExcerpt: |');
+          var excerptLines = tc.diffExcerpt.split('\n');
+          for (var el = 0; el < excerptLines.length; el++) {
+            lines.push('    ' + excerptLines[el]);
+          }
+        }
+      });
+    }
+    lines.push('');
+    lines.push('## Attempts');
+    lines.push('');
+    var attempts = repair.attempts || [];
+    if (attempts.length === 0) {
+      lines.push('_no attempts_');
+    } else {
+      lines.push('| n | signature | domain | repairKind | status | checks | branch | headSha | deployed | verifyStatus |');
+      lines.push('|---|---|---|---|---|---|---|---|---|---|');
+      attempts.forEach(function(a) {
+        lines.push('| ' + (a.n || '') +
+          ' | ' + (a.signature || '') +
+          ' | ' + (a.domain || '') +
+          ' | ' + (a.repairKind || '') +
+          ' | ' + (a.status || '') +
+          ' | ' + (a.checks || '') +
+          ' | ' + (a.branch || '') +
+          ' | ' + (a.headSha ? a.headSha.substring(0, 7) : '') +
+          ' | ' + (a.deployed ? 'yes' : 'no') +
+          ' | ' + (a.verifyStatus || '') + ' |');
+      });
+    }
+    lines.push('');
+    lines.push('## Blockers');
+    lines.push('');
+    var blockers = repair.blockers || [];
+    if (blockers.length === 0) {
+      lines.push('_no blockers_');
+    } else {
+      blockers.forEach(function(blk) {
+        lines.push('- code: ' + (blk.code || 'n/a'));
+        lines.push('  message: ' + (blk.message || 'n/a'));
+        lines.push('  evidence: ' + JSON.stringify(blk.evidence || {}));
+      });
+    }
+    lines.push('');
+    lines.push('manualTargetEdits: ' + (repair.manualTargetEdits !== undefined ? repair.manualTargetEdits : 0));
+    lines.push('');
+  }
+
   if (report.compliance) {
     var compliance = report.compliance;
     lines.push('## Compliance Metadata (client-required 2 Oct 2026)');
@@ -440,6 +685,12 @@ module.exports = {
   RESULT_BLOCK: RESULT_BLOCK,
   RESULT_NA: RESULT_NA,
   RUN_LEVEL_END: RUN_LEVEL_END,
+  SCHEMA_VERSION_1_0: SCHEMA_VERSION_1_0,
+  SCHEMA_VERSION_1_1: SCHEMA_VERSION_1_1,
+  OUTCOME_FIXED: OUTCOME_FIXED,
+  OUTCOME_NOT_FIXED: OUTCOME_NOT_FIXED,
+  OUTCOME_BLOCKED: OUTCOME_BLOCKED,
+  OUTCOME_NOT_RUN: OUTCOME_NOT_RUN,
   REQUIRED_RECORD_FIELDS: REQUIRED_RECORD_FIELDS,
   generateReport: generateReport,
   renderMarkdownReport: renderMarkdownReport

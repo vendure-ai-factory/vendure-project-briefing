@@ -1,0 +1,71 @@
+{
+  "schemaVersion": "1.0",
+  "runId": "golden-ref",
+  "executionRevision": null,
+  "referenceCommit": null,
+  "protectedPathHashes": {
+    "pinned": null,
+    "runLevelEnd": null,
+    "tasks": {
+      "CAN-B1-01": {
+        "start": null,
+        "end": null,
+        "match": null,
+        "endMatchesPinned": null
+      }
+    }
+  },
+  "verifyOk": true,
+  "tasks": {
+    "CAN-B1-01": {
+      "ok": true,
+      "outcome": "PASS",
+      "result": "PASS",
+      "coverage": null,
+      "coverageAssertions": null,
+      "classification": null,
+      "cause": null,
+      "repairHistory": [],
+      "manualIntervention": null,
+      "protectedStartHash": null,
+      "protectedEndHash": null,
+      "protectedHashesMatch": null,
+      "endHashMatchesPinned": null,
+      "files": [
+        {
+          "path": "CAN-B1-01/result.json",
+          "expected": "4062edaf750fb8074e7e83e0c9028c94e32468a8b6f1614774328ef045150f93",
+          "actual": "4062edaf750fb8074e7e83e0c9028c94e32468a8b6f1614774328ef045150f93",
+          "match": true
+        },
+        {
+          "path": "CAN-B1-01/record.json",
+          "expected": "36141b00051daeaeb38bc98c8698bb2915b8ce4699a02581ecdb798739b11673",
+          "actual": "36141b00051daeaeb38bc98c8698bb2915b8ce4699a02581ecdb798739b11673",
+          "match": true
+        }
+      ]
+    }
+  },
+  "compliance": {
+    "schemaVersion": "1.0",
+    "protectedPathList": [
+      "manifest/acceptance-manifest.v0.4.json",
+      "manifest/inputs-registry.json",
+      "evaluation-demo/migration-input",
+      "evaluation-demo/migration-input/legacy/vendure-store/scripts",
+      "evaluation-demo/migration-input/legacy/vendure-store/tools"
+    ],
+    "referenceHashes": {
+      "documentSha256": null,
+      "expectedValuesHash": null,
+      "fixturesSha256": null
+    },
+    "executionHead": null,
+    "referenceCommit": null,
+    "repairCommits": [],
+    "repairHistory": []
+  },
+  "protectedPathMismatch": [],
+  "ok": true
+}

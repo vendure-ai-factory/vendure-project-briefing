@@ -11,6 +11,11 @@ on:
           - preflight
           - pipeline
         default: preflight
+      repair:
+        description: "Enable repair mode"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,6 +27,7 @@ concurrency:
 env:
   STAGING_API_URL: https://staging.tibella.eu
   STAGING_ARCHIVE_DIR: /opt/pipeline-archive
+  REPAIR_MODE: ${{ inputs.repair }}
 
 jobs:
   staging-preflight:
@@ -39,10 +45,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Prepare Node.js 20 runtime
+      - name: Prepare Node.js 22 runtime
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.22.3
           check-latest: false
 
       - name: Verify runner toolchain
@@ -123,7 +129,7 @@ jobs:
     needs: staging-preflight
     runs-on: [self-hosted, linux, x64, staging-vps]
     environment: staging
-    timeout-minutes: 600
+    timeout-minutes: 60
 
     steps:
       - name: Checkout the requested revision
@@ -131,10 +137,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Prepare Node.js 20 runtime
+      - name: Prepare Node.js 22 runtime
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.22.3
           check-latest: false
 
       - name: Require the Pipeline entrypoint
@@ -145,6 +151,19 @@ jobs:
             echo "::error::pipeline/run-staging.mjs is not present. Add the Pipeline entrypoint through the branch/PR before selecting run_mode=pipeline."
             exit 78
           fi
+
+      # R5b: This step runs the repair pipeline. It may fail until run-repair.mjs is implemented.
+      - name: Repair run
+        if: ${{ inputs.repair == true }}
+        shell: bash
+        env:
+          VENDURE_STAGING_REPO_TOKEN: ${{ secrets.VENDURE_STAGING_REPO_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          REPAIR_MODE: ${{ inputs.repair }}
+        run: |
+          set -euo pipefail
+          set +x
+          node pipeline/run-repair.mjs
 
       - name: Run Pipeline in staging
         shell: bash
