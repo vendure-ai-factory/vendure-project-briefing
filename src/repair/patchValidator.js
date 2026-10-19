@@ -398,7 +398,7 @@ function validateModePipeline(editSet, protectedPaths) {
 
 function formatErrors(errors) {
   // Convert error objects to error strings with code prefix
-  return errors.map(function(e) {
+  return errors.map(function (e) {
     if (typeof e === 'string') {
       return e;
     }
@@ -482,7 +482,7 @@ function validate(editSet, options) {
   var allPaths = [];
   var pathFileMap = {};
 
-  // PASS 1: Validate structure and path rules BEFORE oldString matching
+  // STEP 1: Validate structure and path rules BEFORE oldString matching
   // This ensures PATH_ESCAPE, SECRET_NAME, PROTECTED_PATH, KIND_NOT_ALLOWED are caught first
 
   for (var i = 0; i < edits.length; i++) {
@@ -567,15 +567,15 @@ function validate(editSet, options) {
     errors.push({ code: ERR_CODES.TOO_MANY_LINES, message: 'Maximum 200 changed lines allowed, got: ' + stats.totalChangedLines });
   }
 
-  // PASS 2: RepairKind-specific path restrictions (MUST happen before oldString check)
-  // For dependency-bump, only package.json and lockfile are allowed - check here, not in oldString pass
+  // STEP 2: RepairKind-specific path restrictions (MUST happen before oldString check)
+  // For dependency-bump, only package.json and lockfile are allowed - check here, not in oldString STEP
 
   if (editSet.repairKind === 'dependency-bump') {
     var depErrors = validateDependencyBump(editSet, cloneDir);
     errors = errors.concat(depErrors);
   }
 
-  // PASS 3: oldString validation (only for existing files, after path rules pass)
+  // STEP 3: oldString validation (only for existing files, after path rules STEP)
   // This runs AFTER path validation ensures the file is in an allowed location
 
   for (var pathKey in pathFileMap) {
