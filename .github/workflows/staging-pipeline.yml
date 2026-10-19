@@ -159,9 +159,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           STAGING_ADMIN_EMAIL: ${{ secrets.STAGING_ADMIN_EMAIL }}
           STAGING_ADMIN_PASSWORD: ${{ secrets.STAGING_ADMIN_PASSWORD }}
-          SEED_TEST_CUSTOMER_PASSWORD: ${{ secrets.SEED_TEST_CUSTOMER_PASSWORD }}
-          CHANNEL_TOKENS: ${{ secrets.CHANNEL_TOKENS }}
-          VENDURE_STAGING_REPO_TOKEN: ${{ secrets.VENDURE_STAGING_REPO_TOKEN }}
+          SEED_TEST_CUSTOMER_PASSWORD: ${{ secrets.SEED_TEST_CUSTOMER_PASSWORD }}         
         run: |
           set -euo pipefail
           set +x
@@ -180,7 +178,7 @@ jobs:
       # TARGET_APP_DEFECT / API-error tasks, and writes the schema 1.1 repair
       # block through the existing report path.
       - name: Repair run
-        if: ${{ inputs.repair == true }}
+        if: ${{ !cancelled() && inputs.repair == true }}
         shell: bash
         env:
           VENDURE_STAGING_REPO_TOKEN: ${{ secrets.VENDURE_STAGING_REPO_TOKEN }}
