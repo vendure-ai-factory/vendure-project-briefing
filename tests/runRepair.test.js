@@ -614,3 +614,45 @@ test('run-repair: run-staging.mjs exposes runStage for the rerun path', async fu
   assert.strictEqual(stages.length, 3);
 });
 
+test('run-repair: evidence/<runId>/repair/finding.json written BEFORE blocker return', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var ctrl = {};
+  ctrl.propose = function() {
+    return { status: 'MODEL_FAILED', blocker: { code: 'MODEL_UNAVAILABLE', message: 'OpenRouter API 401', evidence: { status: 401 } } };
+  };
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-evidblock',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-evid', OPENROUTER_API_KEY: 'key-evid' },
+    adapters: fakeAdapters(ctrl, log)
+  });
+  assert.strictEqual(res.outcome, 'BLOCKED');
+  assert.strictEqual(res.exitCode, 4);
+
+  // The evidence file must exist even though the repair was BLOCKED
+  var evidPath = path.join(cwd, 'evidence', 'run-evidblock', 'repair', 'finding.json');
+  assert.strictEqual(fs.existsSync(evidPath), true, 'evidence/<runId>/repair/finding.json must exist for blocked repair');
+
+  var evid = JSON.parse(fs.readFileSync(evidPath, 'utf8'));
+  assert.strictEqual(evid.class, 'SQL_PARAM_TYPE', 'class should match finding');
+  assert.strictEqual(evid.domain, 'target-code', 'domain should match finding (not infrastructure)');
+  assert.strictEqual(evid.signature, FINDING_SIG, 'signature should match finding');
+  assert.strictEqual(evid.confidence, 'API_ONLY', 'confidence should match finding');
+
+  // logs_collected_per_kind must be present with counts and byte sizes
+  assert.ok(evid.logs_collected_per_kind, 'logs_collected_per_kind must be present');
+  var kinds = ['postgres', 'vendure', 'worker'];
+  for (var i = 0; i < kinds.length; i++) {
+    var kind = kinds[i];
+    assert.ok(evid.logs_collected_per_kind[kind], 'logs entry for ' + kind + ' must exist');
+    assert.strictEqual(typeof evid.logs_collected_per_kind[kind].count, 'number', 'count for ' + kind);
+    assert.strictEqual(typeof evid.logs_collected_per_kind[kind].bytes, 'number', 'bytes for ' + kind);
+    // Verify it's counts/sizes only - no actual log content
+    assert.ok(!evid.logs_collected_per_kind[kind].lines, 'no lines field (counts only)');
+    assert.ok(!evid.logs_collected_per_kind[kind].content, 'no content field (counts only)');
+  }
+});
+

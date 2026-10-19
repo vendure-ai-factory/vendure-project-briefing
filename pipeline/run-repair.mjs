@@ -278,6 +278,44 @@ function safeErr(e) {
 }
 
 /**
+ * Write finding evidence to evidence/<runId>/repair/finding.json BEFORE any
+ * blocker return. Records counts and byte sizes of logs per kind (no content).
+ * Safe to call multiple times; only writes when finding is present.
+ */
+function writeFindingEvidence(cfg, state) {
+  if (!cfg || !cfg.runId || !state || !state.finding) return;
+  var f = state.finding;
+  var logsInfo = {};
+  var kinds = ['postgres', 'vendure', 'worker'];
+  for (var k = 0; k < kinds.length; k++) {
+    var kind = kinds[k];
+    var lines = state.logs && Array.isArray(state.logs[kind]) ? state.logs[kind] : [];
+    var totalBytes = 0;
+    for (var i = 0; i < lines.length; i++) totalBytes += lines[i] ? lines[i].length : 0;
+    logsInfo[kind] = { count: lines.length, bytes: totalBytes };
+  }
+  var findingJson = {
+    class: f.class || null,
+    domain: f.domain || null,
+    sqlstate: f.sqlstate || null,
+    signature: f.signature || null,
+    confidence: f.confidence || null,
+    logs_collected_per_kind: logsInfo
+  };
+  try {
+    var evidenceDir = path.join(cfg.cwd, EVIDENCE_DIR, cfg.runId, 'repair');
+    cfg.fs.mkdirSync(evidenceDir, { recursive: true });
+    cfg.fs.writeFileSync(
+      path.join(evidenceDir, 'finding.json'),
+      JSON.stringify(findingJson, null, 2) + '\n',
+      'utf8'
+    );
+  } catch (e) {
+    // best-effort: never throw from evidence writing
+  }
+}
+
+/**
  * Normalize an arbitrary adapter refusal into the blocker record shape
  * ({ code, message, evidence }) used by the report. The evidence is
  * redacted in-memory so a token or key can never be persisted.
@@ -630,6 +668,7 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
   });
 
   if (!propose || typeof propose !== 'object') {
+    writeFindingEvidence(cfg, state);
     return { next: 'stop-blocked', blocker: normalizeBlocker('PROPOSE_FAILED', 'proposeAndCheck returned no result', {}) };
   }
 
@@ -637,11 +676,13 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
     return { next: 'stop-budget', blocker: propose.blocker || null };
   }
   if (propose.status === 'BLOCKED') {
+    writeFindingEvidence(cfg, state);
     return { next: 'stop-blocked', blocker: propose.blocker || normalizeBlocker('BLOCKED', 'proposeAndCheck blocked', {}) };
   }
   if (propose.status === 'MODEL_FAILED') {
     // Model unavailable (or an unusable model response) is a terminal blocker,
     // never retried by another route.
+    writeFindingEvidence(cfg, state);
     return { next: 'stop-blocked', blocker: propose.blocker || normalizeBlocker('MODEL_UNAVAILABLE', 'model call failed', {}) };
   }
   if (propose.status !== 'READY') {
@@ -674,6 +715,7 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
     timeout: 120000
   });
   if (!pushResult || !pushResult.ok) {
+    writeFindingEvidence(cfg, state);
     return { next: 'stop-blocked', blocker: pushResult && pushResult.blocker ? pushResult.blocker : normalizeBlocker('PUSH_FAILED', 'git push failed', {}) };
   }
 
@@ -685,6 +727,7 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
     now: Date.now
   });
   if (!buildResult || !buildResult.ok) {
+    writeFindingEvidence(cfg, state);
     return { next: 'stop-blocked', blocker: buildResult && buildResult.blocker ? buildResult.blocker : normalizeBlocker('IMAGE_BUILD_DISPATCH_FAILED', 'image build/publish failed', {}) };
   }
 
@@ -694,6 +737,7 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
     fetch: cfg.fetch
   });
   if (!deployResult || !deployResult.ok) {
+    writeFindingEvidence(cfg, state);
     return { next: 'stop-blocked', blocker: deployResult && deployResult.blocker ? deployResult.blocker : normalizeBlocker('DEPLOY_REFUSED', 'deploy refused', {}) };
   }
 
@@ -854,6 +898,7 @@ async function runRepair(deps) {
   // A log wrapper refusal is a BLOCKED status: stop after extraction.
   if (state.logBlockers.length > 0) {
     state.blockers = state.logBlockers.slice();
+    writeFindingEvidence(cfg, state);
     state.outcome = OUTCOME_BLOCKED;
     state.exitCode = EXIT_BLOCKED;
     writeRepairReport(cfg, state);
@@ -866,6 +911,7 @@ async function runRepair(deps) {
   if (!located || !located.ok) {
     var gblk = located && located.blocker ? located.blocker : normalizeBlocker('GIT_BLOCKED', 'git setup failed', {});
     state.blockers.push(gblk);
+    writeFindingEvidence(cfg, state);
     state.outcome = OUTCOME_BLOCKED;
     state.exitCode = EXIT_BLOCKED;
     writeRepairReport(cfg, state);

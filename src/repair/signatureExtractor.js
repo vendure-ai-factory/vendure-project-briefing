@@ -34,7 +34,17 @@ var INFRA_PATTERNS = [
   { pattern: /ENOTFOUND|DNS/i, domain: 'infrastructure' },
   { pattern: /401\s+Unauthorized/i, domain: 'infrastructure' },
   { pattern: /403\s+Forbidden/i, domain: 'infrastructure' },
-  { pattern: /\b5\d{2}\b/, domain: 'infrastructure' }
+  { pattern: /gateway.*timeout|504\s+Gateway\s+Timeout/i, domain: 'infrastructure' },
+  { pattern: /502\s+Bad\s+Gateway|503\s+Service\s+Unavailable/i, domain: 'infrastructure' }
+];
+
+var APP_LAYER_SQL_PATTERNS = [
+  { pattern: /invalid input syntax for type (integer|decimal|numeric|real|double precision|smallint|bigint|boolean|date|time|timestamp)/i, domain: 'target-code' },
+  { pattern: /operator does not exist/i, domain: 'target-code' },
+  { pattern: /column ["'`\w.]+ does not exist/i, domain: 'database' },
+  { pattern: /relation ["'`\w.]+ does not exist/i, domain: 'database' },
+  { pattern: /permission denied for/i, domain: 'database' },
+  { pattern: /duplicate key value violates unique constraint/i, domain: 'database' }
 ];
 
 var GRAPHQL_PIPELINE_PATTERNS = [
@@ -174,6 +184,12 @@ function decideDomain(sqlstate, apiErrors, logExcerpt) {
   for (var ci = 0; ci < CLIENT_INPUT_PATTERNS.length; ci++) {
     if (CLIENT_INPUT_PATTERNS[ci].pattern.test(allText)) {
       return CLIENT_INPUT_PATTERNS[ci].domain;
+    }
+  }
+
+  for (var al = 0; al < APP_LAYER_SQL_PATTERNS.length; al++) {
+    if (APP_LAYER_SQL_PATTERNS[al].pattern.test(allText)) {
+      return APP_LAYER_SQL_PATTERNS[al].domain;
     }
   }
 
@@ -414,4 +430,26 @@ function extractFinding(input) {
   };
 }
 
-module.exports = { extractFinding: extractFinding };
+module.exports = {
+  extractFinding: extractFinding,
+  DOMAIN_DECISION_TABLE: {
+    rules: [
+      { order: 1,  name: 'sqlstate-hard',   condition: 'sqlstate in DB_SQLSTATES_HARD',       domain: 'DB_SQLSTATES_HARD[sqlstate]', blocked: true },
+      { order: 2,  name: 'sqlstate-soft',   condition: 'sqlstate in DB_SQLSTATES_SOFT',         domain: 'target-code (or dependency/pipeline from stack)', blocked: false },
+      { order: 3,  name: 'graphql-pipeline',condition: 'GraphQL schema/query error patterns',  domain: 'pipeline',                          blocked: false },
+      { order: 4,  name: 'client-input',    condition: 'missing required/input/credential',   domain: 'client-input',                       blocked: true  },
+      { order: 5,  name: 'app-layer-sql',   condition: 'SQL param type/syntax/constraint in GraphQL error', domain: 'target-code or database', blocked: false },
+      { order: 6,  name: 'infrastructure',  condition: 'ECONNREFUSED/ETIMEDOUT/ENOTFOUND/401/403/504/502/503 Gateway', domain: 'infrastructure', blocked: true },
+      { order: 7,  name: 'stack-node_modules',condition: 'stack frame in node_modules/',       domain: 'dependency',                         blocked: false },
+      { order: 8,  name: 'stack-pipeline', condition: 'stack frame in src/repair/ or src/staging/', domain: 'pipeline',                     blocked: false },
+      { order: 9,  name: 'stack-src-file', condition: 'stack frame in src/*.js (target repo)', domain: 'target-code',                        blocked: false },
+      { order: 10, name: 'fallback',       condition: 'no match',                             domain: 'unknown',                            blocked: false }
+    ],
+    fallback: {
+      domain: 'unknown',
+      blocked: false,
+      note: 'unknown must NOT be blocked without a model call; repair loop proceeds to log collection'
+    },
+    infra_scope: 'infrastructure is assigned ONLY for: ECONNREFUSED, ETIMEDOUT, ENOTFOUND/DNS, TLS handshake, HTTP 502/503/504 from gateway, container/OOM kill, disk full. SQL/Postgres type/syntax/constraint errors in GraphQL are application-layer (target-code when no migration/schema evidence, database when schema/constraint evidence exists).'
+  }
+};

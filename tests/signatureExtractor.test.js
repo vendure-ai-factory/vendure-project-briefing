@@ -286,3 +286,125 @@ test('signatureExtractor: missing artifact -> domain client-input', function(t, 
   assert.strictEqual(result.domain, 'client-input', 'missing artifact should be client-input');
   done();
 });
+
+// (a) exact case from bug report: GraphQL SQL integer mismatch -> domain NOT infrastructure
+test('signatureExtractor: GraphQL SQL integer mismatch -> domain target-code (not infrastructure)', function(t, done) {
+  var input = {
+    apiErrors: [{ message: 'invalid input syntax for type integer: "undefined"', path: ['products'], extensions: { code: 'BAD_USER_INPUT' } }]
+  };
+  var result = signatureExtractor.extractFinding(input);
+
+  assert.notStrictEqual(result.domain, 'infrastructure', 'domain must NOT be infrastructure for SQL integer mismatch');
+  assert.strictEqual(result.domain, 'target-code', 'domain should be target-code for GraphQL SQL param error');
+  assert.strictEqual(result.sqlstate, null, 'sqlstate should be null (no SQLSTATE in apiErrors)');
+  done();
+});
+
+// (a2) same GraphQL SQL error with undefined in cause text -> domain target-code
+test('signatureExtractor: GraphQL error with product.id != $3 undefined -> domain target-code', function(t, done) {
+  var input = {
+    apiErrors: [
+      { message: 'invalid input syntax for type integer: "undefined"', path: ['products'], extensions: { code: 'BAD_USER_INPUT' } }
+    ]
+  };
+  var result = signatureExtractor.extractFinding(input);
+
+  assert.strictEqual(result.domain, 'target-code', 'domain should be target-code, not infrastructure');
+  done();
+});
+
+// (b) ECONNREFUSED -> domain infrastructure
+test('signatureExtractor: ECONNREFUSED -> domain infrastructure', function(t, done) {
+  var input = {
+    apiErrors: [{ message: 'connect ECONNREFUSED 127.0.0.1:54321', path: null, extensions: {} }]
+  };
+  var result = signatureExtractor.extractFinding(input);
+
+  assert.strictEqual(result.domain, 'infrastructure', 'ECONNREFUSED should be infrastructure');
+  done();
+});
+
+// (b2) 503 Service Unavailable -> domain infrastructure
+test('signatureExtractor: 503 Service Unavailable -> domain infrastructure', function(t, done) {
+  var input = {
+    apiErrors: [{ message: 'HTTP 503 Service Unavailable', path: null, extensions: {} }]
+  };
+  var result = signatureExtractor.extractFinding(input);
+
+  assert.strictEqual(result.domain, 'infrastructure', '503 Service Unavailable should be infrastructure');
+  done();
+});
+
+// (b3) 504 Gateway Timeout -> domain infrastructure
+test('signatureExtractor: 504 Gateway Timeout -> domain infrastructure', function(t, done) {
+  var input = {
+    apiErrors: [{ message: '504 Gateway Timeout', path: null, extensions: {} }]
+  };
+  var result = signatureExtractor.extractFinding(input);
+
+  assert.strictEqual(result.domain, 'infrastructure', '504 Gateway Timeout should be infrastructure');
+  done();
+});
+
+// (c) missing-relation SQL error -> domain database
+test('signatureExtractor: missing relation -> domain database', function(t, done) {
+  var input = {
+    apiErrors: [{ message: 'relation "public.products" does not exist', path: null, extensions: { code: '42P01' } }]
+  };
+  var result = signatureExtractor.extractFinding(input);
+
+  assert.strictEqual(result.domain, 'database', 'missing-relation SQL error should be database');
+  done();
+});
+
+// (d) no signals -> domain unknown (not infrastructure)
+test('signatureExtractor: no input signals -> domain unknown', function(t, done) {
+  var input = {
+    apiErrors: [{ message: 'something went wrong but not sure what', path: ['x'] }]
+  };
+  var result = signatureExtractor.extractFinding(input);
+
+  assert.strictEqual(result.domain, 'unknown', 'domain should be unknown when no signals found');
+  assert.notStrictEqual(result.domain, 'infrastructure', 'unknown must NOT be infrastructure');
+  done();
+});
+
+// (d2) null input -> domain unknown (not infrastructure)
+test('signatureExtractor: null input -> domain unknown (not infrastructure)', function(t, done) {
+  var result = signatureExtractor.extractFinding(null);
+
+  assert.strictEqual(result.domain, 'unknown', 'null input should give domain unknown');
+  assert.notStrictEqual(result.domain, 'infrastructure', 'unknown must NOT be infrastructure');
+  done();
+});
+
+// (e) forbidden terms guard: source strings must not contain classification keywords
+test('signatureExtractor: forbidden terms guard - store-credit not in src/', function(t, done) {
+  var sigExtSrc = require('fs').readFileSync(require('path').resolve(__dirname, '../src/repair/signatureExtractor.js'), 'utf8');
+  var forbidden = ['store-credit', 'npp', 'notEq'];
+  var found = forbidden.filter(function(term) { return sigExtSrc.indexOf(term) !== -1; });
+  assert.deepStrictEqual(found, [], 'src/repair/signatureExtractor.js must not contain forbidden classification keywords: ' + forbidden.join(', '));
+  done();
+});
+
+// DOMAIN_DECISION_TABLE is exported
+test('signatureExtractor: DOMAIN_DECISION_TABLE is exported', function(t, done) {
+  var exported = require('../src/repair/signatureExtractor');
+  assert.ok(exported.DOMAIN_DECISION_TABLE, 'DOMAIN_DECISION_TABLE should be exported');
+  assert.ok(Array.isArray(exported.DOMAIN_DECISION_TABLE.rules), 'rules should be an array');
+  assert.ok(exported.DOMAIN_DECISION_TABLE.fallback, 'fallback should be present');
+  assert.ok(exported.DOMAIN_DECISION_TABLE.infra_scope, 'infra_scope should be present');
+  done();
+});
+
+// Integer type mismatch via APP_LAYER_SQL_PATTERNS before INFRA_PATTERNS
+test('signatureExtractor: integer type mismatch does NOT trigger infrastructure via 5xx pattern', function(t, done) {
+  var input = {
+    apiErrors: [{ message: 'invalid input syntax for type integer: "NaN"', path: ['products'], extensions: {} }]
+  };
+  var result = signatureExtractor.extractFinding(input);
+
+  assert.notStrictEqual(result.domain, 'infrastructure', 'integer type mismatch must not be classified as infrastructure');
+  assert.strictEqual(result.domain, 'target-code', 'integer type mismatch should be target-code');
+  done();
+});
