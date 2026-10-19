@@ -29,6 +29,7 @@ export const OUTCOME_BLOCKED = 'BLOCKED';
 export const REPAIR_TASK_IDS = ['CAN-B1-03', 'CAN-B1-04', 'CAN-B2-16'];
 
 const CLASS_TARGET_APP_DEFECT = 'TARGET_APP_DEFECT';
+const CLASS_CLIENT_INPUT_SCOPE = 'CLIENT_INPUT_SCOPE';
 
 const MANIFEST_PATH = 'manifest/acceptance-manifest.v0.4.json';
 const DEFAULT_ARCHIVE_ROOT = '/opt/pipeline-archive';
@@ -403,7 +404,7 @@ async function defaultCloneAndLocate(cfg, adapters, finding) {
   var absent = [cfg.targetRepoUrl, branch, dir, cfg.token].some(function(v) { return !hasText(v); });
   var clone = absent ? { ok: false, blocker: normalizeBlocker('MISSING_GIT_INPUT', 'git clone input incomplete', {}) } : null;
   if (!clone) {
-    clone = await git.cloneTarget({
+    clone = await git.cloneRepoForRepair({
       repoUrl: cfg.targetRepoUrl,
       branch: branch,
       dir: dir,
@@ -784,6 +785,28 @@ async function runRepair(deps) {
   var targets = selectRepairTargets(normal.tasks);
   if (targets.length === 0) {
     return { outcome: OUTCOME_NO_REPAIR, exitCode: EXIT_NO_REPAIR, runId: cfg.runId || null, blockers: [] };
+  }
+
+  // Pre-check: if any target is blocked with CLIENT_INPUT_SCOPE (seed failed /
+  // missing client secret) repair cannot proceed. Do not clone or call the model.
+  var clientInputTasks = normal.tasks.filter(function(t) {
+    return t && t.classification === CLASS_CLIENT_INPUT_SCOPE;
+  });
+  if (clientInputTasks.length > 0) {
+    var firstBlocked = clientInputTasks[0];
+    var evidence = {
+      classification: CLASS_CLIENT_INPUT_SCOPE,
+      cause: firstBlocked.cause || ('task ' + firstBlocked.taskId + ' blocked: CLIENT_INPUT_SCOPE'),
+      variableNames: (firstBlocked.variableNames && Array.isArray(firstBlocked.variableNames))
+        ? firstBlocked.variableNames.slice()
+        : []
+    };
+    return {
+      outcome: OUTCOME_BLOCKED,
+      exitCode: EXIT_BLOCKED,
+      runId: cfg.runId || null,
+      blockers: [{ code: 'REPAIR_PRECONDITION_NOT_MET', message: 'task blocked with CLIENT_INPUT_SCOPE: repair precondition not met', evidence: evidence }]
+    };
   }
 
   var adapters = Object.assign({}, defaultAdapters(), cfg.adapters || {});

@@ -150,6 +150,11 @@ function fakeAdapters(ctrl, log) {
         if (ctrl.cloneBlock) return { ok: false, blocker: { code: 'CLONE_FAILED', message: 'remote branch not found', evidence: { branch: opts.branch } } };
         return { ok: true, dir: opts.dir, branch: opts.branch };
       },
+      cloneRepoForRepair: async function(opts) {
+        log.push('cloneRepoForRepair:' + opts.branch);
+        if (ctrl.cloneBlock) return { ok: false, blocker: { code: 'CLONE_FAILED', message: 'remote branch not found', evidence: { branch: opts.branch } } };
+        return { ok: true, dir: opts.dir, branch: opts.branch };
+      },
       getHeadSha: async function() {
         log.push('getHeadSha');
         if (ctrl.headShaBlock) return { ok: false, blocker: { code: 'HEAD_SHA_FAILED', message: 'failed' } };
@@ -208,7 +213,7 @@ async function runOnce(deps) {
 }
 
 // log is an array of pushed strings; each entry is a prefix label (e.g.
-// 'cloneTarget:<branch>'). Use this helper instead of Array#indexOf, which
+// 'cloneRepoForRepair:<branch>'). Use this helper instead of Array#indexOf, which
 // compares whole elements only.
 function hasLog(log, prefix) {
   return log.some(function(s) { return s.indexOf(prefix) === 0; });
@@ -274,7 +279,7 @@ test('run-repair: FIXED on attempt 1', async function() {
   assert.strictEqual(res.outcome, 'FIXED');
   assert.strictEqual(res.exitCode, 0);
   assert.ok(hasLog(log,'collect:vendure') && hasLog(log,'collect:postgres') && hasLog(log,'collect:worker'), 'all three log kinds collected');
-  assert.ok(hasLog(log,'extractFinding'), 'finding extracted');  assert.ok(hasLog(log,'cloneTarget:'), 'cloned');
+  assert.ok(hasLog(log,'extractFinding'), 'finding extracted');  assert.ok(hasLog(log,'cloneRepoForRepair:'), 'cloned via cloneRepoForRepair');
   assert.ok(hasLog(log,'push:'), 'pushed');
   assert.ok(hasLog(log,'build'), 'built');
   assert.ok(hasLog(log,'deploy:'), 'deployed');
@@ -402,8 +407,40 @@ test('run-repair: BLOCKED when log wrapper refuses (finding still extracted)', a
   assert.strictEqual(res.outcome, 'BLOCKED');
   assert.strictEqual(res.exitCode, 4);
   assert.ok(hasLog(log,'extractFinding'), 'finding extraction proceeds past the log blocker');
-  assert.ok(!hasLog(log,'cloneTarget'), 'no git op after a log block');
+  assert.ok(!hasLog(log,'cloneRepoForRepair'), 'no git op after a log block');
   assert.ok(res.blockers.some(function(b) { return b.code === 'LOG_WRAPPER_REFUSED'; }), 'exact blocker recorded');
+});
+
+test('run-repair: CLIENT_INPUT_SCOPE blocked seed -> REPAIR_PRECONDITION_NOT_MET, no gitClient call', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  // Task blocked with CLIENT_INPUT_SCOPE (seed failed / missing secret)
+  var clientInputRun = [
+    { taskId: 'CAN-B1-03', result: 'BLOCK', classification: 'CLIENT_INPUT_SCOPE', cause: 'seed failed: ADMIN_CREDENTIALS_MISSING; missing STAGING_ADMIN_PASSWORD, SUPERADMIN_PASSWORD', variableNames: ['STAGING_ADMIN_PASSWORD', 'SUPERADMIN_PASSWORD'] },
+    { taskId: 'CAN-B1-04', result: 'BLOCK', classification: 'CLIENT_INPUT_SCOPE', cause: 'seed failed: SEED_CONFIG_BLOCKED; missing client-supplied secret SEED_TEST_CUSTOMER_PASSWORD', variableNames: ['SEED_TEST_CUSTOMER_PASSWORD'] },
+    { taskId: 'CAN-B2-16', result: 'RESULT_PASS', classification: null, cause: null }
+  ];
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-clientblock',
+    cwd: cwd,
+    normalRun: clientInputRun,
+    adapters: fakeAdapters({}, log)
+  });
+  assert.strictEqual(res.outcome, 'BLOCKED');
+  assert.strictEqual(res.exitCode, 4);
+  var blocker = res.blockers && res.blockers.find(function(b) { return b.code === 'REPAIR_PRECONDITION_NOT_MET'; });
+  assert.ok(blocker, 'REPAIR_PRECONDITION_NOT_MET blocker present');
+  var ev = blocker && blocker.evidence;
+  assert.strictEqual(ev && ev.classification, 'CLIENT_INPUT_SCOPE');
+  assert.ok(ev && ev.variableNames && Array.isArray(ev.variableNames),
+    'evidence.variableNames is an array (names only, never values)');
+  assert.ok(ev && ev.variableNames.indexOf('STAGING_ADMIN_PASSWORD') !== -1 ||
+             ev && ev.variableNames.indexOf('SEED_TEST_CUSTOMER_PASSWORD') !== -1,
+    'variableNames includes the missing secret names');
+  // No git operation must have been attempted
+  assert.ok(!hasLog(log, 'cloneTarget') && !hasLog(log, 'cloneRepoForRepair'), 'no gitClient call');
+  assert.ok(!hasLog(log, 'collect:vendure'), 'no log collection (prerequisite fails before that step)');
 });
 
 test('run-repair: BLOCKED when git clone refuses', async function() {

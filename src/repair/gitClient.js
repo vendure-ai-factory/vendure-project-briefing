@@ -403,8 +403,90 @@ function diffText(dir, baseSha, maxBytes, opts) {
   });
 }
 
+/**
+ * Clone a target repository using the default branch (no --branch), then
+ * create the fix branch locally with `git checkout -b`.  The clone step
+ * carries no fix-branch ref so it never 128s on a missing branch; the
+ * subsequent checkout -b raises a new local branch that is pushed via the
+ * existing push() path (which already enforces the fix-branch contract).
+ *
+ * Credentials go only through the git config env block; they never travel in
+ * argv, the URL or stdout/stderr.
+ */
+function cloneRepoForRepair(opts) {
+  opts = opts || {};
+  var repoUrl = opts.repoUrl;
+  var branch = opts.branch;  // the fix branch name to create after clone
+  var dir = opts.dir;
+  var token = opts.token;
+  var runCommand = opts.runCommand;
+
+  if (typeof runCommand !== 'function') {
+    return Promise.resolve(blockerFor('IO_NOT_INJECTED', 'runCommand executor was not injected', {}));
+  }
+  if (!isAllowedRepoUrl(repoUrl)) {
+    return Promise.resolve(blockerFor('UNSAFE_REPOSITORY_URL', 'Only https://github.com/vendure-ai-factory/* repositories may be cloned', { repoUrl: repoUrl }));
+  }
+  if (!isFixBranch(branch)) {
+    return Promise.resolve(blockerFor('UNSAFE_BRANCH_NAME', 'Branch name must match codex/pipeline-fix-<runId>-<sig8>', { branch: branch }));
+  }
+  if (typeof dir !== 'string' || dir.length === 0) {
+    return Promise.resolve(blockerFor('MISSING_CLONE_DIR', 'A clone directory is required', {}));
+  }
+  if (typeof token !== 'string' || token.length === 0) {
+    return Promise.resolve(blockerFor('MISSING_TOKEN', 'A token is required to clone', {}));
+  }
+
+  var authEnv = gitAuthEnv(token);
+  var authorEnv = commitAuthorEnv();
+  var env = {
+    GIT_CONFIG_COUNT: authEnv.GIT_CONFIG_COUNT,
+    GIT_CONFIG_KEY_0: authEnv.GIT_CONFIG_KEY_0,
+    GIT_CONFIG_VALUE_0: authEnv.GIT_CONFIG_VALUE_0,
+    GIT_AUTHOR_NAME: authorEnv.GIT_AUTHOR_NAME,
+    GIT_AUTHOR_EMAIL: authorEnv.GIT_AUTHOR_EMAIL,
+    GIT_COMMITTER_NAME: authorEnv.GIT_COMMITTER_NAME,
+    GIT_COMMITTER_EMAIL: authorEnv.GIT_COMMITTER_EMAIL
+  };
+
+  // Step 1: clone the default branch (no --branch flag)
+  return runCommand('git', ['clone', '--single-branch', '--depth', '1', repoUrl, dir], {
+    cwd: opts.cwd,
+    env: env,
+    timeout: opts.timeout || DEFAULT_TIMEOUT_MS
+  }).then(function(res) {
+    var r = normalizeExecResult(res);
+    var stderr = redactOutput(redactOutput(r.stderr, [token]), [repoUrl]);
+    if (!r.success) {
+      return blockerFor('CLONE_FAILED', 'git clone failed: ' + (r.error || ('exit code ' + r.exitCode)), {
+        exitCode: r.exitCode,
+        stderr: stderr
+      });
+    }
+    // Step 2: create the fix branch locally (only on successful clone)
+    return runCommand('git', ['checkout', '-b', branch], {
+      cwd: dir,
+      timeout: opts.timeout || DEFAULT_TIMEOUT_MS
+    });
+  }).then(function(res) {
+    // If clone step returned a blocker (early exit), propagate it unchanged
+    if (res && res.ok === false && res.blocker) {
+      return res;
+    }
+    var r = normalizeExecResult(res);
+    if (!r.success) {
+      return blockerFor('BRANCH_FAILED', 'git checkout -b failed: ' + (r.error || ('exit code ' + r.exitCode)), {
+        exitCode: r.exitCode,
+        stderr: redactOutput(r.stderr, [])
+      });
+    }
+    return { ok: true, dir: dir, branch: branch };
+  });
+}
+
 module.exports = {
   cloneTarget: cloneTarget,
+  cloneRepoForRepair: cloneRepoForRepair,
   createBranch: createBranch,
   commitAll: commitAll,
   getHeadSha: getHeadSha,

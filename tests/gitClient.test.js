@@ -127,6 +127,107 @@ test('cloneTarget: success case', function() {
 });
 
 // ---------------------------------------------------------------------------
+// cloneRepoForRepair
+// ---------------------------------------------------------------------------
+
+test('cloneRepoForRepair: clone argv contains no --branch for fix branch; checkout -b follows', async function() {
+  var capturedCalls = [];
+  var fakeRunner = function(cmd, args, opts) {
+    capturedCalls.push({ cmd: cmd, args: args.slice() });
+    return Promise.resolve({ success: true, stdout: '', stderr: '', exitCode: 0 });
+  };
+
+  await gitClient.cloneRepoForRepair({
+    repoUrl: 'https://github.com/vendure-ai-factory/test-repo',
+    branch: 'codex/pipeline-fix-run1-abc12345',
+    dir: '/tmp/test-clone',
+    token: 'test-token',
+    runCommand: fakeRunner
+  });
+
+  assert.strictEqual(capturedCalls.length, 2, 'two git commands: clone then checkout -b');
+
+  // Verify clone has no --branch with the fix-branch name
+  var cloneArgs = capturedCalls[0].args;
+  var fixBranch = 'codex/pipeline-fix-run1-abc12345';
+  var branchIdx = cloneArgs.indexOf('--branch');
+  if (branchIdx !== -1) {
+    assert.notStrictEqual(cloneArgs[branchIdx + 1], fixBranch,
+      'clone argv must not use --branch with the fix-branch name');
+  } else {
+    assert.ok(true, 'no --branch flag in clone argv (expected: clone default branch)');
+  }
+
+  // Verify second call is git checkout -b <fix-branch>
+  assert.strictEqual(capturedCalls[1].cmd, 'git');
+  assert.deepStrictEqual(capturedCalls[1].args, ['checkout', '-b', fixBranch],
+    'second call is git checkout -b with the fix-branch name');
+});
+
+test('cloneRepoForRepair: non-fix-branch name -> BLOCK', function() {
+  var fakeRunner = makeFakeRunCommand({ results: [{ success: true, stdout: '', stderr: '', exitCode: 0 }] });
+  return gitClient.cloneRepoForRepair({
+    repoUrl: 'https://github.com/vendure-ai-factory/test',
+    branch: 'main',
+    dir: '/tmp/x',
+    token: 'tok',
+    runCommand: fakeRunner
+  }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'UNSAFE_BRANCH_NAME');
+  });
+});
+
+test('cloneRepoForRepair: clone failure returns CLONE_FAILED', function() {
+  var fakeRunner = makeFakeRunCommand({ results: [{ success: false, stdout: '', stderr: 'fatal: could not create work tree', exitCode: 128 }] });
+  return gitClient.cloneRepoForRepair({
+    repoUrl: 'https://github.com/vendure-ai-factory/test',
+    branch: 'codex/pipeline-fix-run1-abc12345',
+    dir: '/tmp/x',
+    token: 'tok',
+    runCommand: fakeRunner
+  }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'CLONE_FAILED');
+  });
+});
+
+test('cloneRepoForRepair: checkout -b failure returns BRANCH_FAILED', function() {
+  var fakeRunner = makeFakeRunCommand({ results: [
+    { success: true, stdout: 'Cloning', stderr: '', exitCode: 0 },
+    { success: false, stdout: '', stderr: 'fatal: not a valid branch name', exitCode: 128 }
+  ]});
+  return gitClient.cloneRepoForRepair({
+    repoUrl: 'https://github.com/vendure-ai-factory/test',
+    branch: 'codex/pipeline-fix-run1-abc12345',
+    dir: '/tmp/x',
+    token: 'tok',
+    runCommand: fakeRunner
+  }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'BRANCH_FAILED');
+  });
+});
+
+test('cloneRepoForRepair: success case', function() {
+  var fakeRunner = makeFakeRunCommand({ results: [
+    { success: true, stdout: 'Cloning', stderr: '', exitCode: 0 },
+    { success: true, stdout: '', stderr: '', exitCode: 0 }
+  ]});
+  return gitClient.cloneRepoForRepair({
+    repoUrl: 'https://github.com/vendure-ai-factory/test',
+    branch: 'codex/pipeline-fix-run1-abc12345',
+    dir: '/tmp/my-clone',
+    token: 'tok',
+    runCommand: fakeRunner
+  }).then(function(r) {
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.dir, '/tmp/my-clone');
+    assert.strictEqual(r.branch, 'codex/pipeline-fix-run1-abc12345');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // createBranch
 // ---------------------------------------------------------------------------
 

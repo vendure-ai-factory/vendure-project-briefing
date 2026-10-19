@@ -159,7 +159,8 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           STAGING_ADMIN_EMAIL: ${{ secrets.STAGING_ADMIN_EMAIL }}
           STAGING_ADMIN_PASSWORD: ${{ secrets.STAGING_ADMIN_PASSWORD }}
-          SEED_TEST_CUSTOMER_PASSWORD: ${{ secrets.SEED_TEST_CUSTOMER_PASSWORD }}         
+          SEED_TEST_CUSTOMER_PASSWORD: ${{ secrets.SEED_TEST_CUSTOMER_PASSWORD }}
+          CHANNEL_TOKENS: ${{ secrets.CHANNEL_TOKENS }}
         run: |
           set -euo pipefail
           set +x
@@ -186,6 +187,11 @@ jobs:
           REPAIR_MODE: ${{ inputs.repair }}
           PIPELINE_STAGING_URL: ${{ env.STAGING_API_URL }}
           PIPELINE_ARCHIVE_ROOT: ${{ env.STAGING_ARCHIVE_DIR }}
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          STAGING_ADMIN_EMAIL: ${{ secrets.STAGING_ADMIN_EMAIL }}
+          STAGING_ADMIN_PASSWORD: ${{ secrets.STAGING_ADMIN_PASSWORD }}
+          SEED_TEST_CUSTOMER_PASSWORD: ${{ secrets.SEED_TEST_CUSTOMER_PASSWORD }}
+          CHANNEL_TOKENS: ${{ secrets.CHANNEL_TOKENS }}
         run: |
           set -euo pipefail
           set +x
