@@ -1,10 +1,11 @@
 'use strict';
-'use strict';
 
 var fs = require('fs');
 var path = require('path');
 var crypto = require('crypto');
 var childProcess = require('child_process');
+var coerce = require('./coerce');
+var toText = coerce.toText;
 
 var DEFAULT_MAX_CANDIDATES = 5;
 var MAX_FILE_SIZE = 1024 * 1024; // 1MB
@@ -31,7 +32,7 @@ function deriveSearchPatterns(finding) {
   var queryPath = finding.path;
 
   if (operator && column) {
-    var colName = column.split('.').pop(); // e.g., 'col' from 'table.col'
+    var colName = toText(column).split('.').pop(); // e.g., 'col' from 'table.col'
 
     // Generic operator negation patterns
     if (operator === '!=') {

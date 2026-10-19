@@ -231,7 +231,9 @@ async function collectRepairLogs(cfg, logSource, state) {
         cwd: cfg.cwd
       });
       if (result && result.ok === true) {
-        state.logs[kind] = Array.isArray(result.lines) ? result.lines : [];
+        // Log lines may be an array of strings, one big string, or absent. Coerce
+        // any shape into an array of strings without throwing.
+        state.logs[kind] = toArrayLines(result.lines);
       } else if (result && result.blocker) {
         state.logBlockers.push(normalizeBlocker('LOG_WRAPPER_REFUSED',
           'log source refused for ' + kind, result.blocker));
@@ -278,6 +280,19 @@ function safeErr(e) {
 }
 
 /**
+ * Coerce a log source's lines value (array of strings, one big string, or
+ * abstract/missing) into an array of strings. Never throws.
+ */
+function toArrayLines(lines) {
+  if (lines == null) return [];
+  if (Array.isArray(lines)) return lines.map(function(l) { return l == null ? '' : String(l); });
+  if (typeof lines === 'string') {
+    return lines.split('\n').filter(function(l) { return l !== ''; });
+  }
+  return [String(lines)];
+}
+
+/**
  * Write finding evidence to evidence/<runId>/repair/finding.json BEFORE any
  * blocker return. Records counts and byte sizes of logs per kind (no content).
  * Safe to call multiple times; only writes when finding is present.
@@ -308,6 +323,41 @@ function writeFindingEvidence(cfg, state) {
     cfg.fs.writeFileSync(
       path.join(evidenceDir, 'finding.json'),
       JSON.stringify(findingJson, null, 2) + '\n',
+      'utf8'
+    );
+  } catch (e) {
+    // best-effort: never throw from evidence writing
+  }
+}
+
+/**
+ * Write attempt-level exception to evidence/<runId>/repair/attempt-error.json.
+ * Called from the REPAIR_ATTEMPT_ERROR catch handler before the blocker is recorded.
+ * Writes: {errorName, message, stack (stackToString, truncated), phase}.
+ * Message and stack are redacted for env secrets and email addresses.
+ */
+function writeAttemptError(cfg, err, phase) {
+  if (!cfg || !cfg.runId) return;
+  try {
+    var evidenceDir = path.join(cfg.cwd, EVIDENCE_DIR, cfg.runId, 'repair');
+    cfg.fs.mkdirSync(evidenceDir, { recursive: true });
+    var stackLib = require('../src/repair/coerce.js');
+    var redactMod = require('../src/repair/verifier.js');
+    var secretValues = collectSecretValues(cfg);
+    function redactAll(text) {
+      var out = redactMod.redactSecrets(text, secretValues);
+      out = redactMod.redactEmails(out);
+      return out;
+    }
+    var errObj = {
+      errorName: err && err.name ? err.name : 'Error',
+      message: redactAll(err && err.message ? err.message : String(err || 'unknown')),
+      stack: redactAll(stackLib.stackToString(err && err.stack, 2000)),
+      phase: phase || 'unknown'
+    };
+    cfg.fs.writeFileSync(
+      path.join(evidenceDir, 'attempt-error.json'),
+      JSON.stringify(errObj, null, 2) + '\n',
       'utf8'
     );
   } catch (e) {
@@ -895,6 +945,9 @@ async function runRepair(deps) {
   });
   state.baselineSignatures = Array.isArray(repro.signatures) ? repro.signatures : [];
 
+  // Write finding evidence early, before any attempt mutations.
+  writeFindingEvidence(cfg, state);
+
   // A log wrapper refusal is a BLOCKED status: stop after extraction.
   if (state.logBlockers.length > 0) {
     state.blockers = state.logBlockers.slice();
@@ -935,6 +988,7 @@ async function runRepair(deps) {
     try {
       result = await proposeAttempt(cfg, adapters, state, located, attemptNumber, budget);
     } catch (err) {
+      writeAttemptError(cfg, err, 'propose-attempt');
       state.blockers.push(normalizeBlocker('REPAIR_ATTEMPT_ERROR', safeErr(err), {}));
       break;
     }
@@ -1007,7 +1061,9 @@ export {
   writeRepairReport,
   redactRepairState,
   loadNormalRun,
-  resolveRunId
+  resolveRunId,
+  writeFindingEvidence,
+  writeAttemptError
 };
 
 

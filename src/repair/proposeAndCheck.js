@@ -2,6 +2,10 @@
 
 var path = require('path');
 var crypto = require('crypto');
+var coerce = require('./coerce');
+var stackToString = coerce.stackToString;
+var toText = coerce.toText;
+var toArray = coerce.toArray;
 
 // TARGET_PROTECTED_PATHS = ['.git/','.github/','deploy/'] plus protected paths from this repo
 var BASE_PROTECTED_PATHS = ['.git/', '.github/', 'deploy/'];
@@ -86,7 +90,7 @@ function formatPreviousAttempts(previousAttempts) {
     var attempt = previousAttempts[i];
     lines.push('Attempt ' + (i + 1) + ':');
     if (attempt.diff) {
-      lines.push('  diff: ' + attempt.diff.substring(0, 500));
+      lines.push('  diff: ' + toText(attempt.diff, 500));
     }
     if (attempt.checks && attempt.checks.results) {
       var failed = attempt.checks.results.filter(function(r) { return !r.success; });
@@ -129,7 +133,7 @@ function buildPrompt(finding, candidates, previousAttempts) {
     .replace('{{message}}', finding.message || 'unknown')
     .replace('{{path}}', finding.path || 'none')
     .replace('{{sql}}', finding.sql || 'none')
-    .replace('{{stack}}', (finding.stack || 'none').substring(0, 2000))
+    .replace('{{stack}}', stackToString(finding.stack, 2000))
     .replace('{{domain}}', finding.domain || 'unknown')
     .replace('{{confidence}}', String(finding.confidence || 'unknown'))
     .replace('{{notes}}', finding.notes || 'none')
@@ -422,7 +426,7 @@ async function proposeAndCheck(options) {
   }
 
   // Step 8: git commit and get diff info
-  var sig8 = (finding.signature || 'unknown').substring(0, 8);
+  var sig8 = toText(finding.signature, 8) || 'unknown';
   var commitMsg = 'pipeline fix ' + sig8 + ': ' + editSet.repairKind;
 
   var commitResult = await git.commitAll(cloneDir, commitMsg, { runCommand: runCommand });
@@ -483,4 +487,8 @@ async function proposeAndCheck(options) {
   };
 }
 
-module.exports = { proposeAndCheck: proposeAndCheck };
+module.exports = {
+  proposeAndCheck: proposeAndCheck,
+  stackToString: stackToString,
+  buildPrompt: buildPrompt
+};

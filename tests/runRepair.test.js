@@ -614,6 +614,40 @@ test('run-repair: run-staging.mjs exposes runStage for the rerun path', async fu
   assert.strictEqual(stages.length, 3);
 });
 
+test('run-repair: an attempt that throws still writes finding.json and attempt-error.json', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var ctrl = {};
+  ctrl.propose = async function() {
+    throw new Error('finding.stack.substring is not a function');
+  };
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-throw',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-test', OPENROUTER_API_KEY: 'key-test' },
+    adapters: fakeAdapters(ctrl, log),
+    rerunTasks: async function() { return []; },
+    extractAfter: function() { return []; }
+  });
+  assert.ok(res.blockers.some(function(b) { return b.code === 'REPAIR_ATTEMPT_ERROR'; }), 'REPAIR_ATTEMPT_ERROR blocker recorded');
+
+  var evidenceDir = path.join(cwd, 'evidence', 'run-throw', 'repair');
+  assert.ok(fs.existsSync(path.join(evidenceDir, 'finding.json')), 'finding.json written in evidence/<runId>/repair/');
+  assert.ok(fs.existsSync(path.join(evidenceDir, 'attempt-error.json')), 'attempt-error.json written in evidence/<runId>/repair/');
+
+  var attemptErr = JSON.parse(fs.readFileSync(path.join(evidenceDir, 'attempt-error.json'), 'utf8'));
+  assert.strictEqual(attemptErr.errorName, 'Error');
+  assert.strictEqual(attemptErr.message, 'finding.stack.substring is not a function');
+  assert.strictEqual(typeof attemptErr.stack, 'string');
+  assert.strictEqual(attemptErr.phase, 'propose-attempt');
+
+  var findingJson = JSON.parse(fs.readFileSync(path.join(evidenceDir, 'finding.json'), 'utf8'));
+  assert.strictEqual(findingJson.signature, FINDING_SIG, 'finding.json carries signature');
+  assert.strictEqual(findingJson.class, 'SQL_PARAM_TYPE');
+});
+
 test('run-repair: evidence/<runId>/repair/finding.json written BEFORE blocker return', async function() {
   var cwd = tempCwd();
   var log = [];

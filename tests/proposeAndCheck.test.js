@@ -737,6 +737,57 @@ test('j: pipeline mode -> PIPELINE_PATCH_READY, scratch copy used, real tree not
   }
 });
 
+// k. stackToString handles every stack shape without throwing and returns a string
+test('k: stackToString handles string, array, object, undefined, null -> no throw, string result', async function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var stackToString = mod.stackToString;
+
+  var cases = [
+    { name: 'undefined', value: undefined, expect: 'none' },
+    { name: 'null', value: null, expect: 'none' },
+    { name: 'string', value: 'at src/a.ts:12:5', expect: 'at src/a.ts:12:5' },
+    { name: 'array', value: [{ file: 'src/a.ts', line: 12 }, 'raw frame'], expect: 'src/a.ts:12\nraw frame' },
+    { name: 'object', value: { frames: [{ file: 'src/b.ts', line: 3 }] }, expect: '{"frames":[{"file":"src/b.ts","line":3}]}' },
+    { name: 'number', value: 42, expect: '42' },
+    { name: 'boolean', value: true, expect: 'true' }
+  ];
+
+  for (var i = 0; i < cases.length; i++) {
+    var c = cases[i];
+    var out = stackToString(c.value, 2000);
+    assert.strictEqual(typeof out, 'string', c.name + ' -> string result');
+    assert.ok(out.length <= 2000, c.name + ' -> truncated to maxLen');
+    assert.strictEqual(out, c.expect, c.name + ' -> expected content');
+  }
+
+  // Truncation works when maxLen is given.
+  var long = 'x'.repeat(5000);
+  assert.strictEqual(stackToString(long, 100).length, 100, 'string truncated');
+  var arrLong = [{ file: 'src/a.ts', line: 1 }];
+  var repeated = [];
+  for (var k = 0; k < 5000; k++) repeated.push({ file: 'src/a.ts', line: k });
+  assert.ok(stackToString(repeated, 100).length <= 100, 'array truncated');
+});
+
+test('k2: buildPrompt with a non-string stack does not throw and includes the stack', async function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var buildPrompt = mod.buildPrompt;
+  var variants = [
+    { stack: 'Error: boom\n at src/a.ts:1:2' },
+    { stack: [{ file: 'src/a.ts', line: 1 }] },
+    { stack: { frames: ['x'] } },
+    { stack: undefined },
+    { stack: null }
+  ];
+  for (var i = 0; i < variants.length; i++) {
+    var finding = { class: 'Err', message: 'msg', path: 'p', sql: 's', domain: 'target-code', confidence: 0.9, notes: [], stack: variants[i].stack };
+    var prompt = buildPrompt(finding, [], []);
+    assert.strictEqual(typeof prompt, 'string');
+    assert.ok(prompt.indexOf('stack: ') !== -1, 'stack placeholder replaced');
+  }
+});
+
+
 // k. DEP_PATCH_NOT_APPLIED_IN_IMAGE -> BLOCKED
 test('k: DEP_PATCH_NOT_APPLIED_IN_IMAGE -> BLOCKED', async function() {
   var dir = createTempProject({
