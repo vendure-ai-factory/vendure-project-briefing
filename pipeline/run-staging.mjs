@@ -1790,6 +1790,7 @@ export {
   checkAdminEnvMapping,
   buildStagesForTaskIds,
   checkTaskSelection,
+  runStage,
   AUTHORIZED_TASK_IDS,
   DRY_RUN_TASK,
   DEFAULT_ARCHIVE_ROOT,
