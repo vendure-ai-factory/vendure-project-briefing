@@ -584,3 +584,83 @@ test('locator: dependency-bug fixture — lockfile version used and why field pr
   fs.rmSync(targetRoot, { recursive: true, force: true });
   fs.rmSync(pkgDir, { recursive: true, force: true });
 });
+
+test('locator: fetchPackage rejecting with npm 404/401 -> candidate-not-found recorded, continues (no block)', async function() {
+  var workspaceDir = createTempDir();
+  var targetRoot = createTempDir();
+  var pkgJson = {
+    name: 'test-target',
+    version: '1.0.0',
+    dependencies: { 'missing-pkg': '1.0.0', 'private-pkg': '2.0.0' }
+  };
+  fs.writeFileSync(path.join(targetRoot, 'package.json'), JSON.stringify(pkgJson, null, 2));
+  var srcDir = path.join(targetRoot, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'index.js'), 'const x = 1;\n');
+
+  var fakeFetch = function(name, version) {
+    if (name === 'missing-pkg') return Promise.reject(new Error('404 Not Found - GET https://registry.npmjs.org/missing-pkg'));
+    if (name === 'private-pkg') return Promise.reject(new Error('401 Unauthorized - GET https://registry.npmjs.org/private-pkg'));
+    return Promise.resolve(createTempDir());
+  };
+
+  var finding = { operator: '!=', column: 'store.id', path: 'products' };
+  var result = await locator.locateCandidates({
+    finding: finding,
+    targetRoot: targetRoot,
+    fetchPackage: fakeFetch,
+    maxCandidates: 5,
+    runId: 'test-404-' + Date.now(),
+    workspaceDir: workspaceDir
+  });
+
+  assert.ok(Array.isArray(result.notFound), 'result.notFound must be an array');
+  var missing = result.notFound.filter(function(n) { return n.package.indexOf('missing-pkg@1.0.0') !== -1; })[0];
+  var priv = result.notFound.filter(function(n) { return n.package.indexOf('private-pkg@2.0.0') !== -1; })[0];
+  assert.ok(missing, 'missing package must be recorded as candidate-not-found');
+  assert.strictEqual(missing.status, 'candidate-not-found');
+  assert.strictEqual(missing.kind, 'not-found');
+  assert.ok(priv, 'private package must be recorded as candidate-not-found');
+  assert.strictEqual(priv.kind, 'unavailable');
+  assert.ok(Array.isArray(result.candidates), 'locator still returns candidates despite failed package fetch');
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+});
+
+test('locator: fetchPackage resolving to a 404 Response -> candidate-not-found recorded, continues (no block)', async function() {
+  var workspaceDir = createTempDir();
+  var targetRoot = createTempDir();
+  var pkgJson = {
+    name: 'test-target',
+    version: '1.0.0',
+    dependencies: { 'http-fetched-dep': '1.0.0' }
+  };
+  fs.writeFileSync(path.join(targetRoot, 'package.json'), JSON.stringify(pkgJson, null, 2));
+  var srcDir = path.join(targetRoot, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'index.js'), 'const x = 1;\n');
+
+  var fakeFetch = function(name, version) {
+    return Promise.resolve(new Response('not found', { status: 404, headers: { 'content-type': 'text/plain' } }));
+  };
+
+  var finding = { operator: '!=', column: 'store.id', path: 'products' };
+  var result = await locator.locateCandidates({
+    finding: finding,
+    targetRoot: targetRoot,
+    fetchPackage: fakeFetch,
+    maxCandidates: 5,
+    runId: 'test-http404-' + Date.now(),
+    workspaceDir: workspaceDir
+  });
+
+  assert.ok(Array.isArray(result.notFound), 'result.notFound must be an array');
+  var entry = result.notFound.filter(function(n) { return n.package.indexOf('http-fetched-dep@') === 0; })[0];
+  assert.ok(entry, 'Response-404 package must be recorded as candidate-not-found');
+  assert.strictEqual(entry.status, 'candidate-not-found');
+  assert.strictEqual(entry.kind, 'not-found');
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+});

@@ -658,6 +658,7 @@ async function locateCandidates(options) {
 
   var candidates = [];
   var searched = [];
+  var packageNotes = [];
 
   if (!finding || !targetRoot) {
     return { candidates: candidates, searched: searched };
@@ -744,6 +745,24 @@ async function locateCandidates(options) {
       try {
         var pkgPath = await fetchPackage(pkgName, pkgVersion, pkgWorkspace);
 
+        // A fetchPackage that resolves to an HTTP Response (e.g. the npm
+        // registry or a private mirror) rather than a directory: a 4xx means
+        // the package is missing or not accessible. Record candidate-not-found
+        // and keep searching; never block on a single package.
+        if (pkgPath && typeof pkgPath.status === 'number') {
+          var respStatus = pkgPath.status;
+          var respKind = (respStatus === 404) ? 'not-found'
+            : (respStatus === 401 || respStatus === 403) ? 'unavailable'
+            : 'failed';
+          packageNotes.push({
+            package: pkgName + '@' + pkgVersion,
+            status: 'candidate-not-found',
+            kind: respKind,
+            reason: 'package fetch resolved to HTTP ' + respStatus
+          });
+          continue;
+        }
+
         // Search in package, avoiding node_modules inside packages
         var searchInPackage = function(dir) {
           var found = [];
@@ -795,7 +814,15 @@ async function locateCandidates(options) {
         var pkgResults = searchInPackage(pkgPath);
         candidates = candidates.concat(pkgResults);
       } catch (err) {
-        // Package fetch failed, skip
+        // Package fetch failed (e.g. npm 404/401 for a missing or private
+        // package): record candidate-not-found and keep searching. This must
+        // never block the locator.
+        packageNotes.push({
+          package: pkgName + '@' + pkgVersion,
+          status: 'candidate-not-found',
+          kind: classifyPackageFetchError(err),
+          reason: 'package could not be fetched'
+        });
       }
     }
 
@@ -819,6 +846,7 @@ async function locateCandidates(options) {
     runId: runId,
     finding: finding,
     patterns: patterns,
+    candidateNotFound: packageNotes,
     candidates: candidates.map(function(c) {
       return {
         source: c.source,
@@ -843,7 +871,14 @@ async function locateCandidates(options) {
   // Also write sha256 file
   fs.writeFileSync(path.join(evidenceDir, 'candidates.json.sha256'), sha, 'utf8');
 
-  return { candidates: candidates, searched: searched };
+  return { candidates: candidates, searched: searched, notFound: packageNotes };
+}
+
+function classifyPackageFetchError(err) {
+  var text = String((err && err.message) || err || '');
+  if (/E404|\b404\b|not found/i.test(text)) return 'not-found';
+  if (/E401|\b401\b|E403|\b403\b|unauthor|forbidden|access/i.test(text)) return 'unavailable';
+  return 'failed';
 }
 
 module.exports = { locateCandidates: locateCandidates };

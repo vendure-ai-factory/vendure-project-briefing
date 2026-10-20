@@ -3,6 +3,7 @@
 var zlib = require('zlib');
 var path = require('path');
 var fs = require('fs');
+var fetchUtil = require('./fetchUtil');
 
 var OWNER_REPO = 'vendure-ai-factory/vendure-staging-baseline';
 var WORKFLOW_FILE = 'staging-image.yml';
@@ -234,14 +235,14 @@ async function downloadArtifactZip(fetchFn, artifactUrl, token, onRedirectHeader
     redirect: 'manual'
   });
   if (response.status !== 302 && response.status !== 303) {
-    return { ok: false, blocker: { code: 'ARTIFACT_DOWNLOAD_FAILED', message: 'unexpected redirect status', evidence: { status: response.status } } };
+    return { ok: false, blocker: { code: 'ARTIFACT_DOWNLOAD_FAILED', message: 'unexpected redirect status', evidence: fetchUtil.fetchEvidence('build', 'GET', artifactUrl, response, 'unexpected redirect status') } };
   }
   var location = null;
   if (response.headers && typeof response.headers.get === 'function') {
     location = response.headers.get('location');
   }
   if (!location) {
-    return { ok: false, blocker: { code: 'ARTIFACT_DOWNLOAD_FAILED', message: 'no redirect location', evidence: {} } };
+    return { ok: false, blocker: { code: 'ARTIFACT_DOWNLOAD_FAILED', message: 'no redirect location', evidence: fetchUtil.fetchEvidence('build', 'GET', artifactUrl, response, 'no redirect location') } };
   }
   var redirectHeaders = {};
   var redirectResponse = await fetchFn(location, {
@@ -253,7 +254,7 @@ async function downloadArtifactZip(fetchFn, artifactUrl, token, onRedirectHeader
     onRedirectHeaders(redirectHeaders);
   }
   if (redirectResponse.status !== 200) {
-    return { ok: false, blocker: { code: 'ARTIFACT_DOWNLOAD_FAILED', message: 'download failed', evidence: { status: redirectResponse.status } } };
+    return { ok: false, blocker: { code: 'ARTIFACT_DOWNLOAD_FAILED', message: 'download failed', evidence: fetchUtil.fetchEvidence('build', 'GET', location, redirectResponse, 'download returned non-200') } };
   }
   var buffer = null;
   if (redirectResponse.arrayBuffer) {
@@ -331,18 +332,12 @@ async function buildAndPublish(options) {
   }
 
   if (dispatchResponse.status !== 204) {
-    var errMsg = 'dispatch failed with status ' + dispatchResponse.status;
-    var respText = '';
-    try { respText = await dispatchResponse.text(); } catch (e) { /* ok */ }
     return {
       ok: false,
       blocker: {
         code: 'IMAGE_BUILD_DISPATCH_FAILED',
-        message: errMsg,
-        evidence: {
-          status: dispatchResponse.status,
-          sanitizedMessage: sanitizeMessage(respText)
-        }
+        message: 'dispatch failed with status ' + dispatchResponse.status,
+        evidence: fetchUtil.fetchEvidence('build', 'POST', dispatchUrl, dispatchResponse, 'dispatch returned non-204')
       }
     };
   }
@@ -439,7 +434,7 @@ async function buildAndPublish(options) {
   }
 
   if (artifactsResponse.status !== 200) {
-    return { ok: false, blocker: { code: 'ARTIFACT_FETCH_ERROR', message: 'artifacts fetch failed', evidence: { status: artifactsResponse.status } } };
+    return { ok: false, blocker: { code: 'ARTIFACT_FETCH_ERROR', message: 'artifacts fetch failed', evidence: fetchUtil.fetchEvidence('build', 'GET', artifactsUrl, artifactsResponse, 'artifacts fetch failed') } };
   }
 
   var artifactsData;
@@ -580,7 +575,7 @@ async function baselineDigest(options) {
   }
 
   if (runsResponse.status !== 200) {
-    return { ok: false, blocker: { code: 'BASELINE_FETCH_ERROR', message: 'runs fetch failed', evidence: { status: runsResponse.status } } };
+    return { ok: false, blocker: { code: 'BASELINE_FETCH_ERROR', message: 'runs fetch failed', evidence: fetchUtil.fetchEvidence('build', 'GET', runsUrl, runsResponse, 'runs fetch failed') } };
   }
 
   var runsData;
@@ -614,7 +609,7 @@ async function baselineDigest(options) {
   }
 
   if (artifactsResponse.status !== 200) {
-    return { ok: false, blocker: { code: 'BASELINE_FETCH_ERROR', message: 'artifacts fetch failed', evidence: { status: artifactsResponse.status } } };
+    return { ok: false, blocker: { code: 'BASELINE_FETCH_ERROR', message: 'artifacts fetch failed', evidence: fetchUtil.fetchEvidence('build', 'GET', artifactsUrl, artifactsResponse, 'artifacts fetch failed') } };
   }
 
   var artifactsData;

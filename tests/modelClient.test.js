@@ -194,7 +194,7 @@ test('callModel: budget exhausted -> BLOCK', function() {
   });
 });
 
-test('callModel: wrong model constant -> API error response', function() {
+test('callModel: wrong model constant -> HTTP_400 blocker', function() {
   var capturedBody = null;
   return modelClient.callModel({
     prompt: 'hello',
@@ -202,57 +202,70 @@ test('callModel: wrong model constant -> API error response', function() {
     budget: { model: { used: 0, maxTokensTotal: 400000 } },
     fetch: function(url, opts) {
       capturedBody = opts && opts.body;
-      return Promise.resolve({ status: 400, json: function() { return Promise.resolve({ error: { message: 'model not found' } }); } });
+      return Promise.resolve({ status: 400, ok: false, json: function() { return Promise.resolve({ error: { message: 'model not found' } }); } });
     }
   }).then(function(r) {
     assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.blocker.code, 'MODEL_UNAVAILABLE');
+    assert.strictEqual(r.blocker.code, 'HTTP_400');
+    assert.strictEqual(r.blocker.evidence.stage, 'model');
+    assert.strictEqual(r.blocker.evidence.host, 'openrouter.ai');
+    assert.strictEqual(r.blocker.evidence.method, 'POST');
+    assert.strictEqual(r.blocker.evidence.status, 400);
     assert.strictEqual(capturedBody.indexOf('z-ai/glm-5.3-flash') !== -1, true, 'model constant must be in request');
     assert.strictEqual(capturedBody.indexOf('sk-or-') === -1, true, 'raw key must not be in body');
   });
 });
 
-test('callModel: HTTP 401 -> MODEL_UNAVAILABLE blocker', function() {
+test('callModel: HTTP 401 -> HTTP_401 blocker with evidence', function() {
   return modelClient.callModel({
     prompt: 'hello',
     env: { OPENROUTER_API_KEY: 'bad-key-12345' },
     budget: { model: { used: 0, maxTokensTotal: 400000 } },
     fetch: function() {
-      return Promise.resolve({ status: 401, json: function() { return Promise.resolve({ error: {} }); } });
+      return Promise.resolve({ status: 401, ok: false, json: function() { return Promise.resolve({ error: {} }); } });
     }
   }).then(function(r) {
     assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.blocker.code, 'MODEL_UNAVAILABLE');
+    assert.strictEqual(r.blocker.code, 'HTTP_401');
+    assert.strictEqual(r.blocker.evidence.stage, 'model');
+    assert.strictEqual(r.blocker.evidence.host, 'openrouter.ai');
+    assert.strictEqual(r.blocker.evidence.method, 'POST');
+    assert.strictEqual(r.blocker.evidence.status, 401);
     assert.strictEqual(r.blocker.message.indexOf('sk-or-') === -1, true, 'key must not appear in message');
   });
 });
 
-test('callModel: HTTP 429 -> MODEL_UNAVAILABLE blocker', function() {
+test('callModel: HTTP 429 -> HTTP_429 blocker with evidence', function() {
   return modelClient.callModel({
     prompt: 'hello',
     env: { OPENROUTER_API_KEY: 'tok' },
     budget: { model: { used: 0, maxTokensTotal: 400000 } },
     fetch: function() {
-      return Promise.resolve({ status: 429, json: function() { return Promise.resolve({}); } });
+      return Promise.resolve({ status: 429, ok: false, json: function() { return Promise.resolve({}); } });
     }
   }).then(function(r) {
     assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.blocker.code, 'MODEL_UNAVAILABLE');
+    assert.strictEqual(r.blocker.code, 'HTTP_429');
+    assert.strictEqual(r.blocker.evidence.stage, 'model');
+    assert.strictEqual(r.blocker.evidence.host, 'openrouter.ai');
+    assert.strictEqual(r.blocker.evidence.status, 429);
     assert.strictEqual(r.blocker.message.indexOf('429') !== -1, true);
   });
 });
 
-test('callModel: HTTP 500 -> MODEL_UNAVAILABLE blocker', function() {
+test('callModel: HTTP 500 -> HTTP_500 blocker with evidence', function() {
   return modelClient.callModel({
     prompt: 'hello',
     env: { OPENROUTER_API_KEY: 'tok' },
     budget: { model: { used: 0, maxTokensTotal: 400000 } },
     fetch: function() {
-      return Promise.resolve({ status: 500, json: function() { return Promise.resolve({}); } });
+      return Promise.resolve({ status: 500, ok: false, json: function() { return Promise.resolve({}); } });
     }
   }).then(function(r) {
     assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.blocker.code, 'MODEL_UNAVAILABLE');
+    assert.strictEqual(r.blocker.code, 'HTTP_500');
+    assert.strictEqual(r.blocker.evidence.stage, 'model');
+    assert.strictEqual(r.blocker.evidence.status, 500);
   });
 });
 
@@ -356,17 +369,19 @@ test('callModel: max_tokens=8000 constant', function() {
   });
 });
 
-test('callModel: wrong status code returns MODEL_UNAVAILABLE', function() {
+test('callModel: wrong status code returns HTTP_502', function() {
   return modelClient.callModel({
     prompt: 'hello',
     env: { OPENROUTER_API_KEY: 'tok' },
     budget: { model: { used: 0, maxTokensTotal: 400000 } },
     fetch: function() {
-      return Promise.resolve({ status: 502, json: function() { return Promise.resolve({}); } });
+      return Promise.resolve({ status: 502, ok: false, json: function() { return Promise.resolve({}); } });
     }
   }).then(function(r) {
     assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.blocker.code, 'MODEL_UNAVAILABLE');
+    assert.strictEqual(r.blocker.code, 'HTTP_502');
+    assert.strictEqual(r.blocker.evidence.stage, 'model');
+    assert.strictEqual(r.blocker.evidence.status, 502);
   });
 });
 
@@ -583,5 +598,90 @@ test('callModel: injected setTimeout receives timeoutMs argument', function() {
   }).then(function(r) {
     assert.strictEqual(r.ok, true);
     assert.strictEqual(capturedDelay, modelClient.SIGNAL_TIMEOUT_MS, '_setTimeout must be called with SIGNAL_TIMEOUT_MS');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WHATWG fetch conformance (real Response objects, not hand-built stubs)
+// ---------------------------------------------------------------------------
+
+test('callModel: real WHATWG Response (new Response) works end to end', function() {
+  var payload = {
+    choices: [{ message: { content: '{"repairKind":"source-edit","rationale":"real response","edits":[],"newFiles":[]}' } }],
+    usage: { prompt_tokens: 5, completion_tokens: 7, total_tokens: 12 }
+  };
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function() {
+      return Promise.resolve(new Response(JSON.stringify(payload), { status: 200, headers: { 'content-type': 'application/json' } }));
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, true, 'real Response must be accepted');
+    assert.strictEqual(r.text.indexOf('source-edit') !== -1, true);
+    assert.strictEqual(r.usage.total_tokens, 12);
+  });
+});
+
+test('callModel: real Response with non-2xx maps to HTTP_<status> with evidence fields', function() {
+  var canary = 'sk-or-v1-nodefaultresponse' + Math.random().toString(36).slice(2);
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok-' + canary },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function() {
+      return Promise.resolve(new Response('nope ' + canary, { status: 429, headers: { 'content-type': 'text/plain' } }));
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'HTTP_429');
+    var ev = r.blocker.evidence;
+    assert.strictEqual(ev.stage, 'model');
+    assert.strictEqual(ev.host, 'openrouter.ai');
+    assert.strictEqual(ev.method, 'POST');
+    assert.strictEqual(ev.status, 429);
+    assert.strictEqual(ev.contentType, 'text/plain');
+    assert.strictEqual(ev.reason, 'rate limit exceeded');
+    assert.strictEqual(JSON.stringify(ev).indexOf(canary), -1, 'canary must never appear in evidence');
+    assert.strictEqual(JSON.stringify(r.blocker).indexOf(canary), -1, 'canary must never appear in blocker');
+  });
+});
+
+test('callModel: malformed body -> INVALID_RESPONSE with evidence fields', function() {
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function() {
+      return Promise.resolve(new Response('{broken', { status: 200, headers: { 'content-type': 'application/json' } }));
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'INVALID_RESPONSE');
+    var ev = r.blocker.evidence;
+    assert.strictEqual(ev.stage, 'model');
+    assert.strictEqual(ev.host, 'openrouter.ai');
+    assert.strictEqual(ev.method, 'POST');
+    assert.strictEqual(ev.status, 200);
+    assert.strictEqual(ev.bodyLength, 7, '{broken is 7 chars, so evidence.bodyLength must be 7');
+  });
+});
+
+test('callModel: adapter-refusal shape is passed through, not hidden as INVALID_RESPONSE', function() {
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function() {
+      return Promise.resolve({ ok: false, blocker: { code: 'IO_NOT_INJECTED', message: 'fetch was not injected' } });
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'IO_NOT_INJECTED', 'adapter-refusal shape is passed through');
+    assert.strictEqual(r.blocker.evidence.stage, 'model');
+    assert.strictEqual(r.blocker.evidence.host, 'openrouter.ai');
+    assert.strictEqual(r.blocker.evidence.method, 'POST');
+    assert.strictEqual(r.blocker.evidence.bodyLength, null);
   });
 });

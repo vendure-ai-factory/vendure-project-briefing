@@ -183,6 +183,39 @@ function fakeAdapters(ctrl, log, opts) {
       proposeAndCheck: async function(o) {
         log.push('propose:' + (o.previousAttempts ? o.previousAttempts.length : 0));
         if (ctrl.propose) return ctrl.propose(o);
+        if (opts.modelResponse) {
+          // Exercise the real modelClient path with the fetch injected through
+          // run-repair's proposeAndCheck deps, returning a real WHATWG
+          // Response object (not a hand-built stub).
+          var modelClient = require('../src/repair/modelClient');
+          var injectedFetch = o.deps && o.deps.fetch;
+          assert.strictEqual(typeof injectedFetch, 'function', 'run-repair must wire cfg.fetch into proposeAndCheck deps');
+          return modelClient.callModel({
+            prompt: 'build an edit set',
+            system: 'You are a bug fixer. Output only JSON.',
+            env: o.env,
+            budget: o.budget,
+            fetch: injectedFetch,
+            timeout: 5000
+          }).then(function(mr) {
+            if (!mr.ok) {
+              return { status: 'MODEL_FAILED', blocker: mr.blocker };
+            }
+            var parsed = modelClient.parseEditSet(mr.text);
+            if (!parsed.ok) {
+              return { status: 'MODEL_FAILED', blocker: { code: 'PARSE_ERROR', message: parsed.error }, errors: ['parse failed'] };
+            }
+            return {
+              status: 'READY',
+              repairKind: parsed.editSet.repairKind,
+              rationale: parsed.editSet.rationale,
+              headSha: 'aaaa',
+              diffText: '--- a/x.ts\n+++ b/x.ts',
+              diffStat: '1 file changed',
+              checks: { results: [{ script: 'build', success: true }] }
+            };
+          });
+        }
         if (opts.modelMode === 'invalid' || opts.modelMode === 'empty' || opts.modelMode === 'none') {
           return { status: 'MODEL_FAILED', blocker: { code: 'MODEL_UNAVAILABLE', message: 'model call failed or returned no usable edit set' } };
         }
@@ -394,4 +427,36 @@ test('coerce helpers: toText/toArray/stackToString never throw on any shape', fu
   }
   assert.strictEqual(coerce.stackToString([{ file: 'a', line: 2 }]), 'a:2');
   assert.strictEqual(coerce.stackToString(undefined), 'none');
+});
+
+test('dry-run: propose stage drives modelClient with a real Response object, not a hand-built stub -> FIXED', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var ctrl = { verifyCalls: 0, verifyVerdicts: [{ status: 'fixed' }] };
+  var runId = runIdFor('realresponse');
+  seedRealShapedRun(cwd, runId);
+  var canary = 'canary-realresponse-zzz9';
+  var fetched = false;
+  var payload = {
+    choices: [{ message: { content: JSON.stringify({ repairKind: 'source-edit', rationale: 'fix via real Response', edits: [{ path: 'x', oldString: 'a', newString: 'b' }], newFiles: [] }) } }],
+    usage: { total_tokens: 3 }
+  };
+  var res = await runOnce({
+    repairMode: true,
+    runId: runId,
+    cwd: cwd,
+    env: { VENDURE_STAGING_REPO_TOKEN: canary, OPENROUTER_API_KEY: 'key-' + canary },
+    fetch: function(url, opts) {
+      fetched = true;
+      return Promise.resolve(new Response(JSON.stringify(payload), { status: 200, headers: { 'content-type': 'application/json' } }));
+    },
+    adapters: fakeAdapters(ctrl, log, { modelResponse: true }),
+    rerunTasks: async function() { return [{ taskId: 'CAN-B1-03', result: 'RESULT_PASS' }]; },
+    extractAfter: function() { return []; }
+  });
+  assert.strictEqual(fetched, true, 'the injected WHATWG fetch must actually be used in the propose stage');
+  assert.strictEqual(res.outcome, 'FIXED', 'FIXED when the real Response drives a valid edit set');
+  assert.strictEqual(res.exitCode, 0);
+  assertSchema11AndEvidence(cwd, runId, 'FIXED');
+  assertNoSecretLeak(cwd, canary);
 });

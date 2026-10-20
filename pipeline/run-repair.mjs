@@ -713,7 +713,8 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
     env: cfg.env,
     deps: {
       git: adapters.gitClient,
-      verifier: adapters.verifier
+      verifier: adapters.verifier,
+      fetch: cfg.fetch
     }
   });
 

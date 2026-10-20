@@ -8,6 +8,7 @@ var MODEL_CONSTANT = 'z-ai/glm-5.3-flash';
 var API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 var REDACTED_MARKER = '[REDACTED]';
 var MAX_RAW_LOG = 500;
+var fetchUtil = require('./fetchUtil');
 
 var BUDGET_SCHEMA = {
   perSignature: 3,
@@ -175,26 +176,53 @@ function callModel(opts) {
   });
 
   function processResponse(response) {
-    if (!response || typeof response.status !== 'number') {
-      return { ok: false, blocker: { code: 'INVALID_RESPONSE', message: 'Invalid response from fetch', evidence: {} } };
+    // Adapter-refusal shape (ok:false + blocker) is propagated unchanged except
+    // for normalized evidence, so a refused fetch never masquerades as an HTTP
+    // error or an invalid response.
+    if (response && response.ok === false && response.blocker && response.blocker.code) {
+      var refused = response.blocker;
+      var refusedEvidence = Object.assign({}, refused.evidence || {},
+        fetchUtil.fetchEvidence('model', 'POST', API_URL, response, 'fetch adapter refused'));
+      return { ok: false, blocker: { code: refused.code, message: refused.message || ('fetch adapter ' + refused.code), evidence: refusedEvidence } };
     }
-    if (response.status === 401 || response.status === 403) {
-      var shortBody = redactBody(body);
-      var shortLog = shortBody.length > MAX_RAW_LOG ? shortBody.substring(0, MAX_RAW_LOG) + '...' : shortBody;
-      return { ok: false, blocker: { code: 'MODEL_UNAVAILABLE', message: 'OpenRouter API returned ' + response.status + ' - credentials may be invalid', evidence: { status: response.status, requestLog: shortLog } } };
+
+    if (!fetchUtil.isResponseLike(response)) {
+      return { ok: false, blocker: { code: 'INVALID_RESPONSE', message: 'Invalid response from fetch', evidence: fetchUtil.fetchEvidence('model', 'POST', API_URL, response, 'fetch resolved with a non-Response value') } };
     }
-    if (response.status === 429) {
-      return { ok: false, blocker: { code: 'MODEL_UNAVAILABLE', message: 'OpenRouter API rate limit exceeded (429)', evidence: { status: 429 } } };
+
+    var status = response.status;
+    if (status !== 200) {
+      var reason = null;
+      if (status === 401 || status === 403) {
+        reason = 'credentials may be invalid';
+      } else if (status === 429) {
+        reason = 'rate limit exceeded';
+      } else if (status >= 500) {
+        reason = 'server error';
+      } else {
+        reason = 'unexpected status';
+      }
+      var message = 'OpenRouter API returned ' + status + ' (' + reason + ')';
+      return { ok: false, blocker: { code: 'HTTP_' + status, message: message, evidence: fetchUtil.fetchEvidence('model', 'POST', API_URL, response, reason) } };
     }
-    if (response.status >= 500) {
-      return { ok: false, blocker: { code: 'MODEL_UNAVAILABLE', message: 'OpenRouter API server error: ' + response.status, evidence: { status: response.status } } };
-    }
-    if (response.status !== 200) {
-      return { ok: false, blocker: { code: 'MODEL_UNAVAILABLE', message: 'OpenRouter API returned unexpected status: ' + response.status, evidence: { status: response.status } } };
-    }
-    return response.json().then(function(data) {
-      if (!data || !data.choices || !data.choices[0] || !data.choices[0].message) {
-        return { ok: false, blocker: { code: 'INVALID_RESPONSE', message: 'OpenRouter response missing choices', evidence: {} } };
+
+    return readBody(response).then(function(bodyResult) {
+      if (!bodyResult.ok) {
+        return invalidResponse('response body not readable: ' + (bodyResult.error && bodyResult.error.message ? bodyResult.error.message : 'unknown'), bodyResult.length, response);
+      }
+      var data = bodyResult.json;
+      if (data == null && bodyResult.text != null) {
+        try {
+          data = JSON.parse(bodyResult.text);
+        } catch (e) {
+          return invalidResponse('response body is not valid JSON: ' + e.message, bodyResult.length, response);
+        }
+      }
+      if (data == null) {
+        return invalidResponse('response has no readable body', bodyResult.length, response);
+      }
+      if (!data.choices || !data.choices[0] || !data.choices[0].message) {
+        return invalidResponse('response JSON missing choices', bodyResult.length, response);
       }
       var usage = data.usage || {};
       var totalTokens = typeof usage.total_tokens === 'number' ? usage.total_tokens :
@@ -210,10 +238,32 @@ function callModel(opts) {
           total_tokens: totalTokens
         }
       };
-    }).catch(function(parseErr) {
-      return { ok: false, blocker: { code: 'INVALID_RESPONSE', message: 'Failed to parse OpenRouter response: ' + parseErr.message, evidence: {} } };
     });
   }
+
+  function invalidResponse(reason, length, response) {
+    var evidence = fetchUtil.fetchEvidence('model', 'POST', API_URL, response, reason);
+    if (length != null && evidence.bodyLength == null) evidence.bodyLength = length;
+    return { ok: false, blocker: { code: 'INVALID_RESPONSE', message: 'Failed to parse OpenRouter response: ' + reason, evidence: evidence } };
+  }
+}
+
+/**
+ * Read the response body as text, falling back to json() for non-standards
+ * stubs. Returns { ok, text?, json?, length }.
+ */
+function readBody(response) {
+  if (response && typeof response.text === 'function') {
+    return Promise.resolve().then(function() { return response.text(); })
+      .then(function(t) { return { ok: true, text: t, json: null, length: t ? t.length : 0 }; })
+      .catch(function(err) { return { ok: false, error: err, length: fetchUtil.bodyLengthHint(response) }; });
+  }
+  if (response && typeof response.json === 'function') {
+    return Promise.resolve().then(function() { return response.json(); })
+      .then(function(data) { return { ok: true, text: null, json: data, length: null }; })
+      .catch(function(err) { return { ok: false, error: err, length: fetchUtil.bodyLengthHint(response) }; });
+  }
+  return Promise.resolve({ ok: true, text: null, json: null, length: null });
 }
 
 function parseEditSet(text) {

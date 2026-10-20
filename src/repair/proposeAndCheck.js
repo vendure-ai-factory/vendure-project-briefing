@@ -269,7 +269,7 @@ async function proposeAndCheck(options) {
       exitCode: result.status
     };
   };
-  var fetch = deps.fetch || function() { return Promise.resolve({ ok: false, blocker: { code: 'IO_NOT_INJECTED' } }); };
+  var fetch = deps.fetch || ((typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function') ? globalThis.fetch : null);
   var now = deps.now || function() { return new Date().toISOString(); };
   var readFile = deps.readFile || function(p) { return require('fs').readFileSync(p, 'utf8'); };
   var fs = deps.fs || require('fs');
