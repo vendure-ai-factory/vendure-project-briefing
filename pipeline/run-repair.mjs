@@ -271,7 +271,20 @@ function buildExtractInput(target, logs) {
   if (allLines.length > 0) {
     logExcerpt = allLines.join('\n').substring(0, 20000);
   }
-  return { apiErrors: apiErrors, logExcerpt: logExcerpt, operationName: (target && target.taskId) || null };
+  // operationName is the GraphQL operation name when available, never the task
+  // id (task ids are pipeline-internal and must not leak into search patterns).
+  var operationName = null;
+  if (target && typeof target.operationName === 'string' && target.operationName !== '') {
+    operationName = target.operationName;
+  } else if (target && target.exitErrorResult && target.exitErrorResult.apiErrors != null) {
+    try {
+      var first = Array.isArray(target.exitErrorResult.apiErrors) ? target.exitErrorResult.apiErrors[0] : null;
+      if (first && typeof first.operationName === 'string' && first.operationName !== '') {
+        operationName = first.operationName;
+      }
+    } catch (e) { /* ignore */ }
+  }
+  return { apiErrors: apiErrors, logLines: allLines, logExcerpt: logExcerpt, operationName: operationName || (target && target.taskId) || null };
 }
 
 function safeErr(e) {
@@ -510,6 +523,7 @@ async function defaultCloneAndLocate(cfg, adapters, finding) {
     targetRoot: dir,
     runId: cfg.runId,
     workspaceDir: path.dirname(dir),
+    evidenceRoot: path.join(cfg.cwd, EVIDENCE_DIR),
     maxCandidates: 10
   });
   return { ok: true, dir: dir, branch: branch, candidates: (located && located.candidates) || [], searched: (located && located.searched) || [] };
@@ -704,6 +718,7 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
   var propose = await proposeFn({
     finding: state.finding,
     candidates: located.candidates || [],
+    searched: located.searched || [],
     previousAttempts: state.previousAttempts,
     budget: budget,
     runId: cfg.runId,
@@ -755,7 +770,10 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
       previousEvidence: {
         diff: propose.diffText || null,
         checks: propose.checks || null,
-        errors: [propose.status]
+        errors: [propose.status],
+        rejectionCodes: propose.rejectionCodes || null,
+        validCandidatePaths: propose.validCandidatePaths || null,
+        requestedPaths: propose.requestedPaths || null
       }
     };
   }

@@ -664,3 +664,59 @@ test('locator: fetchPackage resolving to a 404 Response -> candidate-not-found r
   fs.rmSync(workspaceDir, { recursive: true, force: true });
   fs.rmSync(targetRoot, { recursive: true, force: true });
 });
+
+// review-6b: dependency candidates are clone-relative node_modules/<pkg>/ paths
+// and the file exists in the clone (materialized before temp cleanup).
+test('locator: dependency candidate is clone-relative and materialized in the clone', async function() {
+  var workspaceDir = createTempDir();
+  var targetRoot = createTempDir();
+
+  fs.writeFileSync(path.join(targetRoot, 'package.json'), JSON.stringify({
+    name: 'test-target', version: '1.0.0', dependencies: { 'fake-wrap-lib': '1.0.0' }
+  }, null, 2));
+  fs.writeFileSync(path.join(targetRoot, 'package-lock.json'), JSON.stringify({
+    dependencies: { 'fake-wrap-lib': { version: '1.0.0' } },
+    packages: { 'node_modules/fake-wrap-lib': { version: '1.0.0' } }
+  }, null, 2));
+
+  var srcDir = path.join(targetRoot, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'index.js'), 'const x = 1;\n');
+
+  var pkgDir = createTempDir();
+  fs.mkdirSync(path.join(pkgDir, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: 'fake-wrap-lib', version: '1.0.0' }, null, 2));
+  fs.writeFileSync(path.join(pkgDir, 'dist', 'svc.js'),
+    'async function orders(ctx){ const id = { notEq: `\u0024{otherId}` }; return id; }\n');
+
+  var fakeFetch = function(name, version, dir) { return Promise.resolve(pkgDir); };
+  var evidenceRoot = createTempDir();
+  var runId = 'run-rr6b-' + Date.now();
+
+  var result = await locator.locateCandidates({
+    finding: { operator: '!=', column: 'order.id', path: 'orders', stack: [] },
+    targetRoot: targetRoot,
+    fetchPackage: fakeFetch,
+    maxCandidates: 5,
+    runId: runId,
+    workspaceDir: workspaceDir,
+    evidenceRoot: evidenceRoot
+  });
+
+  var dep = result.candidates.filter(function(c) { return c.source === 'dependency'; })[0];
+  assert.ok(dep, 'should have a dependency candidate');
+  assert.strictEqual(dep.file.indexOf('node_modules/fake-wrap-lib/'), 0,
+    'candidate file is clone-relative: ' + dep.file);
+  assert.strictEqual(fs.existsSync(path.join(targetRoot, dep.file)), true,
+    'file exists in the clone when the prompt is built');
+  assert.ok(Array.isArray(dep.snippet) && dep.snippet.length > 0, 'content snippet present');
+
+  // candidates.json written under the SAME evidence root the orchestrator uses.
+  assert.strictEqual(fs.existsSync(path.join(evidenceRoot, runId, 'repair', 'candidates.json')), true,
+    'candidates.json must be written under evidenceRoot/<runId>/repair');
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+  fs.rmSync(pkgDir, { recursive: true, force: true });
+  fs.rmSync(evidenceRoot, { recursive: true, force: true });
+});

@@ -24,9 +24,13 @@ function ensureDir(dirPath) {
 /**
  * Derive search patterns from a finding.
  * Generic patterns based on operator and column, not hard-coded to one bug.
+ * When the GraphQL path is absent, patterns are derived from the finding's
+ * stack frames (function/file names) and the GraphQL operation name, keeping
+ * the derivation task-id independent.
  */
 function deriveSearchPatterns(finding) {
   var patterns = [];
+  finding = finding || {};
   var operator = finding.operator;
   var column = finding.column;
   var queryPath = finding.path;
@@ -69,6 +73,40 @@ function deriveSearchPatterns(finding) {
     patterns.push(queryPath + 'Resolver');
     patterns.push(queryPath + 'Service');
     patterns.push(queryPath + 'Query');
+  }
+
+  // When the GraphQL path is absent, fall back to stack-frame function/file
+  // names and the GraphQL operation name (both task-id independent).
+  if (!queryPath || queryPath === 'undefined') {
+    var stack = finding.stack;
+    var frames = Array.isArray(stack) ? stack : [];
+    for (var fi = 0; fi < frames.length; fi++) {
+      var f = frames[fi];
+      if (!f) continue;
+      var file = f.file ? String(f.file).replace(/\\/g, '/') : '';
+      // Low-signal: skip node_modules frames and parent dirs for the millions
+      // of frames that would otherwise flood the pattern set.
+      if (file.indexOf('node_modules/') !== -1) continue;
+      if (file.indexOf('node:') === 0) continue;
+      var fn = f.fn ? String(f.fn) : '';
+      var fnName = fn.split(/[.(]/)[0] || '';
+      if (fnName && fnName.length >= 2 && ['async', 'at', 'module'].indexOf(fnName) === -1) {
+        patterns.push(fnName);
+      }
+      var base = path.posix.basename(file).replace(/\.(ts|js|mjs|cjs)$/, '');
+      if (base && base.length >= 2 && patterns.indexOf(base) === -1) {
+        patterns.push(base);
+      }
+    }
+    if (typeof finding.operationName === 'string' && finding.operationName.length > 0) {
+      var opName = finding.operationName.trim();
+      if (patterns.indexOf(opName) === -1) {
+        patterns.push(opName);
+      }
+      if (patterns.indexOf(opName + 'Resolver') === -1) {
+        patterns.push(opName + 'Resolver');
+      }
+    }
   }
 
   return patterns;
@@ -127,6 +165,27 @@ function getContextLines(filePath, targetLine, matchedPattern) {
     };
   } catch (err) {
     return { snippet: [], matchedLine: targetLine, matchedPattern: matchedPattern };
+  }
+}
+
+/**
+ * Recursively copy a package's contents into the clone's node_modules/<pkg>
+ * location without overwriting existing files, while skipping nested
+ * node_modules/.git inside the package itself.
+ */
+function copyDirContents(src, dst) {
+  var entries = fs.readdirSync(src, { withFileTypes: true });
+  for (var i = 0; i < entries.length; i++) {
+    var entry = entries[i];
+    if (entry.name === 'node_modules' || entry.name === '.git') continue;
+    var s = path.join(src, entry.name);
+    var d = path.join(dst, entry.name);
+    if (entry.isDirectory()) {
+      if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+      copyDirContents(s, d);
+    } else if (entry.isFile()) {
+      if (!fs.existsSync(d)) fs.copyFileSync(s, d);
+    }
   }
 }
 
@@ -655,6 +714,10 @@ async function locateCandidates(options) {
   var maxCandidates = options.maxCandidates || DEFAULT_MAX_CANDIDATES;
   var runId = options.runId || ('locator-' + Date.now());
   var workspaceDir = options.workspaceDir || process.cwd();
+  // Evidence root is passed through from the orchestrator (cfg.cwd + EVIDENCE_DIR)
+  // so locator evidence is written to the same tree as finding.json and never
+  // silently depends on process.cwd().
+  var evidenceRoot = options.evidenceRoot || EVIDENCE_ROOT;
 
   var candidates = [];
   var searched = [];
@@ -763,7 +826,21 @@ async function locateCandidates(options) {
           continue;
         }
 
-        // Search in package, avoiding node_modules inside packages
+        // Materialize the fetched package into the clone so the candidate
+        // paths survive the temp-workspace cleanup below and the prompt can
+        // point at real files in the clone's node_modules.
+        var nodeModulesPkgDir = path.join(targetRoot, 'node_modules', pkgName);
+        try {
+          fs.mkdirSync(nodeModulesPkgDir, { recursive: true });
+        } catch (e) { /* fall through: report below */ }
+        if (pkgPath && typeof pkgPath === 'string' && fs.existsSync(pkgPath)) {
+          try {
+            copyDirContents(pkgPath, nodeModulesPkgDir);
+          } catch (e) { /* skip */ }
+        }
+
+        // Search in the materialized package (clone-relative paths), avoiding
+        // node_modules nested inside packages.
         var searchInPackage = function(dir) {
           var found = [];
           try {
@@ -787,19 +864,20 @@ async function locateCandidates(options) {
                         var pkgMatch = pkgMatches[m];
                         var pkgContext = getContextLines(full, pkgMatch.lineNumber, pkgMatch.matchedPattern);
                         var pkgScore = scoreMatch({ line: pkgMatch.line, lineNumber: pkgMatch.lineNumber, matchedPattern: pkgMatch.matchedPattern, file: full }, finding, patterns);
+                        var relFile = path.relative(targetRoot, full).replace(/\\/g, '/');
 
                         found.push({
                           source: 'dependency',
                           package: pkgName + '@' + pkgVersion,
-                          file: full,
+                          file: relFile,
                           line: pkgMatch.lineNumber,
                           snippet: pkgContext.snippet,
                           score: pkgScore,
                           reasons: [pkgMatch.matchedPattern],
                           why: 'pattern "' + pkgMatch.matchedPattern + '" matched in dependency ' + pkgName + '@' + pkgVersion
                         });
-                        if (searched.indexOf(full) === -1) {
-                          searched.push(full);
+                        if (searched.indexOf(relFile) === -1) {
+                          searched.push(relFile);
                         }
                       }
                     }
@@ -811,7 +889,7 @@ async function locateCandidates(options) {
           return found;
         };
 
-        var pkgResults = searchInPackage(pkgPath);
+        var pkgResults = searchInPackage(nodeModulesPkgDir);
         candidates = candidates.concat(pkgResults);
       } catch (err) {
         // Package fetch failed (e.g. npm 404/401 for a missing or private
@@ -839,7 +917,7 @@ async function locateCandidates(options) {
   candidates = candidates.slice(0, maxCandidates);
 
   // Write evidence file
-  var evidenceDir = path.join(EVIDENCE_ROOT, runId, 'repair');
+  var evidenceDir = path.join(evidenceRoot, runId, 'repair');
   ensureDir(evidenceDir);
 
   var evidenceData = {
@@ -853,7 +931,7 @@ async function locateCandidates(options) {
         package: c.package,
         file: c.file,
         line: c.line,
-        snippet: c.snippet,
+        snippet: null,
         score: c.score,
         reasons: c.reasons
       };

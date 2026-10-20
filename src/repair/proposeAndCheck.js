@@ -1,5 +1,6 @@
 'use strict';
 
+var fs = require('fs');
 var path = require('path');
 var crypto = require('crypto');
 var coerce = require('./coerce');
@@ -38,7 +39,9 @@ function loadProtectedPathsFromEvidence(fs) {
   return protectedPaths;
 }
 
-// PROMPT_TEMPLATE - no cause names, no mention of specific business terms
+// PROMPT_TEMPLATE - no cause names, no mention of specific business terms.
+// Allowed repair kinds are injected per-run based on the clone's capabilities
+// (e.g. dependency-patch is only offered when the runtime image can apply it).
 var PROMPT_TEMPLATE = 'You are a bug fixer. Your task is to propose a JSON edit-set to fix the following finding.\n\n' +
 '## Finding\n' +
 '- class: {{class}}\n' +
@@ -51,16 +54,13 @@ var PROMPT_TEMPLATE = 'You are a bug fixer. Your task is to propose a JSON edit-
 '- notes: {{notes}}\n\n' +
 '## Candidate Code Snippets\n' +
 '{{candidates}}\n\n' +
-'## Allowed repairKind Values (use ONE)\n' +
-'- source-edit: for application code bugs\n' +
-'- config-edit: for wrong configuration settings\n' +
-'- migration: for missing database columns or tables\n' +
-'- dependency-bump: for bugs whose code lives in node_modules/<pkg> - bump version\n' +
-'- dependency-patch: for bugs whose code lives in node_modules/<pkg> - apply a patch\n' +
-'- local-wrapper: for bugs in node_modules/<pkg> that need a local wrapper workaround\n\n' +
+'## Allowed repairKind Values (choose ONE from this list)\n' +
+'{{allowedRepairKinds}}\n' +
+'{{dependencyInfo}}\n' +
+'{{capabilityNote}}\n' +
 '## JSON Edit-Set Contract\n' +
 '{\n' +
-'  "repairKind": "source-edit|config-edit|migration|dependency-bump|dependency-patch|local-wrapper",\n' +
+'  "repairKind": "<one of the allowed repairKind values>",\n' +
 '  "rationale": "one sentence explaining why this fix is correct",\n' +
 '  "edits": [\n' +
 '    { "path": "relative/path.js", "oldString": "exact text to find", "newString": "replacement text" }\n' +
@@ -72,11 +72,53 @@ var PROMPT_TEMPLATE = 'You are a bug fixer. Your task is to propose a JSON edit-
 '## Rules\n' +
 '- Make the smallest change possible\n' +
 '- Do not make unrelated edits\n' +
-'- Use only paths shown in candidates or created inside the clone\n' +
+'- Edits may only target one of the listed candidate files, or a new file under patches/, a migrations directory, or (for local-style wrappers) a new wrapper file under src/. Any other path is rejected with PROPOSAL_OUTSIDE_CANDIDATES.\n' +
+'- The local wrapper runs in-process in the same application; it must not copy secrets and must not change behavior beyond the finding.\n' +
 '- Answer with JSON only (no markdown, no explanation)\n\n' +
 '{{previousAttempts}}\n\n' +
 '## Output\n' +
 'Return a JSON object matching the Edit-Set Contract above.';
+
+function defaultAllowedRepairKinds(opts) {
+  var d = opts || {};
+  var allowDepPatch = d.capabilities ? d.capabilities.dependencyPatch : true;
+  var lines = [
+    '- source-edit: for application code bugs',
+    '- config-edit: for wrong configuration settings',
+    '- migration: for missing database columns or tables'
+  ];
+  if (d.domain === 'dependency') {
+    lines.push('- dependency-bump: for bugs whose code lives in node_modules/<pkg> - upgrade to a newer version listed below');
+    if (allowDepPatch) {
+      lines.push('- dependency-patch: for bugs whose code lives in node_modules/<pkg> - apply a patch');
+    }
+    lines.push('- local-wrapper: for bugs in node_modules/<pkg> that need a local wrapper workaround');
+  }
+  return lines.join('\n');
+}
+
+function dependencyInfoText(depInfo) {
+  if (!depInfo) return '';
+  var lines = ['## Dependency Version Info'];
+  lines.push('- package: ' + depInfo.package);
+  lines.push('- installed version: ' + (depInfo.installedVersion || 'unknown'));
+  if (depInfo.availableVersions && depInfo.availableVersions.length > 0) {
+    lines.push('- available versions (newest first): ' + depInfo.availableVersions.join(', '));
+  } else {
+    lines.push('- no newer versions are available on the registry for this package');
+  }
+  if (depInfo.noNewer) {
+    lines.push('- NOTE: this package has no version newer than the installed one; do NOT use dependency-bump, use local-wrapper instead.');
+  }
+  return lines.join('\n') + '\n';
+}
+
+function capabilityNoteText(capabilities) {
+  if (!capabilities || capabilities.dependencyPatch) return '';
+  return '## Capability Note\n' +
+    '- Patching a dependency inside node_modules is NOT available in this runtime: ' + (capabilities.reason || 'not applicable in this image') + '\n';
+}
+
 
 /**
  * Format previous attempts into the prompt.
@@ -89,6 +131,12 @@ function formatPreviousAttempts(previousAttempts) {
   for (var i = 0; i < previousAttempts.length; i++) {
     var attempt = previousAttempts[i];
     lines.push('Attempt ' + (i + 1) + ':');
+    if (attempt.rejectionCodes && attempt.rejectionCodes.length > 0) {
+      lines.push('  rejection codes: ' + attempt.rejectionCodes.join(', '));
+    }
+    if (attempt.validCandidatePaths && attempt.validCandidatePaths.length > 0) {
+      lines.push('  valid candidate paths: ' + attempt.validCandidatePaths.join(', '));
+    }
     if (attempt.diff) {
       lines.push('  diff: ' + toText(attempt.diff, 500));
     }
@@ -127,7 +175,11 @@ function formatCandidates(candidates) {
 /**
  * Build the prompt from template.
  */
-function buildPrompt(finding, candidates, previousAttempts) {
+function buildPrompt(finding, candidates, previousAttempts, opts) {
+  opts = opts || {};
+  var allowed = opts.allowedRepairKinds || defaultAllowedRepairKinds(opts);
+  var dependencyInfo = opts.dependencyInfo ? dependencyInfoText(opts.dependencyInfo) : '';
+  var capabilityNote = opts.capabilities ? capabilityNoteText(opts.capabilities) : '';
   var prompt = PROMPT_TEMPLATE
     .replace('{{class}}', finding.class || 'unknown')
     .replace('{{message}}', finding.message || 'unknown')
@@ -138,6 +190,9 @@ function buildPrompt(finding, candidates, previousAttempts) {
     .replace('{{confidence}}', String(finding.confidence || 'unknown'))
     .replace('{{notes}}', finding.notes || 'none')
     .replace('{{candidates}}', formatCandidates(candidates))
+    .replace('{{allowedRepairKinds}}', allowed)
+    .replace('{{dependencyInfo}}', dependencyInfo)
+    .replace('{{capabilityNote}}', capabilityNote)
     .replace('{{previousAttempts}}', formatPreviousAttempts(previousAttempts));
   return prompt;
 }
@@ -149,11 +204,60 @@ function sha256Hex(str) {
   return crypto.createHash('sha256').update(str, 'utf8').digest('hex');
 }
 
+/**
+ * Extract stable error codes embedded as '[CODE]' at the start of error strings.
+ */
+function extractErrorCodes(errors) {
+  var codes = [];
+  for (var i = 0; i < (errors || []).length; i++) {
+    var m = /^\[([A-Z_]+)\]/.exec(toText(errors[i]));
+    if (m && codes.indexOf(m[1]) === -1) codes.push(m[1]);
+  }
+  return codes;
+}
+
+/**
+ * Write the compact attempt summary (evidence/<runId>/repair/attempt-<n>.json).
+ * Paths and codes only — never file contents, log lines, or secrets.
+ */
+function writeAttemptSummary(runId, attemptNumber, data, fsMod, now) {
+  try {
+    var dir = path.join('evidence', runId, 'repair');
+    ensureDir(fsMod, dir);
+    var summary = {
+      attempt: attemptNumber,
+      status: data.status,
+      codes: Array.isArray(data.codes) ? data.codes : [],
+      requestedPaths: Array.isArray(data.requestedPaths) ? data.requestedPaths : [],
+      candidatePaths: Array.isArray(data.candidatePaths) ? data.candidatePaths : [],
+      tokensUsed: typeof data.tokensUsed === 'number' ? data.tokensUsed : null,
+      timestamp: (typeof now === 'function' ? now() : new Date().toISOString())
+    };
+    fsMod.writeFileSync(path.join(dir, 'attempt-' + attemptNumber + '.json'), JSON.stringify(summary, null, 2) + '\n', 'utf8');
+  } catch (e) { /* best effort */ }
+}
+
+/**
+ * Write evidence/<runId>/repair/capabilities.json for the dependency-patch
+ * capability decision (and its reason). Written once per attempt.
+ */
+function writeCapabilitiesEvidence(capabilities, runId, fsMod, now) {
+  try {
+    var dir = path.join('evidence', runId, 'repair');
+    ensureDir(fsMod, dir);
+    var data = {
+      dependencyPatch: capabilities ? capabilities.dependencyPatch : false,
+      reason: capabilities ? capabilities.reason : null,
+      timestamp: (typeof now === 'function' ? now() : new Date().toISOString())
+    };
+    fsMod.writeFileSync(path.join(dir, 'capabilities.json'), JSON.stringify(data, null, 2) + '\n', 'utf8');
+  } catch (e) { /* best effort */ }
+}
+
 function writeEvidence(runId, attemptNumber, evidence, deps) {
   var fs = deps.fs;
   var dir = path.join('evidence', runId, 'repair', 'attempts', String(attemptNumber).padStart(2, '0'));
   ensureDir(fs, dir);
-
   // Write prompt.sha256 (hash only) and prompt.txt (redacted)
   var promptHash = sha256Hex(evidence.prompt);
   var promptPath = path.join(dir, 'prompt.txt');
@@ -234,11 +338,272 @@ function getProtectedPaths(mode, fs) {
 }
 
 /**
+ * Normalize a candidate or proposal path to a forward-slash clone-relative form.
+ * Absolute clone paths and bare relative paths both map to the same key so a
+ * modeled edit path can be matched against a candidate's absolute file path.
+ */
+function normRelPath(p, cloneDir, isCandidate) {
+  if (!p || typeof p !== 'string') return '';
+  var out;
+  if (path.isAbsolute(p)) {
+    try {
+      out = path.relative(cloneDir, p);
+    } catch (e) {
+      out = p;
+    }
+  } else {
+    out = p;
+  }
+  out = out.replace(/\\/g, '/');
+  if (out.indexOf('../') === 0) out = out.replace(/^(\.\.\/)+/, '');
+  if (out === '.') out = '';
+  void isCandidate;
+  return out;
+}
+
+/**
+ * Collect clone-relative candidate paths for the prompt/gate. The prompt and
+ * the PROPOSAL_OUTSIDE_CANDIDATES validator both describe the same normalized
+ * set so a modeled path like 'node_modules/pkg/dist/x.js' matches the located
+ * candidate frames.
+ */
+function candidateRelPaths(cloneDir, candidates) {
+  var set = [];
+  for (var i = 0; i < (candidates || []).length; i++) {
+    var c = candidates[i];
+    if (!c || !c.file) continue;
+    var rel = normRelPath(c.file, cloneDir, true);
+    if (rel !== '' && set.indexOf(rel) === -1) set.push(rel);
+  }
+  return set;
+}
+
+function isUnderMigrationDir(rel, cloneDir) {
+  var dir = findMigrationsDir(cloneDir);
+  if (!dir) return false;
+  var base = path.basename(dir);
+  return rel === base || rel.indexOf(base + '/') === 0;
+}
+
+function findMigrationsDir(cloneDir) {
+  var commonNames = ['migrations', 'src/migrations', 'db/migrations', 'typeorm/migrations', 'mikro-orm/migrations'];
+  for (var i = 0; i < commonNames.length; i++) {
+    var dir = path.join(cloneDir, commonNames[i]);
+    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return dir;
+  }
+  try {
+    var entries = fs.readdirSync(cloneDir, { withFileTypes: true });
+    for (var j = 0; j < entries.length; j++) {
+      var e = entries[j];
+      if (e.isDirectory() && e.name.indexOf('migration') !== -1) {
+        return path.join(cloneDir, e.name);
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+/**
+ * Enforce that every proposed edit path is one of the listed candidate paths
+ * (or an allowed new-file location: patches/, a migrations dir, or a new
+ * local-wrapper file under src/). Returns { ok, offending, validPaths }.
+ */
+function validateProposalPaths(editSet, candidates, cloneDir) {
+  var allowed = candidateRelPaths(cloneDir, candidates);
+  var offending = [];
+  var edits = (editSet && editSet.edits) || [];
+  for (var i = 0; i < edits.length; i++) {
+    var e = edits[i];
+    if (!e || !e.path) continue;
+    var rel = normRelPath(e.path, cloneDir, false);
+    if (rel === '') continue;
+    var isMigrationEdit = isUnderMigrationDir(rel, cloneDir);
+    var isLocalWrapperEdit = editSet.repairKind === 'local-wrapper' && rel.indexOf('src/') === 0;
+    if (allowed.indexOf(rel) === -1 && !isMigrationEdit && !isLocalWrapperEdit) {
+      if (offending.indexOf(e.path) === -1) offending.push(e.path);
+    }
+  }
+  var newFiles = (editSet && editSet.newFiles) || [];
+  for (var j = 0; j < newFiles.length; j++) {
+    var nf = newFiles[j];
+    if (!nf || !nf.path) continue;
+    var relNf = normRelPath(nf.path, cloneDir, false);
+    if (relNf === '') continue;
+    var inPatches = relNf.indexOf('patches/') === 0;
+    var inMigration = isUnderMigrationDir(relNf, cloneDir);
+    var localWrapperNew = editSet.repairKind === 'local-wrapper' && relNf.indexOf('src/') === 0;
+    if (!inPatches && !inMigration && !localWrapperNew) {
+      if (offending.indexOf(nf.path) === -1) offending.push(nf.path);
+    }
+  }
+  return { ok: offending.length === 0, offending: offending, validPaths: allowed };
+}
+
+/**
+ * Find Dockerfile(s) at the clone root (Dockerfile, Dockerfile.*, docker/…).
+ * Returns absolute paths, empty when none exist.
+ */
+function findDockerfiles(cloneDir) {
+  var found = [];
+  try {
+    var entries = fs.readdirSync(cloneDir, { withFileTypes: true });
+    for (var i = 0; i < entries.length; i++) {
+      var e = entries[i];
+      if (e.isFile() && /^Dockerfile($|\.)/.test(e.name)) {
+        found.push(path.join(cloneDir, e.name));
+      } else if (e.isDirectory() && e.name === 'docker') {
+        try {
+          var sub = fs.readdirSync(path.join(cloneDir, e.name));
+          for (var j = 0; j < sub.length; j++) {
+            if (/^Dockerfile($|\.)/.test(sub[j])) found.push(path.join(cloneDir, e.name, sub[j]));
+          }
+        } catch (err) { /* ignore */ }
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return found;
+}
+
+/**
+ * Detect whether dependency patches can be applied at runtime by inspecting the
+ * clone's Dockerfile(s) and package.json. patch-package (or equivalent) must be
+ * installed and the install that produces the runtime node_modules must not use
+ * --ignore-scripts. Never modifies the Dockerfile.
+ */
+function detectDependencyPatchCapability(cloneDir) {
+  var reason = null;
+  var installsOk = true;
+  var patchRuntimeDep = false;
+  var patchDevDep = false;
+  var omitDev = false;
+  var patchViaDockerfile = false;
+
+  try {
+    var pkg = JSON.parse(fs.readFileSync(path.join(cloneDir, 'package.json'), 'utf8'));
+    if ((pkg.dependencies || {})['patch-package']) patchRuntimeDep = true;
+    if ((pkg.devDependencies || {})['patch-package']) patchDevDep = true;
+  } catch (e) { /* no package.json */ }
+
+  var dockerfiles = findDockerfiles(cloneDir);
+  for (var i = 0; i < dockerfiles.length; i++) {
+    var content = '';
+    try { content = fs.readFileSync(dockerfiles[i], 'utf8'); } catch (e) { continue; }
+    if (/RUN\s+(npm|yarn|pnpm)\s+(ci|install)[^\n]*--ignore-scripts/i.test(content)) {
+      if (!reason) reason = 'install step uses --ignore-scripts; the patch postinstall cannot run';
+      installsOk = false;
+    }
+    if (/\b--omit=dev\b|\b--production\b/i.test(content)) omitDev = true;
+    if (/patch-package/i.test(content)) patchViaDockerfile = true;
+  }
+
+  var patchInNodeModules = fs.existsSync(path.join(cloneDir, 'node_modules', 'patch-package'));
+  var patchPackageReady = patchRuntimeDep || patchInNodeModules || patchViaDockerfile || (patchDevDep && !omitDev);
+
+  if (dockerfiles.length === 0) {
+    if (!reason) reason = 'no Dockerfile found in the clone';
+  } else if (!patchPackageReady) {
+    if (!reason) reason = 'patch-package (or equivalent) is not installed in the runtime image';
+  } else if (!installsOk) {
+    reason = reason || 'install does not run package postinstall scripts';
+  }
+
+  var ok = dockerfiles.length > 0 && patchPackageReady && installsOk;
+  return { dependencyPatch: ok, reason: ok ? null : (reason || 'dependency-patch is not applicable in this image') };
+}
+
+/**
+ * Query the npm registry for available versions of a package. Reuses the
+ * injected fetch path (no shell, no network beyond the one GET) and tolerates
+ * 401/404/other failures by returning an empty list. Never throws.
+ */
+function queryDependencyVersions(pkgName, fetch) {
+  if (!pkgName || typeof fetch !== 'function') {
+    return Promise.resolve({ package: pkgName || null, availableVersions: [], error: 'no fetch path' });
+  }
+  var safeName = pkgName.replace(/@/g, '%40').replace(/\//g, '%2F');
+  var url = 'https://registry.npmjs.org/' + safeName;
+  var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  var timer = controller ? setTimeout(function() { controller.abort(); }, 20000) : null;
+  return Promise.resolve().then(function() {
+    return fetch(url, {
+      headers: { 'Accept': 'application/vnd.npm.install-v1+json' },
+      signal: controller ? controller.signal : undefined
+    });
+  }).then(function(res) {
+    var status = res && typeof res.status === 'number' ? res.status : 0;
+    if (status === 401 || status === 403 || status === 404) {
+      return { package: pkgName, availableVersions: [], error: 'registry ' + status };
+    }
+    if (res == null || typeof res.ok !== 'boolean' || !res.ok) {
+      return { package: pkgName, availableVersions: [], error: 'non-ok response' };
+    }
+    var read = typeof res.json === 'function' ? res.json() : null;
+    if (!read) return { package: pkgName, availableVersions: [], error: 'unreadable body' };
+    return read.then(function(data) {
+      var versions = [];
+      var body = data || {};
+      var map = body.versions && typeof body.versions === 'object' ? body.versions : {};
+      var keys = Object.keys(map);
+      for (var i = 0; i < keys.length; i++) {
+        if (keys[i] && versions.indexOf(keys[i]) === -1) versions.push(keys[i]);
+      }
+      versions.sort(semverDesc);
+      return { package: pkgName, availableVersions: versions.slice(0, 15).map(String), versionsAll: versions.length };
+    });
+  }).catch(function(err) {
+    if (err && err.name === 'AbortError') {
+      return { package: pkgName, availableVersions: [], error: 'registry timeout' };
+    }
+    return { package: pkgName, availableVersions: [], error: 'registry query failed' };
+  }).finally(function() {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
+ * Compare two version strings without a dependency on semver. Returns positive
+ * when b is newer than a's numeric segments are compared componentwise.
+ */
+function semverDesc(a, b) {
+  var pa = String(a).split('-')[0].split('.').map(function(n) { return parseInt(n, 10) || 0; });
+  var pb = String(b).split('-')[0].split('.').map(function(n) { return parseInt(n, 10) || 0; });
+  for (var i = 0; i < Math.max(pa.length, pb.length); i++) {
+    var ca = pa[i] || 0;
+    var cb = pb[i] || 0;
+    if (ca !== cb) return cb - ca;
+  }
+  return 0;
+}
+
+/**
+ * Read the exact installed version of a package from the clone's lockfile data
+ * (package-lock.json dependencies/packages), falling back to package.json.
+ */
+function installedDependencyVersion(cloneDir, pkgName) {
+  try {
+    var lock = JSON.parse(fs.readFileSync(path.join(cloneDir, 'package-lock.json'), 'utf8'));
+    var deps = lock.dependencies || {};
+    if (deps[pkgName] && deps[pkgName].version) return String(deps[pkgName].version);
+    var pkgs = lock.packages || {};
+    if (pkgs['node_modules/' + pkgName] && pkgs['node_modules/' + pkgName].version) {
+      return String(pkgs['node_modules/' + pkgName].version);
+    }
+  } catch (e) { /* no lockfile */ }
+  try {
+    var pkg = JSON.parse(fs.readFileSync(path.join(cloneDir, 'package.json'), 'utf8'));
+    var ver = (pkg.dependencies || {})[pkgName] || (pkg.devDependencies || {})[pkgName];
+    if (ver) return String(ver).replace(/^[\^~>=<]+/, '');
+  } catch (e) { /* no package.json */ }
+  return null;
+}
+
+/**
  * Main function: propose and check.
  */
 async function proposeAndCheck(options) {
   var finding = options.finding;
   var candidates = options.candidates || [];
+  var searched = options.searched || [];
   var previousAttempts = options.previousAttempts || [];
   var budget = options.budget;
   var runId = options.runId;
@@ -309,6 +674,41 @@ async function proposeAndCheck(options) {
     };
   }
 
+  // Step 1b: zero real candidates -> BLOCKED NO_CANDIDATES, model never called.
+  var realCandidates = (candidates || []).filter(function(c) { return c && c.file; });
+  var framesEv = [];
+  var stack = finding.stack;
+  if (Array.isArray(stack)) {
+    for (var fe = 0; fe < stack.length; fe++) {
+      var sf = stack[fe];
+      if (sf && sf.file) framesEv.push({ file: sf.file, line: sf.line || null });
+    }
+  }
+  var pkgNames = [];
+  var findingPkg = finding.package;
+  if (findingPkg && typeof findingPkg === 'string' && pkgNames.indexOf(findingPkg) === -1) pkgNames.push(findingPkg);
+  for (var pc = 0; pc < realCandidates.length; pc++) {
+    var cp = realCandidates[pc].package;
+    if (cp && typeof cp === 'string') {
+      var rawName = cp.split('@')[0];
+      if (rawName && pkgNames.indexOf(rawName) === -1) pkgNames.push(rawName);
+    }
+  }
+  if (realCandidates.length === 0) {
+    return {
+      status: 'BLOCKED',
+      blocker: {
+        code: 'NO_CANDIDATES',
+        message: 'no candidate code locations were found for this finding',
+        evidence: {
+          frames: framesEv,
+          packages: pkgNames,
+          searched: Array.isArray(searched) ? searched.slice() : []
+        }
+      }
+    };
+  }
+
   // Step 2: consume budget
   var consumeResult = model.consume(budget, finding.signature);
   if (!consumeResult.ok) {
@@ -318,22 +718,48 @@ async function proposeAndCheck(options) {
     };
   }
 
-  // Step 3: build prompt
-  var prompt = buildPrompt(finding, candidates, previousAttempts);
-
-  // Step 4: call model
-  var modelResult;
+  // Step 3: resolve the clone first (pipeline mode uses a scratch copy) so
+  // capabilities and dependency info are derived from the exact tree the prompt
+  // will point at. Dockerfile is never modified.
+  var scratchCopied = false;
   if (mode === 'pipeline') {
-    // For pipeline mode, use the current repo root
     var repoRoot = path.resolve(__dirname, '..', '..');
     var scratchResult = await scratchCopy(repoRoot, runId, runCommand);
     if (!scratchResult.ok) {
       return { status: 'BLOCKED', blocker: { code: 'SCRATCH_COPY_FAILED', message: scratchResult.error } };
     }
-    // Update cloneDir to scratch copy for pipeline mode
     cloneDir = scratchResult.dir;
+    scratchCopied = true;
   }
 
+  var capabilities = detectDependencyPatchCapability(cloneDir);
+  var capabilitiesForPrompt = { dependencyPatch: capabilities.dependencyPatch, reason: capabilities.reason };
+  writeCapabilitiesEvidence(capabilities, runId, fs, now);
+
+  var dependencyInfo = null;
+  if (finding.domain === 'dependency' && finding.package) {
+    var reg = await queryDependencyVersions(finding.package, fetch);
+    var installedVersion = installedDependencyVersion(cloneDir, finding.package);
+    var newerExists = Array.isArray(reg.availableVersions) && reg.availableVersions.some(function(v) {
+      return semverDesc(v, installedVersion) < 0;
+    });
+    dependencyInfo = {
+      package: finding.package,
+      installedVersion: installedVersion || 'unknown',
+      availableVersions: reg.availableVersions || [],
+      noNewer: !newerExists && (installedVersion !== null)
+    };
+  }
+
+  // Step 3b: build the prompt with the resolved capabilities and dependency info.
+  var prompt = buildPrompt(finding, candidates, previousAttempts, {
+    domain: finding.domain,
+    capabilities: { dependencyPatch: capabilities.dependencyPatch, reason: capabilities.reason },
+    dependencyInfo: dependencyInfo
+  });
+
+  // Step 4: call model
+  var modelResult;
   modelResult = await model.callModel({
     prompt: prompt,
     system: 'You are a bug fixer. Output only JSON.',
@@ -363,6 +789,36 @@ async function proposeAndCheck(options) {
 
   var editSet = parseResult.editSet;
 
+  // Collect the paths the model requested (trimmed to names only for evidence).
+  var requestedPaths = [];
+  (editSet.edits || []).forEach(function(e) { if (e && e.path) requestedPaths.push(e.path); });
+  (editSet.newFiles || []).forEach(function(nf) { if (nf && nf.path) requestedPaths.push(nf.path); });
+
+  // Step 4c: PROPOSAL_OUTSIDE_CANDIDATES gate — edits only on listed
+  // candidate paths (plus newFiles under patches/, migrations dirs, or new
+  // local-wrapper files under src/). An invented path is rejected here before
+  // any general validation masking.
+  var pathGate = validateProposalPaths(editSet, realCandidates, cloneDir);
+  if (!pathGate.ok) {
+    var rejectionCodes = ['PROPOSAL_OUTSIDE_CANDIDATES'];
+    var validPaths = pathGate.validPaths;
+    writeAttemptSummary(runId, 1, {
+      status: 'REJECTED',
+      codes: rejectionCodes,
+      requestedPaths: requestedPaths,
+      candidatePaths: validPaths,
+      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null
+    }, fs, now);
+    return {
+      status: 'REJECTED',
+      rejectionCodes: rejectionCodes,
+      validCandidatePaths: validPaths,
+      requestedPaths: requestedPaths,
+      errors: pathGate.offending.map(function(p) { return '[' + rejectionCodes[0] + '] path not a listed candidate: ' + p; }),
+      blocker: { code: 'PROPOSAL_OUTSIDE_CANDIDATES', message: 'proposal edits a path that is not a listed candidate: ' + pathGate.offending.join(', ') }
+    };
+  }
+
   // Step 5: validate
   var protectedPaths = getProtectedPaths(mode, fs);
   var validationResult = validator.validate(editSet, {
@@ -372,8 +828,20 @@ async function proposeAndCheck(options) {
   });
 
   if (!validationResult.ok) {
+    var vCodes = extractErrorCodes(validationResult.errors);
+    var vValid = candidateRelPaths(cloneDir, realCandidates);
+    writeAttemptSummary(runId, 1, {
+      status: 'REJECTED',
+      codes: vCodes,
+      requestedPaths: requestedPaths,
+      candidatePaths: vValid,
+      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null
+    }, fs, now);
     return {
       status: 'REJECTED',
+      rejectionCodes: vCodes,
+      validCandidatePaths: vValid,
+      requestedPaths: requestedPaths,
       errors: validationResult.errors,
       blocker: { code: 'VALIDATION_FAILED', message: validationResult.errors.join('; ') }
     };
@@ -386,6 +854,26 @@ async function proposeAndCheck(options) {
       return {
         status: 'BLOCKED',
         blocker: { code: 'DEP_PATCH_NOT_APPLIED_IN_IMAGE', message: applyResult.blocker.message }
+      };
+    }
+    // A lockfile/sync mismatch is a retryable rejection, not a hard failure.
+    if (applyResult.blocker && (applyResult.blocker.code === 'LOCKFILE_OUT_OF_SYNC' || applyResult.blocker.code === 'LOCKFILE_REGEN_FAILED')) {
+      var depCodes = [applyResult.blocker.code];
+      var depValid = candidateRelPaths(cloneDir, realCandidates);
+      writeAttemptSummary(runId, 1, {
+        status: 'REJECTED',
+        codes: depCodes,
+        requestedPaths: requestedPaths,
+        candidatePaths: depValid,
+        tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null
+      }, fs, now);
+      return {
+        status: 'REJECTED',
+        rejectionCodes: depCodes,
+        validCandidatePaths: depValid,
+        requestedPaths: requestedPaths,
+        errors: [applyResult.blocker.message],
+        blocker: { code: applyResult.blocker.code, message: applyResult.blocker.message }
       };
     }
     return {
@@ -457,6 +945,15 @@ async function proposeAndCheck(options) {
     diffText: diffTextOutput
   }, { fs: fs, now: now });
 
+  writeAttemptSummary(runId, attemptNumber, {
+    status: 'READY',
+    codes: [],
+    requestedPaths: requestedPaths,
+    candidatePaths: candidateRelPaths(cloneDir, realCandidates),
+    tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null
+  }, fs, now);
+
+
   // For pipeline mode, we don't push - the orchestrator handles that
   // Also for pipeline mode, we should NOT commit to the real tree
   if (mode === 'pipeline') {
@@ -490,5 +987,10 @@ async function proposeAndCheck(options) {
 module.exports = {
   proposeAndCheck: proposeAndCheck,
   stackToString: stackToString,
-  buildPrompt: buildPrompt
+  buildPrompt: buildPrompt,
+  detectDependencyPatchCapability: detectDependencyPatchCapability,
+  queryDependencyVersions: queryDependencyVersions,
+  candidateRelPaths: candidateRelPaths,
+  validateProposalPaths: validateProposalPaths,
+  installedDependencyVersion: installedDependencyVersion
 };

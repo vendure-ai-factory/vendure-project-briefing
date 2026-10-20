@@ -321,7 +321,7 @@ test('apply: dependency-bump fails install returns INSTALL_FAILED', function() {
     var result = patchApplier.apply(editSet, { cloneDir: tmpDir, runCommand: fakeRunCommand });
     assert.strictEqual(result.ok, false);
     assert.ok(result.blocker);
-    assert.strictEqual(result.blocker.code, ERR.INSTALL_FAILED);
+    assert.strictEqual(result.blocker.code, 'LOCKFILE_REGEN_FAILED');
   } finally {
     cleanupTempDir(tmpDir);
   }
@@ -793,9 +793,11 @@ test('apply: runInstall uses correct argv (shell:false)', function() {
       return { stdout: '', stderr: '', exitCode: 0 };
     };
     patchApplier.apply(editSet, { cloneDir: tmpDir, runCommand: fakeRunCommand });
-    assert.strictEqual(recordedCalls.length, 1);
+    assert.strictEqual(recordedCalls.length, 2);
     assert.strictEqual(recordedCalls[0].cmd, 'npm');
-    assert.deepStrictEqual(recordedCalls[0].args, ['ci']);
+    assert.deepStrictEqual(recordedCalls[0].args, ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund']);
+    assert.strictEqual(recordedCalls[1].cmd, 'npm');
+    assert.deepStrictEqual(recordedCalls[1].args, ['ci', '--dry-run']);
   } finally {
     cleanupTempDir(tmpDir);
   }
@@ -825,6 +827,9 @@ test('apply: ERR_CODES contains expected error codes', function() {
     'INVALID_PATH',
     'UNKNOWN_REPAIR_KIND',
     'COMMAND_INJECTION',
+    'COMMAND_INJECTION',
+    'LOCKFILE_REGEN_FAILED',
+    'LOCKFILE_OUT_OF_SYNC',
     'RESTORE_FAILED'
   ];
   expectedCodes.forEach(function(code) {

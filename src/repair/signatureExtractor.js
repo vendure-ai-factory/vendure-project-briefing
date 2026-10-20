@@ -137,6 +137,113 @@ function parseStackFrames(msg) {
   return frames;
 }
 
+/**
+ * Parse a single collected log line into a stack frame {file, line}.
+ * Handles the two required shapes:
+ *   - "at ... (<file>:<line>:<col>)" or "at <file>:<line>:<col>"
+ *   - a bare "<file>:<line>:<col>" where <file> has a known source extension
+ * Returns null when the line holds no frame.
+ */
+function parseLogLineFrame(line) {
+  if (!line || typeof line !== 'string') return null;
+  var m = line.match(/\bat\s+.*?\(?(\S+):(\d+):(\d+)\)?/);
+  if (m) {
+    return { file: m[1], line: parseInt(m[2], 10) };
+  }
+  m = line.match(/(^|[^\w).])([^\s()]+\.(?:js|mjs|ts|cjs)):(\d+)(?::\d+)?/);
+  if (m) {
+    return { file: m[2], line: parseInt(m[3], 10) };
+  }
+  return null;
+}
+
+var LOG_FRAME_WINDOW = 30;
+
+/**
+ * Parse stack frames from the collected log lines and keep only the ones
+ * within a window around the error occurrence. `logLines` is accepted as an
+ * array of strings (merged cross-kind by the caller) or as an object whose
+ * values are arrays of strings. `errorText` (the task's own error text) anchors
+ * the occurrence; falls back to the first error-level line when absent.
+ */
+function parseStackFramesFromLogs(logLines, errorText) {
+  var all = [];
+  if (Array.isArray(logLines)) {
+    all = logLines.filter(function(l) { return typeof l === 'string' && l !== ''; });
+  } else if (logLines && typeof logLines === 'object') {
+    var kinds = Object.keys(logLines);
+    for (var k = 0; k < kinds.length; k++) {
+      var arr = logLines[kinds[k]];
+      if (!Array.isArray(arr)) continue;
+      for (var j = 0; j < arr.length; j++) {
+        var l = arr[j];
+        if (typeof l === 'string' && l !== '') all.push(l);
+      }
+    }
+  }
+  if (all.length === 0) return [];
+
+  var anchor = -1;
+  if (errorText && typeof errorText === 'string' && errorText !== '') {
+    for (var a = 0; a < all.length; a++) {
+      if (all[a].indexOf(errorText) !== -1) { anchor = a; break; }
+    }
+  }
+  if (anchor === -1) {
+    for (var b = 0; b < all.length; b++) {
+      if (/(error|exception|failed|uncaught|fatal|thrown)/i.test(all[b])) { anchor = b; break; }
+    }
+  }
+
+  var frames = [];
+  for (var i = 0; i < all.length; i++) {
+    var f = parseLogLineFrame(all[i]);
+    if (!f) continue;
+    if (anchor !== -1 && Math.abs(i - anchor) > LOG_FRAME_WINDOW) continue;
+    frames.push({ fn: null, file: f.file, line: f.line });
+  }
+  return frames;
+}
+
+/**
+ * Extract the package name from a node_modules path. Supports both unscoped
+ * (node_modules/pkg/...) and scoped (node_modules/@scope/pkg/...) names.
+ */
+function packageFromNodeModulesPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return null;
+  var m = filePath.match(/node_modules\/(@[^/]+\/[^/]+|[^/]+)/);
+  if (!m) return null;
+  var pkg = m[1].replace(/\\/g, '/');
+  var segments = pkg.split('/');
+  if (segments.length === 2) {
+    return '@' + segments[0].replace(/^@/, '') + '/' + segments[1]; // scoped
+  }
+  return segments[0]; // unscoped
+}
+
+/**
+ * Derive { domain, package } from a set of frames. Any node_modules frame wins
+ * with domain 'dependency' plus its package name; otherwise target-source
+ * frames map to 'target-code'. Returns null when no frame is usable (caller
+ * must not override the domain then).
+ */
+function domainFromFrames(frames) {
+  var usable = [];
+  for (var i = 0; i < (frames || []).length; i++) {
+    var f = frames[i];
+    if (!f || !f.file) continue;
+    var norm = String(f.file).replace(/\\/g, '/');
+    if (norm.indexOf('node_modules/') !== -1) {
+      return { domain: 'dependency', package: packageFromNodeModulesPath(norm) };
+    }
+    if (!isPipelineFrame(norm)) usable.push(norm);
+  }
+  if (usable.length > 0) {
+    return { domain: 'target-code', package: null };
+  }
+  return null;
+}
+
 function decideDomain(sqlstate, apiErrors, logExcerpt) {
   var allText = '';
   if (Array.isArray(apiErrors)) {
@@ -356,12 +463,15 @@ function extractFinding(input) {
       notes: ['Invalid input: expected object with apiErrors, logExcerpt, operationName, and/or query fields'],
       domain: 'unknown',
       sqlstate: null,
+      package: null,
       stack: []
     };
   }
 
   var apiErrors = Array.isArray(input.apiErrors) ? input.apiErrors : [];
   var logExcerpt = input.logExcerpt != null && typeof input.logExcerpt === 'string' ? input.logExcerpt : null;
+  var rawLogLines = input.logLines != null && typeof input.logLines === 'object' ? input.logLines : [];
+  var operationName = input.operationName && typeof input.operationName === 'string' ? input.operationName : null;
 
   var notes = [];
 
@@ -373,9 +483,31 @@ function extractFinding(input) {
     logExcerpt = redactedExcerpt;
   }
 
+  // Baseline classification from structured signals (apiErrors + sqlstate).
   var sqlstate = extractSqlstate(apiErrors, logExcerpt);
   var domain = decideDomain(sqlstate, apiErrors, logExcerpt);
   var stack = buildStackFromErrors(apiErrors);
+  var packageName = null;
+
+  // Log-derived stack frames override the classification only when frames are
+  // actually present. A node_modules frame sets domain 'dependency' plus the
+  // package (scoped names supported); a target-source frame sets 'target-code'.
+  var errText = '';
+  if (apiErrors[0] && typeof apiErrors[0].message === 'string') errText = apiErrors[0].message;
+  var logFrames = parseStackFramesFromLogs(rawLogLines, errText);
+  if (logFrames.length > 0) {
+    var merged = stack.slice();
+    for (var lf = 0; lf < logFrames.length; lf++) {
+      var dup = merged.some(function(ex) { return ex && ex.file === logFrames[lf].file && ex.line === logFrames[lf].line; });
+      if (!dup) merged.push(logFrames[lf]);
+    }
+    stack = merged;
+    var frameDomain = domainFromFrames(logFrames);
+    if (frameDomain && frameDomain.domain) {
+      domain = frameDomain.domain;
+      packageName = frameDomain.package || null;
+    }
+  }
 
   var apiResult = parseApiErrorsIntegerMismatch(apiErrors);
 
@@ -385,11 +517,13 @@ function extractFinding(input) {
       class: 'UNKNOWN',
       message: null,
       path: null,
+      operationName: operationName,
       sql: { statement: null, operator: null, column: null, paramIndex: null, paramValue: null },
       confidence: 'API_ONLY',
       notes: notes.length > 0 ? notes : ['No recognizable integer type mismatch error found in apiErrors'],
       domain: domain,
       sqlstate: sqlstate,
+      package: packageName,
       stack: stack
     };
   }
@@ -421,17 +555,22 @@ function extractFinding(input) {
     class: 'SQL_PARAM_TYPE',
     message: apiResult.message,
     path: apiResult.path,
+    operationName: operationName,
     sql: sql,
     confidence: confidence,
     notes: notes,
     domain: domain,
     sqlstate: sqlstate,
+    package: packageName,
     stack: stack
   };
 }
 
 module.exports = {
   extractFinding: extractFinding,
+  parseStackFramesFromLogs: parseStackFramesFromLogs,
+  packageFromNodeModulesPath: packageFromNodeModulesPath,
+  domainFromFrames: domainFromFrames,
   DOMAIN_DECISION_TABLE: {
     rules: [
       { order: 1,  name: 'sqlstate-hard',   condition: 'sqlstate in DB_SQLSTATES_HARD',       domain: 'DB_SQLSTATES_HARD[sqlstate]', blocked: true },

@@ -408,3 +408,43 @@ test('signatureExtractor: integer type mismatch does NOT trigger infrastructure 
   assert.strictEqual(result.domain, 'target-code', 'integer type mismatch should be target-code');
   done();
 });
+
+// (review-6a) log lines with a node_modules frame => domain dependency + package
+test('signatureExtractor: log lines with node_modules frame => domain dependency, scoped package', function(t, done) {
+  var result = signatureExtractor.extractFinding({
+    apiErrors: [{ message: 'TypeError: Cannot read properties of undefined (reading "id")', path: null, extensions: {} }],
+    logLines: [
+      '2026-10-19T00:00:00Z ERROR server: TypeError: Cannot read properties of undefined',
+      '    at Ns.connect (node_modules/@scope/pkg/dist/conn.js:88:15)',
+      '    at execute (src/resolvers/order.ts:134:5)',
+      '    at run (src/run.ts:3:2)'
+    ]
+  });
+  assert.strictEqual(result.domain, 'dependency', 'domain from node_modules frame');
+  assert.strictEqual(result.package, '@scope/pkg', 'scoped package derives from path');
+  assert.ok(Array.isArray(result.stack) && result.stack.length >= 3, 'stack has parsed frames');
+  assert.ok(result.stack.every(function(f) { return f && f.file && typeof f.line === 'number'; }), 'frames are {file,line}');
+  done();
+});
+
+test('signatureExtractor: log lines with only target-source frames => domain target-code', function(t, done) {
+  var result = signatureExtractor.extractFinding({
+    apiErrors: [{ message: 'boom', path: null, extensions: {} }],
+    logLines: [
+      'ERROR: boom at request time',
+      '  at handle (src/resolvers/product.ts:22:4)'
+    ]
+  });
+  assert.strictEqual(result.domain, 'target-code', 'target-source frame overrides domain');
+  assert.strictEqual(result.package, null, 'no package for target-source frames');
+  done();
+});
+
+test('signatureExtractor: no log frames => domain is NOT overridden', function(t, done) {
+  var result = signatureExtractor.extractFinding({
+    apiErrors: [{ message: 'invalid input syntax for type integer: "x"', path: ['products'], extensions: {} }],
+    logLines: ['2026-10-19T00:00:00Z ERROR postgres: no stack in logs']
+  });
+  assert.strictEqual(result.domain, 'target-code', 'no frames -> keep SQL-signal domain decision');
+  done();
+});

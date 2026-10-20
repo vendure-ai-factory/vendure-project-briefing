@@ -24,6 +24,8 @@ var ERR_CODES = {
   INVALID_PATH: 'INVALID_PATH',
   UNKNOWN_REPAIR_KIND: 'UNKNOWN_REPAIR_KIND',
   COMMAND_INJECTION: 'COMMAND_INJECTION',
+  LOCKFILE_REGEN_FAILED: 'LOCKFILE_REGEN_FAILED',
+  LOCKFILE_OUT_OF_SYNC: 'LOCKFILE_OUT_OF_SYNC',
   RESTORE_FAILED: 'RESTORE_FAILED'
 };
 
@@ -223,6 +225,8 @@ function runInstall(cloneDir, runCommand, timeout) {
   };
 }
 
+var ALLOWED_LOCK_ONLY_FLAGS = ['--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'];
+
 function applyDependencyBump(editSet, cloneDir, runCommand) {
   var filesChanged = [];
   var diffStats = {};
@@ -260,11 +264,43 @@ function applyDependencyBump(editSet, cloneDir, runCommand) {
     }
   }
 
-  var installResult = runInstall(cloneDir, runCommand);
-  if (!installResult.success) {
+  // Lockfile regeneration uses only the allowlisted command: never installs,
+  // never runs package scripts, never contacts anything but the lockfile engine.
+  var lockCmdArgs = ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'];
+  var lockResult;
+  try {
+    lockResult = runCommand('npm', lockCmdArgs, { cwd: cloneDir, timeout: DEFAULT_TIMEOUT_MS, shell: false });
+  } catch (e) {
+    lockResult = { exitCode: 1, error: e.message };
+  }
+  if (!lockResult || lockResult.exitCode !== 0) {
     return {
       ok: false,
-      blocker: { code: 'INSTALL_FAILED', message: 'npm ci failed: ' + installResult.stderr, evidence: { stdout: installResult.stdout, stderr: installResult.stderr } },
+      blocker: {
+        code: 'LOCKFILE_REGEN_FAILED',
+        message: 'lockfile regeneration failed: ' + ((lockResult && (lockResult.stderr || lockResult.error)) || 'unknown'),
+        evidence: { stdout: (lockResult && lockResult.stdout) || '', stderr: (lockResult && lockResult.stderr) || '' }
+      },
+      filesChanged: filesChanged,
+      diffStats: diffStats
+    };
+  }
+
+  // Assert the regenerated lockfile and package.json agree before returning.
+  var dryRunResult;
+  try {
+    dryRunResult = runCommand('npm', ['ci', '--dry-run'], { cwd: cloneDir, timeout: DEFAULT_TIMEOUT_MS, shell: false });
+  } catch (e) {
+    dryRunResult = { exitCode: 1, error: e.message };
+  }
+  if (!dryRunResult || dryRunResult.exitCode !== 0) {
+    return {
+      ok: false,
+      blocker: {
+        code: 'LOCKFILE_OUT_OF_SYNC',
+        message: 'lockfile is out of sync with package.json: ' + ((dryRunResult && (dryRunResult.stderr || dryRunResult.error)) || 'npm ci --dry-run failed'),
+        evidence: { stdout: (dryRunResult && dryRunResult.stdout) || '', stderr: (dryRunResult && dryRunResult.stderr) || '' }
+      },
       filesChanged: filesChanged,
       diffStats: diffStats
     };
