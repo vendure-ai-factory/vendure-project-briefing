@@ -384,31 +384,43 @@ function parseLogExcerpt(logExcerpt) {
   if (!logExcerpt || typeof logExcerpt !== 'string') {
     return null;
   }
-  var contextMatch = logExcerpt.match(/CONTEXT:\s*.*?unnamed portal parameter \$(\d+)/s);
-  if (!contextMatch) {
+  // Find all CONTEXT with unnamed portal parameter $N (optional = 'value').
+  // Postgres emits both "unnamed portal parameter $N" and
+  // "unnamed portal parameter $N = 'value'". Prefer the LAST context in the
+  // excerpt, which (after error-window selection) is the error's own entry.
+  var contextRegex = /CONTEXT:\s*unnamed portal parameter \$(\d+)(?:\s*=\s*'([^']*)')?/g;
+  var contextMatches = [];
+  var cm;
+  while ((cm = contextRegex.exec(logExcerpt)) !== null) {
+    contextMatches.push({ after: contextRegex.lastIndex, paramIndex: parseInt(cm[1], 10), paramValue: cm[2] || null });
+  }
+  if (contextMatches.length === 0) {
     return null;
   }
-  var paramIndex = parseInt(contextMatch[1], 10);
-  var statementMatch = logExcerpt.match(/STATEMENT:\s*(.*)\s*$/s);
+  var lastCtx = contextMatches[contextMatches.length - 1];
+  var paramIndex = lastCtx.paramIndex;
+  // Find the STATEMENT after that CONTEXT: capture until the next timestamp
+  // line (YYYY-MM-DD), a blank line, or end, without swallowing later entries.
+  var rest = logExcerpt.substring(lastCtx.after);
+  var statementMatch = rest.match(/STATEMENT:\s*([\s\S]*?)(?=^\d{4}-\d{2}-\d{2}\b|\n\s*\n|$)/m);
   if (!statementMatch) {
     return null;
   }
   var statement = statementMatch[1].trim();
-  var conditionRegex = /((?:"[^"]*"|[\w.]+))\s*(!==|!=|<=|>=|!=|\b=\b|LIKE|ILIKE|NOT LIKE|NOT ILIKE)\s*\$\d+/g;
-  var conditionMatch;
-  while ((conditionMatch = conditionRegex.exec(statement)) !== null) {
-    var fullMatch = conditionMatch[0];
-    var dollarPos = fullMatch.indexOf('$');
-    var extractedParamIndex = parseInt(fullMatch.substring(dollarPos + 1), 10);
-    if (extractedParamIndex === paramIndex) {
-      var columnRaw = conditionMatch[1].replace(/"/g, '');
-      var columnParts = columnRaw.split('.');
-      var column = columnParts.length > 1 ? columnParts[columnParts.length - 1] : columnRaw;
-      var operator = conditionMatch[2];
-      return { statement: statement, column: column, operator: operator, paramIndex: paramIndex };
-    }
+  // Extract the condition that references the specific parameter $N:
+  // "<table>"."<col>" != $N style, handling quoted and plain identifiers.
+  var condRegex = new RegExp('("(?:[^"]|"")+"(?:\\.\\"[^"]+\\")*|"[^"]+"|[\\w.]+)\\s*(!==|!=|>=|<=|LIKE|ILIKE|NOT LIKE|NOT ILIKE|=)\\s*\\$' + paramIndex + '(?!\\d)', 'g');
+  var condMatch;
+  while ((condMatch = condRegex.exec(statement)) !== null) {
+    var colRaw = condMatch[1].replace(/"/g, '');
+    var colParts = colRaw.split('.');
+    var column = colParts.length > 1 ? colParts[colParts.length - 1] : colRaw;
+    var operator = condMatch[2].trim();
+    var truncStmt = statement.length > 300 ? statement.substring(0, 300) + '...' : statement;
+    truncStmt = truncStmt.replace(/'[^']*'/g, '<val>').replace(/(?<!\$)\b\d+\b/g, '<val>');
+    return { statement: truncStmt, column: column, operator: operator, paramIndex: paramIndex };
   }
-  return { statement: statement, column: null, operator: null, paramIndex: paramIndex };
+  return null;
 }
 
 function normalizeForSignature(classifier, message, pathVal, sql) {
@@ -458,6 +470,8 @@ function extractFinding(input) {
       class: 'UNKNOWN',
       message: null,
       path: null,
+      operationName: null,
+      rootFields: [],
       sql: { statement: null, operator: null, column: null, paramIndex: null, paramValue: null },
       confidence: 'API_ONLY',
       notes: ['Invalid input: expected object with apiErrors, logExcerpt, operationName, and/or query fields'],
@@ -472,6 +486,7 @@ function extractFinding(input) {
   var logExcerpt = input.logExcerpt != null && typeof input.logExcerpt === 'string' ? input.logExcerpt : null;
   var rawLogLines = input.logLines != null && typeof input.logLines === 'object' ? input.logLines : [];
   var operationName = input.operationName && typeof input.operationName === 'string' ? input.operationName : null;
+  var rootFields = Array.isArray(input.rootFields) ? input.rootFields.map(function(x) { return String(x); }) : [];
 
   var notes = [];
 
@@ -518,6 +533,7 @@ function extractFinding(input) {
       message: null,
       path: null,
       operationName: operationName,
+      rootFields: rootFields,
       sql: { statement: null, operator: null, column: null, paramIndex: null, paramValue: null },
       confidence: 'API_ONLY',
       notes: notes.length > 0 ? notes : ['No recognizable integer type mismatch error found in apiErrors'],
@@ -556,6 +572,7 @@ function extractFinding(input) {
     message: apiResult.message,
     path: apiResult.path,
     operationName: operationName,
+    rootFields: rootFields,
     sql: sql,
     confidence: confidence,
     notes: notes,
@@ -568,6 +585,7 @@ function extractFinding(input) {
 
 module.exports = {
   extractFinding: extractFinding,
+  parseLogExcerpt: parseLogExcerpt,
   parseStackFramesFromLogs: parseStackFramesFromLogs,
   packageFromNodeModulesPath: packageFromNodeModulesPath,
   domainFromFrames: domainFromFrames,

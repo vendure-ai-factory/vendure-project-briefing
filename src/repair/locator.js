@@ -34,11 +34,13 @@ function deriveSearchPatterns(finding) {
   var operator = finding.operator;
   var column = finding.column;
   var queryPath = finding.path;
+  var rootFields = Array.isArray(finding.rootFields) ? finding.rootFields : [];
+  // The signature extractor nests parsed SQL under finding.sql; fall back to it.
+  if (!operator && finding.sql && finding.sql.operator) operator = finding.sql.operator;
+  if (!column && finding.sql && finding.sql.column) column = finding.sql.column;
 
   if (operator && column) {
-    var colName = toText(column).split('.').pop(); // e.g., 'col' from 'table.col'
-
-    // Generic operator negation patterns
+    var colName = toText(column).split('.').pop();
     if (operator === '!=') {
       patterns.push('notEq');
       patterns.push('!= :');
@@ -48,18 +50,11 @@ function deriveSearchPatterns(finding) {
       patterns.push('.not(');
       patterns.push('ne:');
     }
-
-    // Generic null/empty check patterns
     if (operator === 'IS NOT NULL' || operator === 'IS NULL') {
       patterns.push('isNull');
       patterns.push('isNotNull');
-      patterns.push('!= null');
-      patterns.push('== null');
     }
-
-    // Generic comparison patterns
     if (operator === '>' || operator === '<' || operator === '>=' || operator === '<=') {
-      var opLower = operator.toLowerCase().replace('=', '');
       patterns.push('gt:');
       patterns.push('lt:');
       patterns.push('gte:');
@@ -67,16 +62,27 @@ function deriveSearchPatterns(finding) {
     }
   }
 
-  // If path has a query name, search for resolvers/methods named like that
-  if (queryPath && typeof queryPath === 'string' && queryPath.length > 0 && queryPath !== 'undefined') {
-    patterns.push(queryPath); // e.g., 'products'
-    patterns.push(queryPath + 'Resolver');
-    patterns.push(queryPath + 'Service');
-    patterns.push(queryPath + 'Query');
+  // Use REAL GraphQL root field names from the query (task's own evidence).
+  // These are parsed from the actual GraphQL operation, not derived from error text.
+  if (rootFields.length > 0) {
+    for (var rf = 0; rf < rootFields.length; rf++) {
+      var field = rootFields[rf];
+      if (field && field.length >= 2) {
+        if (patterns.indexOf(field) === -1) patterns.push(field);
+        if (patterns.indexOf(field + 'Resolver') === -1) patterns.push(field + 'Resolver');
+        if (patterns.indexOf(field + 'Service') === -1) patterns.push(field + 'Service');
+        if (patterns.indexOf(field + 'Query') === -1) patterns.push(field + 'Query');
+      }
+    }
+  } else if (queryPath && typeof queryPath === 'string' && queryPath.length > 0 && queryPath !== 'undefined') {
+    if (patterns.indexOf(queryPath) === -1) patterns.push(queryPath);
+    if (patterns.indexOf(queryPath + 'Resolver') === -1) patterns.push(queryPath + 'Resolver');
+    if (patterns.indexOf(queryPath + 'Service') === -1) patterns.push(queryPath + 'Service');
+    if (patterns.indexOf(queryPath + 'Query') === -1) patterns.push(queryPath + 'Query');
   }
 
-  // When the GraphQL path is absent, fall back to stack-frame function/file
-  // names and the GraphQL operation name (both task-id independent).
+  // When path is absent, fall back to stack-frame names and operationName.
+  // taskId is NEVER used as a pattern - it is pipeline-internal.
   if (!queryPath || queryPath === 'undefined') {
     var stack = finding.stack;
     var frames = Array.isArray(stack) ? stack : [];
@@ -84,14 +90,12 @@ function deriveSearchPatterns(finding) {
       var f = frames[fi];
       if (!f) continue;
       var file = f.file ? String(f.file).replace(/\\/g, '/') : '';
-      // Low-signal: skip node_modules frames and parent dirs for the millions
-      // of frames that would otherwise flood the pattern set.
       if (file.indexOf('node_modules/') !== -1) continue;
       if (file.indexOf('node:') === 0) continue;
       var fn = f.fn ? String(f.fn) : '';
       var fnName = fn.split(/[.(]/)[0] || '';
       if (fnName && fnName.length >= 2 && ['async', 'at', 'module'].indexOf(fnName) === -1) {
-        patterns.push(fnName);
+        if (patterns.indexOf(fnName) === -1) patterns.push(fnName);
       }
       var base = path.posix.basename(file).replace(/\.(ts|js|mjs|cjs)$/, '');
       if (base && base.length >= 2 && patterns.indexOf(base) === -1) {
@@ -100,12 +104,8 @@ function deriveSearchPatterns(finding) {
     }
     if (typeof finding.operationName === 'string' && finding.operationName.length > 0) {
       var opName = finding.operationName.trim();
-      if (patterns.indexOf(opName) === -1) {
-        patterns.push(opName);
-      }
-      if (patterns.indexOf(opName + 'Resolver') === -1) {
-        patterns.push(opName + 'Resolver');
-      }
+      if (patterns.indexOf(opName) === -1) patterns.push(opName);
+      if (patterns.indexOf(opName + 'Resolver') === -1) patterns.push(opName + 'Resolver');
     }
   }
 
@@ -263,10 +263,9 @@ function scoreMatch(match, finding, allPatterns) {
   var score = 0;
   var line = match.line;
   var matchedPattern = match.matchedPattern;
-
-  // Check for operator with template-literal/variable operand
-  // e.g., != `${someVar}`, != someVar, or != otherId
   var operator = finding.operator;
+  if (!operator && finding.sql && finding.sql.operator) operator = finding.sql.operator;
+  // e.g., != `${someVar}`, != someVar, or != otherId
   if (operator && line.indexOf(operator) !== -1) {
     // Check for template literal or variable after operator
     if (/`[^`]*\$\{/.test(line) || /\bvar\b|\blet\b|\bconst\b/.test(line)) {
@@ -279,7 +278,7 @@ function scoreMatch(match, finding, allPatterns) {
     }
   }
 
-  // Check if inside a function matching the query path
+  // If path has a query name and this line is inside a function matching it
   var queryPath = finding.path;
   if (queryPath) {
     // Try to get file content and check function context
@@ -291,6 +290,42 @@ function scoreMatch(match, finding, allPatterns) {
     } catch (e) {
       // Can't read file, skip this check
     }
+  }
+
+  // Bonus: a candidate whose file contains BOTH a graphql root field name (or
+  // the query path) AND an operator idiom within ~60 lines ranks above single
+  // matches. This captures the resolver that implements the failing field with
+  // the failing filter idiom (field name + operator idiom together).
+  var opIdioms = ['notEq', 'Equals(', 'Not(', '.not(', 'isNull', 'isNotNull', 'gt:', 'lt:', 'gte:', 'lte:', 'ne:'];
+
+  var hasFieldText = false;
+  var fieldNames = [];
+  if (Array.isArray(finding.rootFields)) {
+    for (var rf = 0; rf < finding.rootFields.length; rf++) {
+      if (finding.rootFields[rf]) fieldNames.push(String(finding.rootFields[rf]));
+    }
+  }
+  if (queryPath && fieldNames.indexOf(queryPath) === -1) fieldNames.push(String(queryPath));
+
+  var hasOpIdiom = opIdioms.some(function(o) { return line.indexOf(o) !== -1; });
+
+  if (fieldNames.length > 0 && !hasOpIdiom) {
+    try {
+      var fileContent = fs.readFileSync(match.file, 'utf8').split('\n');
+      var startLine = Math.max(0, match.lineNumber - 61);
+      var endLine = Math.min(fileContent.length - 1, match.lineNumber + 61);
+      for (var li = startLine; li <= endLine; li++) {
+        var liLine = fileContent[li];
+        if (opIdioms.some(function(o) { return liLine.indexOf(o) !== -1; })) {
+          score += 5;
+          break;
+        }
+      }
+      // Also for the field name appearing near an operator
+      if (fieldNames.some(function(fn) { return line.indexOf(fn) !== -1; })) {
+        score += 4;
+      }
+    } catch (e) { /* skip */ }
   }
 
   // Count additional pattern hits for +1 each
@@ -722,8 +757,10 @@ async function locateCandidates(options) {
   var candidates = [];
   var searched = [];
   var packageNotes = [];
+  var packageStatuses = [];
 
   if (!finding || !targetRoot) {
+    writeCandidatesEvidence(runId, evidenceRoot, finding, [], candidates, searched, packageNotes, packageStatuses);
     return { candidates: candidates, searched: searched };
   }
 
@@ -758,6 +795,7 @@ async function locateCandidates(options) {
   }
 
   if (patterns.length === 0) {
+    writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candidates, searched, packageNotes, packageStatuses);
     return { candidates: candidates, searched: searched };
   }
 
@@ -804,6 +842,7 @@ async function locateCandidates(options) {
     for (var k = 0; k < depNames.length; k++) {
       var pkgName = depNames[k];
       var pkgVersion = deps[pkgName];
+      var fetchStatus = { package: pkgName + '@' + pkgVersion, status: null, kind: null };
 
       try {
         var pkgPath = await fetchPackage(pkgName, pkgVersion, pkgWorkspace);
@@ -817,14 +856,21 @@ async function locateCandidates(options) {
           var respKind = (respStatus === 404) ? 'not-found'
             : (respStatus === 401 || respStatus === 403) ? 'unavailable'
             : 'failed';
+          fetchStatus.status = 'notFound';
+          fetchStatus.kind = respKind;
           packageNotes.push({
             package: pkgName + '@' + pkgVersion,
             status: 'candidate-not-found',
             kind: respKind,
             reason: 'package fetch resolved to HTTP ' + respStatus
           });
+          packageStatuses.push(fetchStatus);
           continue;
         }
+
+        fetchStatus.status = (pkgPath && typeof pkgPath === 'string' && fs.existsSync(pkgPath)) ? 'fetched' : 'skipped';
+        fetchStatus.kind = (pkgPath && typeof pkgPath === 'string' && fs.existsSync(pkgPath)) ? null : 'unavailable';
+        packageStatuses.push(fetchStatus);
 
         // Materialize the fetched package into the clone so the candidate
         // paths survive the temp-workspace cleanup below and the prompt can
@@ -895,6 +941,9 @@ async function locateCandidates(options) {
         // Package fetch failed (e.g. npm 404/401 for a missing or private
         // package): record candidate-not-found and keep searching. This must
         // never block the locator.
+        fetchStatus.status = 'notFound';
+        fetchStatus.kind = classifyPackageFetchError(err);
+        packageStatuses.push(fetchStatus);
         packageNotes.push({
           package: pkgName + '@' + pkgVersion,
           status: 'candidate-not-found',
@@ -916,38 +965,8 @@ async function locateCandidates(options) {
   // Filter to top maxCandidates
   candidates = candidates.slice(0, maxCandidates);
 
-  // Write evidence file
-  var evidenceDir = path.join(evidenceRoot, runId, 'repair');
-  ensureDir(evidenceDir);
-
-  var evidenceData = {
-    runId: runId,
-    finding: finding,
-    patterns: patterns,
-    candidateNotFound: packageNotes,
-    candidates: candidates.map(function(c) {
-      return {
-        source: c.source,
-        package: c.package,
-        file: c.file,
-        line: c.line,
-        snippet: null,
-        score: c.score,
-        reasons: c.reasons
-      };
-    }),
-    searched: searched,
-    timestamp: new Date().toISOString()
-  };
-
-  var evidenceJson = JSON.stringify(evidenceData, null, 2);
-  var sha = sha256Hex(evidenceJson);
-
-  var evidenceFile = path.join(evidenceDir, 'candidates.json');
-  fs.writeFileSync(evidenceFile, evidenceJson, 'utf8');
-
-  // Also write sha256 file
-  fs.writeFileSync(path.join(evidenceDir, 'candidates.json.sha256'), sha, 'utf8');
+  // Write candidates.json evidence (always, even with no candidates).
+  writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candidates, searched, packageNotes, packageStatuses);
 
   return { candidates: candidates, searched: searched, notFound: packageNotes };
 }
@@ -959,4 +978,51 @@ function classifyPackageFetchError(err) {
   return 'failed';
 }
 
-module.exports = { locateCandidates: locateCandidates };
+/**
+ * Always write candidates.json (and its sha256) under evidenceRoot/<runId>/repair,
+ * even when there are no candidates (NO_CANDIDATES). Includes the derived patterns
+ * and per-package fetch status.
+ */
+function writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candidates, searched, packageNotes, packageStatuses) {
+  var evidenceDir = path.join(evidenceRoot, runId, 'repair');
+  ensureDir(evidenceDir);
+  var evidenceData = {
+    runId: runId,
+    finding: finding,
+    patterns: patterns || [],
+    candidateNotFound: packageNotes || [],
+    packageStatuses: packageStatuses || [],
+    candidates: (candidates || []).map(function(c) {
+      return {
+        source: c.source,
+        package: c.package,
+        file: c.file,
+        line: c.line,
+        snippet: null,
+        score: c.score,
+        reasons: c.reasons
+      };
+    }),
+    searched: searched || [],
+    timestamp: new Date().toISOString()
+  };
+  var evidenceJson = JSON.stringify(evidenceData, null, 2);
+  var sha = sha256Hex(evidenceJson);
+  fs.writeFileSync(path.join(evidenceDir, 'candidates.json'), evidenceJson, 'utf8');
+  fs.writeFileSync(path.join(evidenceDir, 'candidates.json.sha256'), sha, 'utf8');
+}
+
+function writeCapabilities(runId, evidenceRoot, dependencyPatch, reason) {
+  try {
+    var dir = path.join(evidenceRoot, runId, 'repair');
+    ensureDir(dir);
+    var data = {
+      dependencyPatch: dependencyPatch || false,
+      reason: reason || null,
+      timestamp: new Date().toISOString()
+    };
+    fs.writeFileSync(path.join(dir, 'capabilities.json'), JSON.stringify(data, null, 2) + '\n', 'utf8');
+  } catch (e) { /* best effort */ }
+}
+
+module.exports = { locateCandidates: locateCandidates, writeCapabilities: writeCapabilities, deriveSearchPatterns: deriveSearchPatterns, writeCandidatesEvidence: writeCandidatesEvidence };

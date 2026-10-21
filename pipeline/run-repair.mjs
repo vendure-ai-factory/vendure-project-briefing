@@ -250,11 +250,185 @@ async function collectRepairLogs(cfg, logSource, state) {
 }
 
 /**
+ * Parse a GraphQL query string and extract the operation name and root field names.
+ * Returns { operationName, rootFields } where rootFields is an array of field names
+ * at the top level of the query (e.g., ['activeChannel', 'products']).
+ */
+function parseGraphQlQuery(queryBody) {
+  if (!queryBody || typeof queryBody !== 'string') {
+    return { operationName: null, rootFields: [] };
+  }
+  var operationName = null;
+  var rootFields = [];
+  // Match: query OperationName { ... } or mutation OperationName(...) { ... }
+  // Also handles anonymous queries: { rootField { ... } }
+  var nameMatch = queryBody.match(/^\s*(?:query|mutation)\s+(\w+)/);
+  if (nameMatch) {
+    operationName = nameMatch[1];
+  }
+  // Find the first { that starts the selection set
+  var bracePos = queryBody.indexOf('{');
+  if (bracePos !== -1) {
+    var selectionSet = queryBody.substring(bracePos + 1);
+    // Find the matching closing brace by counting nesting level
+    var depth = 1;
+    var endPos = 0;
+    for (var i = 0; i < selectionSet.length; i++) {
+      if (selectionSet[i] === '{') depth++;
+      else if (selectionSet[i] === '}') {
+        depth--;
+        if (depth === 0) { endPos = i; break; }
+      }
+    }
+    var inner = selectionSet.substring(0, endPos);
+    // Extract root field names: each field starts with an identifier followed by
+    // either a space, (, or { (but not a nested { which would be a fragment)
+    var fieldRegex = /(\w+)\s*(?:[({]|\.|\?|\:)/g;
+    var fieldMatch;
+    while ((fieldMatch = fieldRegex.exec(inner)) !== null) {
+      var fname = fieldMatch[1];
+      // Skip keywords that might appear as field names
+      if (fname !== 'query' && fname !== 'mutation' && fname !== 'subscription' &&
+          fname !== 'fragment' && fname !== 'on' && fname !== 'true' && fname !== 'false' && fname !== 'null' &&
+          fname !== 'undefined' && !/^\d/.test(fname)) {
+        if (rootFields.indexOf(fname) === -1) {
+          rootFields.push(fname);
+        }
+      }
+    }
+  }
+  return { operationName: operationName, rootFields: rootFields };
+}
+
+/**
+ * Extract the GraphQL operation name and root fields from the task's own
+ * request evidence (evidence/<runId>/<taskId>/shop-api-requests.json).
+ * Returns { operationName, rootFields } where operationName may be null
+ * (caller must NOT use taskId as fallback).
+ */
+function getGraphQlInfoFromEvidence(cfg, taskId) {
+  if (!cfg || !cfg.cwd || !cfg.runId || !taskId) {
+    return { operationName: null, rootFields: [] };
+  }
+  try {
+    var evidencePath = path.join(cfg.cwd, 'evidence', cfg.runId, taskId, 'shop-api-requests.json');
+    var content = cfg.fs.readFileSync(evidencePath, 'utf8');
+    var data = JSON.parse(content);
+    var rawRequests = data && Array.isArray(data.rawRequests) ? data.rawRequests : [];
+    if (rawRequests.length === 0) {
+      return { operationName: null, rootFields: [] };
+    }
+    // Use the last request (most recent) that has a query body
+    var lastWithQuery = null;
+    for (var i = rawRequests.length - 1; i >= 0; i--) {
+      var req = rawRequests[i];
+      if (req && req.body && typeof req.body === 'string' && req.body.trim().length > 0) {
+        // Check if it's a JSON body with a query property
+        try {
+          var parsed = JSON.parse(req.body);
+          if (parsed.query) {
+            lastWithQuery = parsed;
+            break;
+          }
+        } catch (e) {
+          // Not JSON, treat the body itself as the query
+          lastWithQuery = { query: req.body };
+          break;
+        }
+      }
+    }
+    if (!lastWithQuery || !lastWithQuery.query) {
+      return { operationName: null, rootFields: [] };
+    }
+    return parseGraphQlQuery(lastWithQuery.query);
+  } catch (e) {
+    return { operationName: null, rootFields: [] };
+  }
+}
+
+/**
+ * Find a window of log lines around an error. Groups postgres multi-line
+ * entries (ERROR / CONTEXT / STATEMENT / DETAIL) into entries, finds the last
+ * entry matching the error message, and returns a window around it.
+ * Returns the concatenated log string capped at maxLength.
+ */
+function buildLogExcerptWithWindow(allLines, findingMessage, maxLength) {
+  maxLength = maxLength || 20000;
+  if (!allLines || allLines.length === 0) {
+    return null;
+  }
+  // Group log lines into entries. Postgres entries start with a timestamp pattern
+  // like "2026-10-21 12:34:56.789 UTC" or just "ERROR" at the start of a line
+  var entries = [];
+  var currentEntry = [];
+  // Timestamp regex for log line detection
+  var timestampRegex = /^\d{4}-\d{2}-\d{2}|^[A-Z]{3,}\s+/;
+  for (var i = 0; i < allLines.length; i++) {
+    var line = allLines[i];
+    if (!line || typeof line !== 'string') continue;
+    // Check if this line starts a new entry (timestamp or ERROR/DETAIL/CONTEXT/STATEMENT)
+    var isNewEntry = timestampRegex.test(line) || /^ERROR|^DETAIL|^CONTEXT|^STATEMENT/.test(line);
+    if (isNewEntry && currentEntry.length > 0) {
+      entries.push(currentEntry.join('\n'));
+      currentEntry = [line];
+    } else {
+      currentEntry.push(line);
+    }
+  }
+  if (currentEntry.length > 0) {
+    entries.push(currentEntry.join('\n'));
+  }
+  if (entries.length === 0) {
+    return null;
+  }
+  // Find the entry that best matches the finding's message
+  var targetPattern = findingMessage || '';
+  var bestIndex = -1;
+  var bestScore = -1;
+  // Search from newest (end) to oldest (start), find the last match
+  for (var j = entries.length - 1; j >= 0; j--) {
+    var entry = entries[j];
+    if (!entry) continue;
+    var score = 0;
+    // Prefer entries with ERROR
+    if (/^ERROR/.test(entry)) score += 10;
+    // Check if entry contains the error message or SQLSTATE
+    if (targetPattern && entry.indexOf(targetPattern) !== -1) score += 5;
+    if (/22P02|42883|42P01/.test(entry)) score += 3; // common postgres error codes
+    if (entry.indexOf('invalid input syntax') !== -1) score += 3;
+    if (entry.indexOf('unnamed portal parameter') !== -1) score += 2;
+    if (score > 0 && (bestIndex === -1 || score > bestScore)) {
+      bestIndex = j;
+      bestScore = score;
+    }
+  }
+  // Build window around the best entry (or newest entry if no good match)
+  var windowEntries = [];
+  var windowRadius = 20; // ~40 lines total (20 before + 20 after)
+  var centerIndex = bestIndex !== -1 ? bestIndex : entries.length - 1;
+  var startIdx = Math.max(0, centerIndex - windowRadius);
+  var endIdx = Math.min(entries.length - 1, centerIndex + windowRadius);
+  for (var k = startIdx; k <= endIdx; k++) {
+    windowEntries.push(entries[k]);
+  }
+  var excerpt = windowEntries.join('\n');
+  // Cap at maxLength
+  if (excerpt.length > maxLength) {
+    excerpt = excerpt.substring(0, maxLength);
+  }
+  return excerpt;
+}
+
+/**
  * Build the input for signatureExtractor from the target task. The API errors
  * array comes from the task's own record error text (never from logs), so a
  * log blocker can never stop extraction.
+ *
+ * operationName is the GraphQL operation name when it can be parsed from the
+ * task's own request evidence. The taskId is NEVER used as operationName -
+ * task ids are pipeline-internal and must not leak into search patterns.
  */
-function buildExtractInput(target, logs) {
+function buildExtractInput(cfg, target, logs) {
   var apiErrors = [];
   var errText = taskErrorText(target);
   if (errText !== '') {
@@ -268,23 +442,43 @@ function buildExtractInput(target, logs) {
       allLines = allLines.concat(logLines[k]);
     }
   });
-  if (allLines.length > 0) {
-    logExcerpt = allLines.join('\n').substring(0, 20000);
-  }
-  // operationName is the GraphQL operation name when available, never the task
-  // id (task ids are pipeline-internal and must not leak into search patterns).
+  // Extract GraphQL operation name from task's own request evidence.
+  // This is the authoritative source - never use taskId as operationName.
   var operationName = null;
-  if (target && typeof target.operationName === 'string' && target.operationName !== '') {
-    operationName = target.operationName;
-  } else if (target && target.exitErrorResult && target.exitErrorResult.apiErrors != null) {
-    try {
-      var first = Array.isArray(target.exitErrorResult.apiErrors) ? target.exitErrorResult.apiErrors[0] : null;
-      if (first && typeof first.operationName === 'string' && first.operationName !== '') {
-        operationName = first.operationName;
-      }
-    } catch (e) { /* ignore */ }
+  var rootFields = [];
+  if (target && target.taskId && cfg) {
+    var gqlInfo = getGraphQlInfoFromEvidence(cfg, target.taskId);
+    if (gqlInfo.operationName) {
+      operationName = gqlInfo.operationName;
+    }
+    rootFields = gqlInfo.rootFields || [];
   }
-  return { apiErrors: apiErrors, logLines: allLines, logExcerpt: logExcerpt, operationName: operationName || (target && target.taskId) || null };
+  // Fall back to exitErrorResult.apiErrors if present
+  if (!operationName) {
+    if (target && typeof target.operationName === 'string' && target.operationName !== '') {
+      operationName = target.operationName;
+    } else if (target && target.exitErrorResult && target.exitErrorResult.apiErrors != null) {
+      try {
+        var first = Array.isArray(target.exitErrorResult.apiErrors) ? target.exitErrorResult.apiErrors[0] : null;
+        if (first && typeof first.operationName === 'string' && first.operationName !== '') {
+          operationName = first.operationName;
+        }
+      } catch (e) { /* ignore */ }
+    }
+  }
+  // Build log excerpt with error windowing instead of first 20000 chars
+  if (allLines.length > 0) {
+    logExcerpt = buildLogExcerptWithWindow(allLines, errText, 20000);
+  }
+  return {
+    apiErrors: apiErrors,
+    logLines: allLines,
+    logExcerpt: logExcerpt,
+    operationName: operationName,
+    rootFields: rootFields,
+    // Note: taskId is deliberately NOT included here - callers must NOT use it as operationName
+    taskId: target && target.taskId ? target.taskId : null
+  };
 }
 
 function safeErr(e) {
@@ -322,12 +516,23 @@ function writeFindingEvidence(cfg, state) {
     for (var i = 0; i < lines.length; i++) totalBytes += lines[i] ? lines[i].length : 0;
     logsInfo[kind] = { count: lines.length, bytes: totalBytes };
   }
+  var sql = (f && f.sql && typeof f.sql === 'object') ? f.sql : null;
   var findingJson = {
     class: f.class || null,
     domain: f.domain || null,
+    message: f.message || null,
+    path: f.path || null,
+    operation_name: f.operationName || null,
     sqlstate: f.sqlstate || null,
     signature: f.signature || null,
     confidence: f.confidence || null,
+    sql: sql ? {
+      operator: sql.operator || null,
+      column: sql.column || null,
+      paramIndex: sql.paramIndex || null,
+      paramValue: sql.paramValue || null,
+      statement: sql.statement || null
+    } : null,
     logs_collected_per_kind: logsInfo
   };
   try {
@@ -953,7 +1158,7 @@ async function runRepair(deps) {
 
   // 2. Extract finding from the first target's API error and reproduce the
   //    baseline signatures. This runs even when a log blocker was recorded.
-  var extractInput = buildExtractInput(targets[0], state.logs);
+  var extractInput = buildExtractInput(cfg, targets[0], state.logs);
   state.finding = adapters.signatureExtractor.extractFinding(extractInput);
   var replayer = cfg.replayer || function(f) { return defaultReplayer(f); };
   var repro = adapters.verifier.reproduce(state.finding, targets[0], {
@@ -1082,7 +1287,11 @@ export {
   loadNormalRun,
   resolveRunId,
   writeFindingEvidence,
-  writeAttemptError
+  writeAttemptError,
+  buildExtractInput,
+  parseGraphQlQuery,
+  getGraphQlInfoFromEvidence,
+  buildLogExcerptWithWindow
 };
 
 
