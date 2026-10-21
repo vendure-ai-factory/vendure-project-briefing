@@ -178,7 +178,7 @@ test('fixture regression: error window, SQL parse, root-field patterns, no taskI
     return s.package.indexOf('fake-products-resolver') === 0;
   })[0];
   assert.ok(status, 'candidates.json includes per-package fetch status');
-  assert.strictEqual(status.status, 'fetched', 'fake package should be marked fetched');
+  assert.strictEqual(status.status, 'matched', 'fake package should be marked matched (candidates found)');
 
   // 9. finding.json (via writeFindingEvidence) has parsed SQL, no raw log lines.
   var state = { finding: finding, logs: logs };
@@ -199,4 +199,113 @@ test('fixture regression: error window, SQL parse, root-field patterns, no taskI
   fs.rmSync(cwd, { recursive: true, force: true });
   fs.rmSync(targetRoot, { recursive: true, force: true });
   fs.rmSync(pkgDir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// D: log-shape.json is written for docker-prefixed, JSON-line, and standard
+//    Postgres logs with no raw values (canary: values must never appear).
+// ---------------------------------------------------------------------------
+test('fixture: buildLogShape produces masked evidence with no raw values for all 3 log formats', async function() {
+  var repairModule = await repairModulePromise;
+
+  // A stable canary value that would FAIL if it appeared in log-shape.json.
+  var CANARY = 'SUP3rS3cr3tT0k3nXYZ789';
+
+  // 1. Docker-prefixed Postgres log.
+  var dockerLog = [
+    'vendure-db-1  | 2026-10-21T12:00:00.001Z ERROR:  invalid input syntax for type integer: "' + CANARY + '"',
+    'vendure-db-1  | 2026-10-21T12:00:00.002Z CONTEXT:  unnamed portal parameter $3 = \'' + CANARY + '\'',
+    'vendure-db-1  | 2026-10-21T12:00:00.003Z STATEMENT:  SELECT * FROM "product" WHERE "product"."id" != $3'
+  ];
+
+  // 2. JSON-line log (structured logging).
+  var jsonLog = [
+    '{"time":"2026-10-21T12:00:00.001Z","level":"error","msg":"ERROR:  invalid input syntax for type integer: \"' + CANARY + '\"","service":"vendure"}',
+    '{"time":"2026-10-21T12:00:00.002Z","level":"info","msg":"CONTEXT:  unnamed portal parameter $3 = \'' + CANARY + '\'","service":"vendure"}',
+    '{"time":"2026-10-21T12:00:00.003Z","level":"info","msg":"STATEMENT:  SELECT * FROM \\"product\\" WHERE \\"product\\".\\"id\\" != $3","service":"vendure"}'
+  ];
+
+  // 3. Standard Postgres log (already tested above; included for completeness).
+  var standardLog = [
+    '2026-10-21 12:00:00.001 UTC [42] ERROR:  invalid input syntax for type integer: "' + CANARY + '"',
+    '2026-10-21 12:00:00.002 UTC [42] CONTEXT:  unnamed portal parameter $3 = \'' + CANARY + '\'',
+    '2026-10-21 12:00:00.003 UTC [42] STATEMENT:  SELECT * FROM "product" WHERE "product"."id" != $3'
+  ];
+
+  var logs1 = { postgres: dockerLog, vendure: [], worker: [] };
+  var logs2 = { postgres: jsonLog, vendure: [], worker: [] };
+  var logs3 = { postgres: standardLog, vendure: [], worker: [] };
+
+  var shapeFn = repairModule.buildLogShape;
+  assert.strictEqual(typeof shapeFn, 'function', 'buildLogShape must be exported');
+
+  var shape1 = shapeFn(logs1, 'invalid input syntax');
+  var shape2 = shapeFn(logs2, 'invalid input syntax');
+  var shape3 = shapeFn(logs3, 'invalid input syntax');
+
+  [shape1, shape2, shape3].forEach(function(shape, idx) {
+    assert.strictEqual(shape.masked, true, 'shape[' + idx + '] must be marked as masked');
+    var pg = shape.kinds && shape.kinds.postgres;
+    assert.ok(pg, 'shape[' + idx + '] must have postgres kind');
+    assert.strictEqual(pg.lineCount, 3, 'postgres log must have 3 lines');
+    assert.ok(pg.counts && pg.counts.error >= 1, 'postgres error count must be >= 1');
+    assert.ok(pg.counts && pg.counts.context >= 1, 'postgres context count must be >= 1');
+    assert.ok(Array.isArray(pg.errorMaskedLines) && pg.errorMaskedLines.length > 0,
+      'postgres must have masked error lines');
+
+    // Canary must NEVER appear in masked output.
+    var shapeJson = JSON.stringify(shape);
+    assert.strictEqual(shapeJson.indexOf(CANARY), -1,
+      'CANARY must never appear in log-shape.json (idx=' + idx + '): ' + shapeJson.substring(0, 200));
+  });
+
+  // Verify masking preserves ERROR keyword and never exposes raw values.
+  var maskedLine = shape1.kinds.postgres.errorMaskedLines[0].masked;
+  assert.ok(maskedLine.indexOf('ERROR') !== -1, 'ERROR keyword must be preserved in masked output');
+  assert.ok(maskedLine.indexOf(CANARY) === -1, 'canary value must not appear in masked line');
+  // Standard log: the ISO timestamp is masked to 9999-99-99T99:99:99 and that
+  // placeholder survives the prefix-stripper (year 9999 is never re-stripped).
+  var maskedStd = shape3.kinds.postgres.errorMaskedLines[0].masked;
+  assert.ok(maskedStd.indexOf('9999') !== -1, 'ISO timestamp in standard log must be masked to 9999-...');
+  assert.ok(maskedStd.indexOf('9999-99-99T99:99:99') !== -1, 'ISO timestamp must retain the masked shape 9999-99-99T99:99:99');
+  assert.ok(maskedStd.indexOf('ERROR') !== -1, 'ERROR keyword must be preserved in standard log masked output');
+  // JSON-line log: verify timestamp masked (ISO format after JSON parsing).
+  var maskedJson = shape2.kinds.postgres.errorMaskedLines[0].masked;
+  assert.ok(maskedJson.indexOf('ERROR') !== -1, 'ERROR keyword must be preserved in JSON-line masked output');
+  assert.ok(maskedJson.indexOf(CANARY) === -1, 'canary must not appear in JSON-line masked output');
+});
+
+// ---------------------------------------------------------------------------
+// E: SQL parse from docker-prefixed Postgres log with ERROR/CONTEXT/STATEMENT.
+// ---------------------------------------------------------------------------
+test('fixture: parseLogExcerpt handles docker-prefixed Postgres ERROR/CONTEXT/STATEMENT entries', function() {
+  var sigExtractor = require('../src/repair/signatureExtractor');
+
+  // Docker-prefixed log: "name-1  | " prefix on each line.
+  var dockerLog = [
+    '2026-10-21T12:00:00.001Z postgres-1  | ERROR:  invalid input syntax for type integer: "NaN"',
+    '2026-10-21T12:00:00.002Z postgres-1  | CONTEXT:  unnamed portal parameter $5 = \'NaN\'',
+    '2026-10-21T12:00:00.003Z postgres-1  | STATEMENT:  SELECT * FROM "order_line" WHERE "order_line"."qty" != $5 LIMIT $1'
+  ].join('\n');
+
+  var result = sigExtractor.parseLogExcerpt(dockerLog);
+
+  assert.ok(result !== null, 'parseLogExcerpt must not return null for docker-prefixed ERROR/CONTEXT/STATEMENT log');
+  assert.strictEqual(result.operator, '!=', 'operator must be extracted as !=');
+  assert.strictEqual(result.column, 'qty', 'column must be extracted as qty');
+  assert.strictEqual(result.paramIndex, 5, 'paramIndex must be extracted as 5');
+
+  // Verify the docker prefix lines themselves don't break the SQL parse.
+  // The ERROR entry matching should work with docker-prefixed format too.
+  var dockerLog2 = [
+    'my-app-db-1  | 2026-10-21 12:00:00.001 UTC ERROR:  invalid input syntax for type integer: "99"',
+    'my-app-db-1  | 2026-10-21 12:00:00.002 UTC CONTEXT:  unnamed portal parameter $2 = \'99\'',
+    'my-app-db-1  | 2026-10-21 12:00:00.003 UTC STATEMENT:  SELECT "id" FROM "product" WHERE "product"."active" != $2'
+  ].join('\n');
+
+  var result2 = sigExtractor.parseLogExcerpt(dockerLog2);
+  assert.ok(result2 !== null, 'parseLogExcerpt must handle "name-1  | " docker prefix format');
+  assert.strictEqual(result2.operator, '!=', 'operator correct for docker-prefix format');
+  assert.strictEqual(result2.column, 'active', 'column correct for docker-prefix format');
+  assert.strictEqual(result2.paramIndex, 2, 'paramIndex correct for docker-prefix format');
 });

@@ -155,19 +155,72 @@ function formatPreviousAttempts(previousAttempts) {
 
 /**
  * Format candidates for the prompt.
+ * Dedupes candidates by file, prefers real code over generated/type files
+ * (.d.ts, graphql-env, generated, dist, build), caps each snippet and the
+ * total candidate text (<= totalCap). Keeps the highest-scoring candidate per
+ * file.
  */
+var PROMPT_SNIPPET_CAP = 2000;     // chars per candidate snippet
+var PROMPT_CANDIDATE_TOTAL_CAP = 12000; // chars of candidate text total
+
+function isGeneratedPath(relFile) {
+  if (!relFile) return false;
+  var f = String(relFile).replace(/\\/g, '/');
+  if (/\.d\.ts$/.test(f)) return true;
+  if (/graphql-env/.test(f)) return true;
+  if (/\/gql\/.*generated/.test(f) || /generated.*\.(ts|js)$/.test(f)) return true;
+  if (/\/dist\//.test(f) || f.indexOf('/dist/') !== -1) return true;
+  if (/\/build\//.test(f) || f.indexOf('/build/') !== -1) return true;
+  if (/\.map$/.test(f)) return true;
+  return false;
+}
+
 function formatCandidates(candidates) {
   if (!candidates || candidates.length === 0) {
     return '(no candidates found)';
   }
-  var lines = [];
+  // Dedupe by file, keeping the highest score; prefer real code over generated.
+  var byFile = {};
   for (var i = 0; i < candidates.length; i++) {
     var c = candidates[i];
-    var snippet = '';
-    if (c.snippet && Array.isArray(c.snippet)) {
-      snippet = c.snippet.map(function(s) { return s.line; }).join('\n');
+    if (!c || !c.file) continue;
+    var key = String(c.file).replace(/\\/g, '/');
+    var stored = byFile[key];
+    if (!stored) {
+      byFile[key] = c;
+    } else if ((stored.score || 0) < (c.score || 0)) {
+      byFile[key] = c;
     }
-    lines.push('[' + (i + 1) + '] file: ' + c.file + ' (line: ' + c.line + ')\n   snippet:\n   ' + snippet.split('\n').join('\n   '));
+  }
+  var unique = Object.keys(byFile).map(function(k) { return byFile[k]; });
+  // Real code over type files: real (non-generated) candidates sort first.
+  unique.sort(function(a, b) {
+    var ag = isGeneratedPath(a.file) ? 1 : 0;
+    var bg = isGeneratedPath(b.file) ? 1 : 0;
+    if (ag !== bg) return ag - bg;
+    return (b.score || 0) - (a.score || 0);
+  });
+
+  var lines = [];
+  var totalChars = 0;
+  for (var j = 0; j < unique.length && totalChars < PROMPT_CANDIDATE_TOTAL_CAP; j++) {
+    var cand = unique[j];
+    var snippet = '';
+    if (cand.snippet && Array.isArray(cand.snippet)) {
+      snippet = cand.snippet.map(function(s) { return s.line; }).join('\n');
+    }
+    if (snippet.length > PROMPT_SNIPPET_CAP) {
+      snippet = snippet.substring(0, PROMPT_SNIPPET_CAP) + '\n... (truncated)';
+    }
+    var block = '[' + (j + 1) + '] file: ' + cand.file + ' (line: ' + cand.line + ')\n   snippet:\n   ' + snippet.split('\n').join('\n   ');
+    if (totalChars + block.length > PROMPT_CANDIDATE_TOTAL_CAP) {
+      // Truncate the block to fit the total cap.
+      var remaining = PROMPT_CANDIDATE_TOTAL_CAP - totalChars;
+      block = block.substring(0, Math.max(0, remaining)) + '\n... (truncated)';
+    }
+    totalChars += block.length;
+    lines.push(block);
+    if (totalChars >= PROMPT_CANDIDATE_TOTAL_CAP) break;
   }
   return lines.join('\n\n');
 }
@@ -231,6 +284,8 @@ function writeAttemptSummary(runId, attemptNumber, data, fsMod, now) {
       requestedPaths: Array.isArray(data.requestedPaths) ? data.requestedPaths : [],
       candidatePaths: Array.isArray(data.candidatePaths) ? data.candidatePaths : [],
       tokensUsed: typeof data.tokensUsed === 'number' ? data.tokensUsed : null,
+      promptChars: typeof data.promptChars === 'number' ? data.promptChars : null,
+      elapsedMs: typeof data.elapsedMs === 'number' ? data.elapsedMs : null,
       timestamp: (typeof now === 'function' ? now() : new Date().toISOString())
     };
     fsMod.writeFileSync(path.join(dir, 'attempt-' + attemptNumber + '.json'), JSON.stringify(summary, null, 2) + '\n', 'utf8');
@@ -636,6 +691,7 @@ async function proposeAndCheck(options) {
   };
   var fetch = deps.fetch || ((typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function') ? globalThis.fetch : null);
   var now = deps.now || function() { return new Date().toISOString(); };
+  var modelNow = deps.modelNow || function() { return Date.now(); };
   var readFile = deps.readFile || function(p) { return require('fs').readFileSync(p, 'utf8'); };
   var fs = deps.fs || require('fs');
 
@@ -757,6 +813,8 @@ async function proposeAndCheck(options) {
     capabilities: { dependencyPatch: capabilities.dependencyPatch, reason: capabilities.reason },
     dependencyInfo: dependencyInfo
   });
+  var promptChars = prompt.length;
+  var modelStartMs = (typeof modelNow === 'function' ? modelNow() : Date.now());
 
   // Step 4: call model
   var modelResult;
@@ -765,9 +823,9 @@ async function proposeAndCheck(options) {
     system: 'You are a bug fixer. Output only JSON.',
     env: env,
     budget: budget,
-    fetch: fetch,
-    timeout: 120000
+    fetch: fetch
   });
+  var elapsedMs = (typeof modelNow === 'function' ? modelNow() : Date.now()) - modelStartMs;
 
   if (!modelResult.ok) {
     return {
@@ -807,7 +865,9 @@ async function proposeAndCheck(options) {
       codes: rejectionCodes,
       requestedPaths: requestedPaths,
       candidatePaths: validPaths,
-      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null
+      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+      promptChars: promptChars,
+      elapsedMs: elapsedMs
     }, fs, now);
     return {
       status: 'REJECTED',
@@ -835,7 +895,9 @@ async function proposeAndCheck(options) {
       codes: vCodes,
       requestedPaths: requestedPaths,
       candidatePaths: vValid,
-      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null
+      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+      promptChars: promptChars,
+      elapsedMs: elapsedMs
     }, fs, now);
     return {
       status: 'REJECTED',
@@ -865,7 +927,9 @@ async function proposeAndCheck(options) {
         codes: depCodes,
         requestedPaths: requestedPaths,
         candidatePaths: depValid,
-        tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null
+        tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+        promptChars: promptChars,
+        elapsedMs: elapsedMs
       }, fs, now);
       return {
         status: 'REJECTED',
@@ -950,7 +1014,9 @@ async function proposeAndCheck(options) {
     codes: [],
     requestedPaths: requestedPaths,
     candidatePaths: candidateRelPaths(cloneDir, realCandidates),
-    tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null
+    tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+    promptChars: promptChars,
+    elapsedMs: elapsedMs
   }, fs, now);
 
 

@@ -352,7 +352,7 @@ test('callModel: openrouter.ai URL only', function() {
   });
 });
 
-test('callModel: max_tokens=8000 constant', function() {
+test('callModel: max_tokens=4000 constant', function() {
   var capturedBody = null;
   return modelClient.callModel({
     prompt: 'hello',
@@ -364,7 +364,7 @@ test('callModel: max_tokens=8000 constant', function() {
     }
   }).then(function(r) {
     var body = JSON.parse(capturedBody);
-    assert.strictEqual(body.max_tokens, 8000);
+    assert.strictEqual(body.max_tokens, 4000);
     assert.deepStrictEqual(body.response_format, { type: 'json_object' });
   });
 });
@@ -412,6 +412,144 @@ test('callModel: response_format json_object in request', function() {
   }).then(function(r) {
     var body = JSON.parse(capturedBody);
     assert.deepStrictEqual(body.response_format, { type: 'json_object' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Item 1b: provider rejection of an optional parameter drops it and retries once
+// ---------------------------------------------------------------------------
+
+function callModelWithSequencedFetch(sequences) {
+  // sequences: array of per-attempt functions (url, opts) => { status, json }
+  var attempt = 0;
+  var capturedBodies = [];
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    _backoffBase: 1,
+    fetch: function(url, opts) {
+      capturedBodies.push(opts && opts.body);
+      var seq = sequences[Math.min(attempt, sequences.length - 1)];
+      attempt += 1;
+      return Promise.resolve({ status: seq.status, ok: seq.status === 200, json: function() { return Promise.resolve(seq.json); } });
+    }
+  }).then(function(r) {
+    return { result: r, capturedBodies: capturedBodies };
+  });
+}
+
+test('callModel: rejected reasoning param is dropped and retried once', function() {
+  return callModelWithSequencedFetch([
+    { status: 400, json: { error: { message: 'reasoning is not supported by this model' } } },
+    { status: 200, json: { choices: [{ message: { content: '{"ok":true}' } }], usage: { total_tokens: 10 } } }
+  ]).then(function(out) {
+    assert.strictEqual(out.capturedBodies.length, 2, 'must retry once after provider rejects reasoning');
+    var body1 = JSON.parse(out.capturedBodies[0]);
+    var body2 = JSON.parse(out.capturedBodies[1]);
+    assert.ok(body1.reasoning, 'first request must include reasoning');
+    assert.ok(body1.reasoning && body1.reasoning.effort === 'low', 'reasoning effort low in first request');
+    assert.strictEqual(body2.reasoning, undefined, 'retry must drop reasoning');
+    assert.strictEqual(out.result.ok, true, 'retry after drop must succeed');
+    assert.strictEqual(out.result.blocker, undefined, 'no blocker on successful retry');
+  });
+});
+
+test('callModel: rejected response_format param is dropped and retried once', function() {
+  return callModelWithSequencedFetch([
+    { status: 400, json: { error: { message: 'response_format is not supported here' } } },
+    { status: 200, json: { choices: [{ message: { content: '{"ok":true}' } }], usage: { total_tokens: 10 } } }
+  ]).then(function(out) {
+    assert.strictEqual(out.capturedBodies.length, 2, 'must retry once after response_format rejection');
+    var body1 = JSON.parse(out.capturedBodies[0]);
+    var body2 = JSON.parse(out.capturedBodies[1]);
+    assert.deepStrictEqual(body1.response_format, { type: 'json_object' });
+    assert.strictEqual(body2.response_format, undefined, 'retry must drop response_format');
+    assert.strictEqual(out.result.ok, true, 'retry after drop must succeed');
+  });
+});
+
+test('callModel: rejected max_tokens param is dropped and retried once', function() {
+  return callModelWithSequencedFetch([
+    { status: 422, json: { error: { message: 'max_tokens exceeds limit for this model' } } },
+    { status: 200, json: { choices: [{ message: { content: '{"ok":true}' } }], usage: { total_tokens: 10 } } }
+  ]).then(function(out) {
+    assert.strictEqual(out.capturedBodies.length, 2, 'must retry once after max_tokens rejection');
+    var body1 = JSON.parse(out.capturedBodies[0]);
+    var body2 = JSON.parse(out.capturedBodies[1]);
+    assert.strictEqual(body1.max_tokens, 4000, 'first request must include max_tokens=4000');
+    assert.strictEqual(body2.max_tokens, undefined, 'retry must drop max_tokens');
+    assert.strictEqual(out.result.ok, true, 'retry after drop must succeed');
+  });
+});
+
+test('callModel: unrelated HTTP 400 is NOT retried', function() {
+  var attempts = 0;
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function() {
+      attempts += 1;
+      return Promise.resolve({ status: 400, ok: false, json: function() { return Promise.resolve({ error: { message: 'model not found' } }); } });
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'HTTP_400');
+    assert.strictEqual(attempts, 1, 'unrelated 400 must NOT be retried');
+  });
+});
+
+test('callModel: unrelated HTTP 401 is NOT retried', function() {
+  var attempts = 0;
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function() {
+      attempts += 1;
+      return Promise.resolve({ status: 401, ok: false, json: function() { return Promise.resolve({ error: {} }); } });
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'HTTP_401');
+    assert.strictEqual(attempts, 1, 'unrelated 401 must NOT be retried');
+  });
+});
+
+test('callModel: HTTP 500 is retried once then returns blocker', function() {
+  var attempts = 0;
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    _backoffBase: 1,
+    fetch: function() {
+      attempts += 1;
+      return Promise.resolve({ status: 500, ok: false, json: function() { return Promise.resolve({}); } });
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'HTTP_500');
+    assert.strictEqual(attempts, 2, '500 must be retried once');
+  });
+});
+
+test('callModel: HTTP 429 is retried once then returns blocker', function() {
+  var attempts = 0;
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    _backoffBase: 1,
+    fetch: function() {
+      attempts += 1;
+      return Promise.resolve({ status: 429, ok: false, json: function() { return Promise.resolve({}); } });
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'HTTP_429');
+    assert.strictEqual(attempts, 2, '429 must be retried once');
   });
 });
 
@@ -488,19 +626,26 @@ test('callModel: budget.model created with defaults if absent', function() {
   });
 });
 
-test('callModel: AbortError from fetch -> MODEL_UNAVAILABLE', function() {
+test('callModel: AbortError from fetch -> MODEL_TIMEOUT', function() {
   var err = new Error('aborted');
   err.name = 'AbortError';
-  var fakeFetch = function() { return Promise.reject(err); };
+  var calls = 0;
+  var fakeFetch = function() { calls += 1; return Promise.reject(err); };
   return modelClient.callModel({
     prompt: 'hello',
     env: { OPENROUTER_API_KEY: 'tok' },
     budget: { model: { used: 0, maxTokensTotal: 400000 } },
-    fetch: fakeFetch
+    fetch: fakeFetch,
+    _backoffBase: 1
   }).then(function(r) {
     assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.blocker.code, 'MODEL_UNAVAILABLE');
-    assert.ok(r.blocker.message.indexOf('120s') !== -1 || r.blocker.message.indexOf('timed out') !== -1);
+    assert.strictEqual(r.blocker.code, 'MODEL_TIMEOUT');
+    assert.strictEqual(r.blocker.evidence.stage, 'model');
+    assert.strictEqual(r.blocker.evidence.host, 'openrouter.ai');
+    assert.strictEqual(typeof r.blocker.evidence.elapsedMs, 'number');
+    assert.strictEqual(typeof r.blocker.evidence.promptChars, 'number');
+    assert.strictEqual(r.blocker.evidence.promptChars, 5);
+    assert.strictEqual(calls, 2, 'should retry once on abort');
   });
 });
 
@@ -517,10 +662,12 @@ test('callModel: bad input -> instanceof Promise', function() {
 // Item 2b: fetch never resolves -> aborted at timeout via AbortController
 // ---------------------------------------------------------------------------
 
-test('callModel: fetch that never resolves -> aborted at opts.timeout, returns MODEL_UNAVAILABLE', function() {
+test('callModel: fetch that never resolves -> aborted at opts.timeout, returns MODEL_TIMEOUT', function() {
   // Like a real fetch: never settles on its own, but rejects with AbortError
   // when the injected signal is aborted. Short timeout makes the test fast.
+  var calls = 0;
   var fakeFetch = function(url, fetchOpts) {
+    calls += 1;
     return new Promise(function(resolve, reject) {
       if (fetchOpts && fetchOpts.signal) {
         fetchOpts.signal.addEventListener('abort', function() {
@@ -537,10 +684,14 @@ test('callModel: fetch that never resolves -> aborted at opts.timeout, returns M
     env: { OPENROUTER_API_KEY: 'tok' },
     budget: { model: { used: 0, maxTokensTotal: 400000 } },
     fetch: fakeFetch,
-    timeout: 50
+    timeout: 50,
+    _backoffBase: 1
   }).then(function(r) {
     assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.blocker.code, 'MODEL_UNAVAILABLE');
+    assert.strictEqual(r.blocker.code, 'MODEL_TIMEOUT');
+    assert.strictEqual(r.blocker.evidence.stage, 'model');
+    assert.strictEqual(typeof r.blocker.evidence.elapsedMs, 'number');
+    assert.strictEqual(calls, 2, 'should retry once');
   });
 });
 
@@ -575,11 +726,11 @@ test('callModel: after success all timers are cleared (created == cleared)', fun
   });
 });
 
-test('callModel: default SIGNAL_TIMEOUT_MS is 120000', function() {
-  assert.strictEqual(modelClient.SIGNAL_TIMEOUT_MS, 120000);
+test('callModel: default REPAIR_MODEL_TIMEOUT_MS is 300000', function() {
+  assert.strictEqual(modelClient.DEFAULT_TIMEOUT_MS, 300000);
 });
 
-test('callModel: injected setTimeout receives timeoutMs argument', function() {
+test('callModel: injected setTimeout receives resolved default timeout (300000)', function() {
   var capturedDelay = null;
   function captureDelay(fn, delay) {
     capturedDelay = delay;
@@ -597,7 +748,7 @@ test('callModel: injected setTimeout receives timeoutMs argument', function() {
     _clearTimeout: noopClearTimeout
   }).then(function(r) {
     assert.strictEqual(r.ok, true);
-    assert.strictEqual(capturedDelay, modelClient.SIGNAL_TIMEOUT_MS, '_setTimeout must be called with SIGNAL_TIMEOUT_MS');
+    assert.strictEqual(capturedDelay, modelClient.DEFAULT_TIMEOUT_MS, '_setTimeout must be called with DEFAULT_TIMEOUT_MS');
   });
 });
 
@@ -665,6 +816,40 @@ test('callModel: malformed body -> INVALID_RESPONSE with evidence fields', funct
     assert.strictEqual(ev.method, 'POST');
     assert.strictEqual(ev.status, 200);
     assert.strictEqual(ev.bodyLength, 7, '{broken is 7 chars, so evidence.bodyLength must be 7');
+  });
+});
+
+test('callModel: MODEL_TIMEOUT on retry succeeds, budget.model.used is NOT incremented on failure', function() {
+  // Both attempts fail with AbortError (never resolved). The retry succeeds on
+  // the second attempt. The budget must NOT be consumed by the failed attempts.
+  var calls = 0;
+  var attemptsUsed = [];
+  var fakeFetch = function(url, opts) {
+    calls += 1;
+    attemptsUsed.push(calls);
+    return new Promise(function(resolve, reject) {
+      if (opts && opts.signal) {
+        opts.signal.addEventListener('abort', function() {
+          var e = new Error('aborted');
+          e.name = 'AbortError';
+          reject(e);
+        });
+      }
+    });
+  };
+  var budget = { model: { used: 0, maxTokensTotal: 400000 } };
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: budget,
+    fetch: fakeFetch,
+    timeout: 50,
+    _backoffBase: 1
+  }).then(function(r) {
+    assert.strictEqual(calls, 2, 'should have retried once');
+    assert.strictEqual(budget.model.used, 0, 'budget must NOT be consumed when model call fails');
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'MODEL_TIMEOUT');
   });
 });
 

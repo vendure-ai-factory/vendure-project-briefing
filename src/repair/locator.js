@@ -22,6 +22,67 @@ function ensureDir(dirPath) {
 }
 
 /**
+ * Generated/type/list files must never become candidates: *.d.ts, gql
+ * generated or graphql-env*, dist/, build/, lock files, *.map, and test
+ * fixtures. These are low-signal and drown the pattern search.
+ */
+var EXCLUDED_DIR_RE = /(^|\/)(node_modules|\.git|dist|build|generated|gql\/generated|__fixtures__|fixtures|test-fixtures)\//;
+var EXCLUDED_FILE_RE = /\.d\.ts$|\.map$|(^|\/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|npm-shrinkwrap\.json|.*\.lock)$|graphql-env/;
+function isGeneratedOrTypeFile(absPath) {
+  if (!absPath) return false;
+  var norm = String(absPath).replace(/\\/g, '/');
+  if (EXCLUDED_DIR_RE.test(norm)) return true;
+  if (EXCLUDED_FILE_RE.test(norm)) return true;
+  if (/graphql-env\.d\.ts$/.test(norm)) return true;
+  return false;
+}
+
+/**
+ * Generic GraphQL pagination/list words that are never useful as search terms
+ * (they appear in every query/args object and would flood the search).
+ */
+function graphQlFieldStoplist() {
+  return ['take', 'skip', 'items', 'item', 'options', 'args', 'input', 'filter',
+    'sort', 'orderBy', 'page', 'pages', 'limit', 'offset', 'first', 'last',
+    'after', 'before', 'cursor', 'nodes', 'node', 'edges', 'edge', 'totalItems',
+    'results', 'list', 'array', 'enable', 'enabled', 'id', 'ids', 'name', 'title'];
+}
+
+/**
+ * Determine the failing GraphQL field from the finding. Priority:
+ *  (1) finding.path (a string or an array path, last segment when array)
+ *  (2) "path:<field>" embedded in the finding's message
+ *  (3) falling back to finding.sql/path when present
+ * Sets finding.path when it is null/undefined but derivable from the message.
+ */
+function failingField(finding) {
+  if (!finding) return null;
+  var pathVal = null;
+  if (typeof finding.path === 'string' && finding.path !== '' && finding.path !== 'undefined' && finding.path !== 'null') {
+    pathVal = finding.path;
+  } else if (Array.isArray(finding.path) && finding.path.length > 0) {
+    pathVal = finding.path[finding.path.length - 1];
+  }
+  if (!pathVal) {
+    // "path:products" or "path: ['products']" style hints in the message.
+    var msg = (typeof finding.message === 'string') ? finding.message : '';
+    var m = msg.match(/path:\s*\[?['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\]?/);
+    if (m) pathVal = m[1];
+    if (!pathVal) {
+      var m2 = msg.match(/"(?:path|field)"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"/);
+      if (m2) pathVal = m2[1];
+    }
+    if (pathVal && (finding.path == null || finding.path === 'undefined')) {
+      try { finding.path = pathVal; } catch (e) { /* ignore */ }
+    }
+  }
+  if (pathVal && typeof pathVal === 'string') {
+    return pathVal.split('.').pop(); // last segment of a dotted path
+  }
+  return null;
+}
+
+/**
  * Derive search patterns from a finding.
  * Generic patterns based on operator and column, not hard-coded to one bug.
  * When the GraphQL path is absent, patterns are derived from the finding's
@@ -62,28 +123,34 @@ function deriveSearchPatterns(finding) {
     }
   }
 
-  // Use REAL GraphQL root field names from the query (task's own evidence).
-  // These are parsed from the actual GraphQL operation, not derived from error text.
-  if (rootFields.length > 0) {
-    for (var rf = 0; rf < rootFields.length; rf++) {
-      var field = rootFields[rf];
-      if (field && field.length >= 2) {
-        if (patterns.indexOf(field) === -1) patterns.push(field);
-        if (patterns.indexOf(field + 'Resolver') === -1) patterns.push(field + 'Resolver');
-        if (patterns.indexOf(field + 'Service') === -1) patterns.push(field + 'Service');
-        if (patterns.indexOf(field + 'Query') === -1) patterns.push(field + 'Query');
-      }
-    }
-  } else if (queryPath && typeof queryPath === 'string' && queryPath.length > 0 && queryPath !== 'undefined') {
+  // Use ONLY the failing field from the finding's error path, never every field
+  // that appeared in the query. Generic GraphQL pagination/list words (take,
+  // skip, items, options, ...) are dropped via the stoplist below.
+  var field = failingField(finding);
+  if (field && graphQlFieldStoplist().indexOf(field) === -1 && field.length >= 2) {
+    if (patterns.indexOf(field) === -1) patterns.push(field);
+    if (patterns.indexOf(field + 'Resolver') === -1) patterns.push(field + 'Resolver');
+    if (patterns.indexOf(field + 'Service') === -1) patterns.push(field + 'Service');
+    if (patterns.indexOf(field + 'Query') === -1) patterns.push(field + 'Query');
+  } else if (queryPath && typeof queryPath === 'string' && queryPath.length > 0 && queryPath !== 'undefined' && graphQlFieldStoplist().indexOf(queryPath) === -1) {
     if (patterns.indexOf(queryPath) === -1) patterns.push(queryPath);
     if (patterns.indexOf(queryPath + 'Resolver') === -1) patterns.push(queryPath + 'Resolver');
     if (patterns.indexOf(queryPath + 'Service') === -1) patterns.push(queryPath + 'Service');
     if (patterns.indexOf(queryPath + 'Query') === -1) patterns.push(queryPath + 'Query');
+  } else {
+    // Fall back to real query root fields, still filtering the stoplist.
+    for (var rf = 0; rf < rootFields.length; rf++) {
+      var fld = rootFields[rf];
+      if (!fld || graphQlFieldStoplist().indexOf(fld) !== -1 || fld.length < 2) continue;
+      if (patterns.indexOf(fld) === -1) patterns.push(fld);
+      if (patterns.indexOf(fld + 'Resolver') === -1) patterns.push(fld + 'Resolver');
+      if (patterns.indexOf(fld + 'Service') === -1) patterns.push(fld + 'Service');
+      if (patterns.indexOf(fld + 'Query') === -1) patterns.push(fld + 'Query');
+    }
   }
 
-  // When path is absent, fall back to stack-frame names and operationName.
-  // taskId is NEVER used as a pattern - it is pipeline-internal.
-  if (!queryPath || queryPath === 'undefined') {
+  // When no field is available, fall back to stack-frame names and operationName.
+  if ((!queryPath || queryPath === 'undefined') && !field) {
     var stack = finding.stack;
     var frames = Array.isArray(stack) ? stack : [];
     for (var fi = 0; fi < frames.length; fi++) {
@@ -202,12 +269,13 @@ function findSourceFiles(dirPath, searched) {
       var fullPath = path.join(dirPath, entry.name);
 
       if (entry.isDirectory()) {
-        if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === '.git') {
+        if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'build' || entry.name === '.git' || entry.name === '__fixtures__' || entry.name === 'fixtures') {
           continue;
         }
         files = files.concat(findSourceFiles(fullPath, searched));
       } else if (entry.isFile()) {
         if (entry.name.endsWith('.ts') || entry.name.endsWith('.js') || entry.name.endsWith('.mjs')) {
+          if (isGeneratedOrTypeFile(fullPath)) continue;
           try {
             var stats = fs.statSync(fullPath);
             if (stats.size <= MAX_FILE_SIZE) {
@@ -338,6 +406,49 @@ function scoreMatch(match, finding, allPatterns) {
   score += patternHits;
 
   return score;
+}
+
+/**
+ * A candidate is a "strong match" (which skips the dependency search) only when
+ * it is a stack frame, OR the file contains BOTH an operator-idiom hit and the
+ * failing GraphQL field name within ~60 lines of the matched line. A pure
+ * field-name-only hit is NEVER strong.
+ */
+var OPERATOR_IDIOMS = ['notEq', 'Equals(', 'Not(', '.not(', 'isNull', 'isNotNull', 'gt:', 'lt:', 'gte:', 'lte:', 'ne:', '!= :'];
+function isStrongCandidate(finding, candidate) {
+  if (!candidate) return false;
+  if (candidate.source === 'stack') return true;
+  if (candidate.source === 'dependency') return true; // dependency candidates are explicit
+  var field = failingField(finding);
+  if (!field) return false;
+  if (!candidate.file) return false;
+  var content;
+  try {
+    content = fs.readFileSync(candidate.file, 'utf8');
+  } catch (e) {
+    return false;
+  }
+  var contentLines = content.split('\n');
+  var fieldAt = [];
+  var idiomAt = [];
+  for (var li = 0; li < contentLines.length; li++) {
+    var l = contentLines[li];
+    var toks = (field + 'Resolver,' + field + 'Service,' + field + 'Query,' + field).split(',');
+    var fieldHit = toks.some(function(t) { return l.indexOf(t) !== -1; });
+    if (fieldHit && fieldAt.indexOf(li) === -1) fieldAt.push(li);
+    if (OPERATOR_IDIOMS.some(function(o) { return l.indexOf(o) !== -1; })) {
+      if (idiomAt.indexOf(li) === -1) idiomAt.push(li);
+    }
+  }
+  if (fieldAt.length === 0 || idiomAt.length === 0) return false;
+  var anchor = (candidate.line || 1) - 1;
+  for (var f = 0; f < fieldAt.length; f++) {
+    for (var g = 0; g < idiomAt.length; g++) {
+      if (Math.abs(fieldAt[f] - idiomAt[g]) <= 60) return true;
+    }
+  }
+  void anchor;
+  return false;
 }
 
 /**
@@ -828,7 +939,10 @@ async function locateCandidates(options) {
   candidates.sort(function(a, b) { return b.score - a.score; });
 
   // Check if we have a strong match (score >= 6)
-  var hasStrongMatch = candidates.length > 0 && (candidates[0].score >= 6 || candidates[0].source === 'stack');
+  // Strong match skips the dependency search. A candidate is strong only when
+  // it is a stack frame, or its file contains BOTH an operator idiom and the
+  // failing field within ~60 lines. A pure field-name hit is never strong.
+  var hasStrongMatch = candidates.some(function(c) { return isStrongCandidate(finding, c); });
 
   // If no strong match, search in package dependencies
   if (!hasStrongMatch) {
@@ -868,8 +982,9 @@ async function locateCandidates(options) {
           continue;
         }
 
-        fetchStatus.status = (pkgPath && typeof pkgPath === 'string' && fs.existsSync(pkgPath)) ? 'fetched' : 'skipped';
-        fetchStatus.kind = (pkgPath && typeof pkgPath === 'string' && fs.existsSync(pkgPath)) ? null : 'unavailable';
+        var pkgFetchedForReal = (pkgPath && typeof pkgPath === 'string' && fs.existsSync(pkgPath));
+        fetchStatus.status = pkgFetchedForReal ? 'fetched' : 'alias-skipped';
+        fetchStatus.kind = pkgFetchedForReal ? null : 'unavailable';
         packageStatuses.push(fetchStatus);
 
         // Materialize the fetched package into the clone so the candidate
@@ -911,6 +1026,13 @@ async function locateCandidates(options) {
                         var pkgContext = getContextLines(full, pkgMatch.lineNumber, pkgMatch.matchedPattern);
                         var pkgScore = scoreMatch({ line: pkgMatch.line, lineNumber: pkgMatch.lineNumber, matchedPattern: pkgMatch.matchedPattern, file: full }, finding, patterns);
                         var relFile = path.relative(targetRoot, full).replace(/\\/g, '/');
+                        // Prefer packages whose source defines the failing-field
+                        // resolver/extension AND the operator idiom together.
+                        try {
+                          if (isStrongCandidate(finding, { source: 'stack', file: full, score: pkgScore })) {
+                            pkgScore += 8;
+                          }
+                        } catch (e) { /* ignore */ }
 
                         found.push({
                           source: 'dependency',
@@ -937,6 +1059,13 @@ async function locateCandidates(options) {
 
         var pkgResults = searchInPackage(nodeModulesPkgDir);
         candidates = candidates.concat(pkgResults);
+        // Mark per-package search outcome: matched if any candidate hit,
+        // otherwise noMatch.
+        if (pkgResults.length > 0) {
+          fetchStatus.status = 'matched';
+        } else if (fetchStatus.status === 'fetched') {
+          fetchStatus.status = 'noMatch';
+        }
       } catch (err) {
         // Package fetch failed (e.g. npm 404/401 for a missing or private
         // package): record candidate-not-found and keep searching. This must

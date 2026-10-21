@@ -352,23 +352,177 @@ function getGraphQlInfoFromEvidence(cfg, taskId) {
  * entry matching the error message, and returns a window around it.
  * Returns the concatenated log string capped at maxLength.
  */
+/**
+ * Strip common container/timestamp/PID prefixes from a log line so keywords
+ * like ERROR/CONTEXT/STATEMENT become detectable regardless of the runner's
+ * log format:
+ *   - docker/compose "name-1  | "
+ *   - ISO / "[2026-...]" timestamps
+ *   - "LOG:" / PID tags
+ *   - JSON log lines with msg/message fields
+ * Returns the "payload" portion after any prefix.
+ */
+function stripLogPrefix(line) {
+  if (!line || typeof line !== 'string') return '';
+  var out = line;
+  // JSON log line (e.g. {"time":...,"level":"error","msg":"ERROR: ..."})
+  if (out.trim().charAt(0) === '{') {
+    try {
+      var parsed = JSON.parse(out);
+      var msg = parsed && (parsed.msg !== undefined ? parsed.msg
+        : (parsed.message !== undefined ? parsed.message : null));
+      if (typeof msg === 'string') out = msg;
+      else if (parsed && parsed.err) out = '';
+    } catch (e) { /* not JSON */ }
+  }
+  // Docker/compose prefix: "name-1  | " or "name-1|"
+  out = out.replace(/^[a-zA-Z0-9_.-]+(\s*)?\|\s*/, '');
+  // Timestamps: ISO (2026-10-21T12:34:56.789Z), bracket [2026-...], and
+  // the YYYY-MM-DD HH:MM:SS[.mmm] UTC-less forms. A year of 9999 is the
+  // masked placeholder from maskLogPayload and must never be re-stripped.
+  out = out.replace(/^(?!9999-)\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z| UTC| [A-Z]+)?\s+/, '');
+  out = out.replace(/^\[(?!9999-)\d{4}-\d{2}-\d{2}[ T][^\]]*\]\s*/, '');
+  out = out.replace(/^(?!9999(?=\s))[\d:.]+\s+/, ''); // bare HH:MM:SS.iii
+  // PID tag: "2026-... [12345] " or "[12345] " or "PID 12345"
+  out = out.replace(/\[(\d+)\]\s*/, '');
+  out = out.replace(/^PID\s+\d+\s*/, '');
+  // Level/log tag
+  out = out.replace(/^(LOG|INFO|WARN|WARNING|NOTICE|ERROR|FATAL|DEBUG|PANIC):\s*/, function(chunk, kw) {
+    // Preserve the keyword (lower risk of breaking CONTEXT/STATEMENT that is
+    // not prefixed by "LOG:"). Keep it only if it is a real severity label.
+    return kw + ': ';
+  });
+  return out;
+}
+
+/**
+ * Mask a log payload into a shape that reveals format/structure without
+ * exposing literal values. Each alphanumeric run is replaced by a token of the
+ * same length class: all-digits -> 999... ("9"), all-alpha -> AAA... ("A"),
+ * mixed -> X... ("X"); punctuation is kept; the keywords
+ * ERROR/CONTEXT/STATEMENT/DETAIL/LOG/PANIC/HINT are preserved verbatim; an ISO
+ * timestamp collapses to 9999-99-99T99:99:99.
+ */
+function maskLogPayload(line) {
+  if (!line || typeof line !== 'string') return '';
+  var s = line;
+  var restores = [];
+  // Protect timestamps behind a non-alphanumeric marker so the run-masker
+  // below can never perturb the masked placeholder shape, then restore the
+  // canonical masked form afterwards.
+  s = s.replace(/\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?(?:Z| UTC)?/g, function() {
+    restores.push('9999-99-99T99:99:99');
+    return '\u0000';
+  });
+  s = s.replace(/^\[\d{4}-\d{2}-\d{2}[ T][^\]]*\]\s*/, function() {
+    restores.push('[9999-99-99T99:99:99]');
+    return '\u0000';
+  });
+  s = s.replace(/^[\d:.]+(?=\s)/, function() {
+    restores.push('9999');
+    return '\u0000';
+  });
+  // Mask alphanumeric runs, preserving punctuation and keywords.
+  s = s.replace(/[A-Za-z0-9]+/g, function(m) {
+    var up = m.toUpperCase();
+    if (up === 'ERROR' || up === 'CONTEXT' || up === 'STATEMENT' || up === 'DETAIL' ||
+        up === 'LOG' || up === 'PANIC' || up === 'HINT' || up === 'NOTICE' || up === 'FATAL') {
+      return m;
+    }
+    var digitRun = /^[0-9]+$/.test(m);
+    var alphaRun = /^[a-zA-Z]+$/.test(m);
+    var ch = digitRun ? '9' : (alphaRun ? 'A' : 'X');
+    return ch.repeat(m.length);
+  });
+  // Restore masked timestamp placeholders in order of appearance.
+  var out = '';
+  var ri = 0;
+  for (var ci = 0; ci < s.length; ci++) {
+    if (s.charCodeAt(ci) === 0) {
+      out += (ri < restores.length) ? restores[ri++] : '';
+    } else {
+      out += s[ci];
+    }
+  }
+  return out;
+}
+
+/**
+ * Produce the per-kind masked log-shape diagnostics object. For each kind:
+ * lineCount, counts of lines containing ERROR/STATEMENT/CONTEXT/"invalid input
+ * syntax", the first/last index of the first error-match entry, and up to 12
+ * MASKED lines around that match. Never contains literal log values (canary-safe).
+ */
+function buildLogShape(logs, findingMessage) {
+  var kinds = ['postgres', 'vendure', 'worker'];
+  var shape = { kinds: {}, generatedAt: new Date().toISOString(), masked: true };
+  for (var ki = 0; ki < kinds.length; ki++) {
+    var kind = kinds[ki];
+    var lines = (logs && Array.isArray(logs[kind])) ? logs[kind].map(String) : [];
+    var info = {
+      lineCount: lines.length,
+      counts: { error: 0, statement: 0, context: 0, invalidInputSyntax: 0 },
+      firstErrorEntryIndex: null,
+      lastErrorEntryIndex: null,
+      errorMaskedLines: []
+    };
+    var errorIdx = -1;
+    var lastErrorIdx = -1;
+    for (var i = 0; i < lines.length; i++) {
+      var payload = stripLogPrefix(lines[i]);
+      if (/ERROR/.test(payload)) info.counts.error++;
+      if (/STATEMENT/.test(payload)) info.counts.statement++;
+      if (/CONTEXT/.test(payload)) info.counts.context++;
+      if (/invalid input syntax/.test(payload)) info.counts.invalidInputSyntax++;
+      var isErrorMatch = payload.indexOf('ERROR') !== -1;
+      if (findingMessage && payload.indexOf(findingMessage) !== -1) isErrorMatch = true;
+      if (isErrorMatch) {
+        if (errorIdx === -1) errorIdx = i;
+        lastErrorIdx = i;
+      }
+    }
+    if (errorIdx !== -1) {
+      info.firstErrorEntryIndex = errorIdx;
+      info.lastErrorEntryIndex = (lastErrorIdx !== -1 ? lastErrorIdx : errorIdx);
+      var start = Math.max(0, errorIdx - 6);
+      var end = Math.min(lines.length - 1, errorIdx + 5);
+      for (var k = start; k <= end && k < errorIdx + 7; k++) {
+        info.errorMaskedLines.push({ index: k, masked: stripLogPrefix(maskLogPayload(lines[k])) });
+      }
+    }
+    shape.kinds[kind] = info;
+  }
+  return shape;
+}
+
+/**
+ * Find a window of log lines around an error. Groups multi-line postgres
+ * entries (ERROR / CONTEXT / STATEMENT / DETAIL), tolerating docker/compose,
+ * ISO/bracket timestamps, "LOG:" tags and PID prefixes, and finds the entry
+ * matching the finding's message (not assuming the first entry). Returns the
+ * concatenated log string capped at maxLength.
+ */
 function buildLogExcerptWithWindow(allLines, findingMessage, maxLength) {
   maxLength = maxLength || 20000;
   if (!allLines || allLines.length === 0) {
     return null;
   }
-  // Group log lines into entries. Postgres entries start with a timestamp pattern
-  // like "2026-10-21 12:34:56.789 UTC" or just "ERROR" at the start of a line
+  // Group lines into entries. A new postgres entry starts when a stripped line
+  // begins with ERROR/CONTEXT/STATEMENT/DETAIL/LOG/other severity, or carries a
+  // leading timestamp after prefix stripping.
   var entries = [];
   var currentEntry = [];
-  // Timestamp regex for log line detection
-  var timestampRegex = /^\d{4}-\d{2}-\d{2}|^[A-Z]{3,}\s+/;
   for (var i = 0; i < allLines.length; i++) {
     var line = allLines[i];
-    if (!line || typeof line !== 'string') continue;
-    // Check if this line starts a new entry (timestamp or ERROR/DETAIL/CONTEXT/STATEMENT)
-    var isNewEntry = timestampRegex.test(line) || /^ERROR|^DETAIL|^CONTEXT|^STATEMENT/.test(line);
-    if (isNewEntry && currentEntry.length > 0) {
+    if (!line || typeof line !== 'string') {
+      if (currentEntry.length > 0) { entries.push(currentEntry.join('\n')); currentEntry = []; }
+      continue;
+    }
+    var stripped = stripLogPrefix(line);
+    var leadingTimestamp = /^\d{4}-\d{2}-\d{2}|^\[\d{4}-\d{2}-\d{2}/.test(stripped);
+    var severityStart = /^(ERROR|PANIC|FATAL|LOG|NOTICE|STATEMENT|CONTEXT|DETAIL|HINT)\b/.test(stripped) ||
+      /^[A-Z]{3,}:/.test(stripped);
+    if ((leadingTimestamp || severityStart) && currentEntry.length > 0) {
       entries.push(currentEntry.join('\n'));
       currentEntry = [line];
     } else {
@@ -381,38 +535,35 @@ function buildLogExcerptWithWindow(allLines, findingMessage, maxLength) {
   if (entries.length === 0) {
     return null;
   }
-  // Find the entry that best matches the finding's message
   var targetPattern = findingMessage || '';
   var bestIndex = -1;
-  var bestScore = -1;
-  // Search from newest (end) to oldest (start), find the last match
+  var bestScore = 0;
   for (var j = entries.length - 1; j >= 0; j--) {
     var entry = entries[j];
     if (!entry) continue;
+    var eStripped = stripLogPrefix(entry);
     var score = 0;
-    // Prefer entries with ERROR
-    if (/^ERROR/.test(entry)) score += 10;
-    // Check if entry contains the error message or SQLSTATE
-    if (targetPattern && entry.indexOf(targetPattern) !== -1) score += 5;
-    if (/22P02|42883|42P01/.test(entry)) score += 3; // common postgres error codes
-    if (entry.indexOf('invalid input syntax') !== -1) score += 3;
-    if (entry.indexOf('unnamed portal parameter') !== -1) score += 2;
-    if (score > 0 && (bestIndex === -1 || score > bestScore)) {
-      bestIndex = j;
+    if (/^ERROR/.test(eStripped)) score += 10;
+    if (targetPattern && eStripped.indexOf(targetPattern) !== -1) score += 6;
+    if (/invalid input syntax/.test(eStripped)) score += 4;
+    if (/22P02|42883|42P01/.test(eStripped)) score += 3;
+    if (/unnamed portal parameter/.test(eStripped)) score += 2;
+    if (score > bestScore) {
       bestScore = score;
+      bestIndex = j;
     }
   }
-  // Build window around the best entry (or newest entry if no good match)
+  // Fall back to newest entry if no positive match scored.
+  if (bestIndex === -1) bestIndex = entries.length - 1;
+
+  var windowRadius = 20;
+  var startIdx = Math.max(0, bestIndex - windowRadius);
+  var endIdx = Math.min(entries.length - 1, bestIndex + windowRadius);
   var windowEntries = [];
-  var windowRadius = 20; // ~40 lines total (20 before + 20 after)
-  var centerIndex = bestIndex !== -1 ? bestIndex : entries.length - 1;
-  var startIdx = Math.max(0, centerIndex - windowRadius);
-  var endIdx = Math.min(entries.length - 1, centerIndex + windowRadius);
   for (var k = startIdx; k <= endIdx; k++) {
     windowEntries.push(entries[k]);
   }
   var excerpt = windowEntries.join('\n');
-  // Cap at maxLength
   if (excerpt.length > maxLength) {
     excerpt = excerpt.substring(0, maxLength);
   }
@@ -1291,7 +1442,8 @@ export {
   buildExtractInput,
   parseGraphQlQuery,
   getGraphQlInfoFromEvidence,
-  buildLogExcerptWithWindow
+  buildLogExcerptWithWindow,
+  buildLogShape
 };
 
 

@@ -851,3 +851,116 @@ test('locator: dependency candidate is clone-relative and materialized in the cl
   fs.rmSync(pkgDir, { recursive: true, force: true });
   fs.rmSync(evidenceRoot, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// B: locator ignores .d.ts/generated files and still runs dependency search;
+//    fake dep resolver with field+idiom is top candidate.
+// ---------------------------------------------------------------------------
+test('locator: .d.ts and generated files are excluded; dep search runs; field+idiom dep is top', async function() {
+  var workspaceDir = createTempDir();
+  var targetRoot = createTempDir();
+
+  fs.writeFileSync(path.join(targetRoot, 'package.json'), JSON.stringify({
+    name: 'test-target', version: '1.0.0',
+    dependencies: { 'fake-npp-resolver': '1.0.0' }
+  }, null, 2));
+
+  var srcDir = path.join(targetRoot, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  // A .d.ts file (must be excluded from candidates).
+  fs.mkdirSync(path.join(srcDir, 'gql'), { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'gql', 'generated.d.ts'), 'declare function products(ctx: any): Promise<any>;\n');
+  // graphql-env.d.ts (must be excluded).
+  fs.writeFileSync(path.join(srcDir, 'graphql-env.d.ts'), 'declare const ENV: string;\n');
+  // A dist/ file (must be excluded).
+  fs.mkdirSync(path.join(targetRoot, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(targetRoot, 'dist', 'index.js'), 'const x = 1;\n');
+  // src index (no match).
+  fs.writeFileSync(path.join(srcDir, 'index.js'), '// no match\n');
+
+  var pkgDir = createTempDir();
+  var resolverDir = path.join(pkgDir, 'dist', 'resolvers');
+  fs.mkdirSync(resolverDir, { recursive: true });
+  fs.writeFileSync(path.join(resolverDir, 'npp.resolver.js'),
+    'async function products(ctx, args) {\n' +
+    '  const nppId = await this.nppService.getRootNPPId(ctx);\n' +
+    "  const options = { ...args.options, filter: { enabled: { eq: true }, id: { notEq: `${nppId}` } } };\n" +
+    '  return options;\n' +
+    '}\n');
+  fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({
+    name: 'fake-npp-resolver', version: '1.0.0', main: 'dist/resolvers/npp.resolver.js'
+  }, null, 2));
+
+  var fakeFetch = function(name, version, dir) { return Promise.resolve(pkgDir); };
+
+  var finding = { operator: '!=', column: 'id', path: 'products' };
+  var result = await locator.locateCandidates({
+    finding: finding,
+    targetRoot: targetRoot,
+    fetchPackage: fakeFetch,
+    maxCandidates: 5,
+    runId: 'test-dts-exclude-' + Date.now(),
+    workspaceDir: workspaceDir
+  });
+
+  // .d.ts and generated files must NOT appear in candidates.
+  var candidateFiles = result.candidates.map(function(c) { return c.file; });
+  assert.ok(!candidateFiles.some(function(f) { return /\.d\.ts$/.test(f) || /generated\.d\.ts$/.test(f); }),
+    '.d.ts files must not be candidates: ' + JSON.stringify(candidateFiles));
+  assert.ok(!candidateFiles.some(function(f) { return f.indexOf('graphql-env') !== -1; }),
+    'graphql-env files must not be candidates');
+
+  // Dependency search must have run (fake-npp-resolver was fetched and matched).
+  var dep = result.candidates.filter(function(c) { return c.source === 'dependency'; })[0];
+  assert.ok(dep, 'dependency search must have run and found a candidate');
+  assert.ok(dep.package.indexOf('fake-npp-resolver') !== -1, 'top dep must be fake-npp-resolver');
+
+  // Top candidate must be the dep (field name + operator idiom together).
+  var top = result.candidates[0];
+  assert.strictEqual(top.source, 'dependency', 'top candidate must be dependency (field + idiom)');
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+  fs.rmSync(pkgDir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// C: patterns exclude pagination/list words and contain the failing field only.
+// ---------------------------------------------------------------------------
+test('locator: deriveSearchPatterns excludes GraphQL pagination words, includes failing field', function() {
+  var locatorMod = require('../src/repair/locator');
+  // Finding with a path that is also a pagination word (items).
+  var finding1 = { path: 'items', operator: '!=', column: 'id', rootFields: [] };
+  var p1 = locatorMod.deriveSearchPatterns(finding1);
+  assert.strictEqual(p1.indexOf('items'), -1, '"items" (pagination word) must be excluded from patterns');
+
+  // Finding with a real failing field and pagination words in rootFields.
+  var finding2 = {
+    path: 'products',
+    operator: '!=',
+    column: 'id',
+    rootFields: ['products', 'activeChannel', 'items', 'take', 'skip']
+  };
+  var p2 = locatorMod.deriveSearchPatterns(finding2);
+  assert.ok(p2.indexOf('products') !== -1, 'failing field "products" must be in patterns');
+  assert.ok(p2.indexOf('productsResolver') !== -1, 'productsResolver must be in patterns');
+  // activeChannel is a rootField but path is set to 'products' (failing field),
+  // so rootFields are not used as fallback; only the failing field drives patterns.
+  assert.strictEqual(p2.indexOf('items'), -1, '"items" stoplisted word must not be in patterns');
+  assert.strictEqual(p2.indexOf('take'), -1, '"take" stoplisted word must not be in patterns');
+  assert.strictEqual(p2.indexOf('skip'), -1, '"skip" stoplisted word must not be in patterns');
+  assert.strictEqual(p2.indexOf('limit'), -1, '"limit" stoplisted word must not be in patterns');
+  assert.strictEqual(p2.indexOf('offset'), -1, '"offset" stoplisted word must not be in patterns');
+  assert.strictEqual(p2.indexOf('options'), -1, '"options" stoplisted word must not be in patterns');
+  assert.strictEqual(p2.indexOf('filter'), -1, '"filter" stoplisted word must not be in patterns');
+
+  // Finding with only stoplisted words in rootFields -> empty patterns (no field to use).
+  var finding3 = {
+    operator: '!=',
+    column: 'id',
+    rootFields: ['items', 'take', 'skip']
+  };
+  var p3 = locatorMod.deriveSearchPatterns(finding3);
+  assert.ok(p3.indexOf('notEq') !== -1, 'operator idiom notEq must still appear');
+  assert.strictEqual(p3.indexOf('items'), -1, '"items" excluded even as only rootField');
+});
