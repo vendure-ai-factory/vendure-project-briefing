@@ -213,14 +213,15 @@ function searchFileForPatterns(filePath, patterns) {
 }
 
 /**
- * Get context lines (3 lines: 1 before, current, 1 after).
+ * Get context lines (±15 around the hit line) for snippet display.
+ * The model sees real code around each hit, not just the matching line.
  */
 function getContextLines(filePath, targetLine, matchedPattern) {
   try {
     var content = fs.readFileSync(filePath, 'utf8');
     var lines = content.split('\n');
-    var startLine = Math.max(0, targetLine - 2);
-    var endLine = Math.min(lines.length - 1, targetLine);
+    var startLine = Math.max(0, targetLine - 1 - 15); // 15 lines before
+    var endLine = Math.min(lines.length - 1, targetLine - 1 + 15); // 15 lines after
     var context = [];
     for (var i = startLine; i <= endLine; i++) {
       context.push({ line: lines[i], lineNumber: i + 1 });
@@ -1081,6 +1082,83 @@ async function locateCandidates(options) {
         });
       }
     }
+
+    // --- (b) .d.ts exclusion/penalization ---
+    // Build a map of package -> set of base paths that have .js/.ts matches
+    // Then exclude .d.ts candidates where .js exists in same package, or penalize heavily
+    var pkgToBasePaths = {};
+    for (var di = 0; di < candidates.length; di++) {
+      var c = candidates[di];
+      if (c.source !== 'dependency') continue;
+      if (!c.file) continue;
+      var isDts = /\.d\.ts$/.test(c.file);
+      var base = c.file.replace(/\.d\.ts$/, '').replace(/\.(js|mjs|ts)$/, '');
+      if (!pkgToBasePaths[c.package]) pkgToBasePaths[c.package] = { jsBases: {}, dtsOnly: [] };
+      if (isDts) {
+        pkgToBasePaths[c.package].dtsOnly.push(di);
+      } else {
+        pkgToBasePaths[c.package].jsBases[base] = true;
+      }
+    }
+    for (var pkg in pkgToBasePaths) {
+      var info = pkgToBasePaths[pkg];
+      var dtsList = info.dtsOnly;
+      for (var dti = 0; dti < dtsList.length; dti++) {
+        var dtsIdx = dtsList[dti];
+        var dtsCandidate = candidates[dtsIdx];
+        var dtsBase = dtsCandidate.file.replace(/\.d\.ts$/, '').replace(/\.(js|mjs|ts)$/, '');
+        if (info.jsBases[dtsBase]) {
+          // .d.ts candidate has corresponding .js/.ts in same package -> exclude
+          candidates[dtsIdx] = null;
+        } else {
+          // No corresponding source -> penalize heavily but keep
+          candidates[dtsIdx].score -= 50;
+          candidates[dtsIdx].reasons.push('dts-only (no corresponding source)');
+        }
+      }
+    }
+    candidates = candidates.filter(function(c) { return c !== null; });
+
+    // --- (c) Per-package cap (stack package is exempt) ---
+    // Identify the stack package from finding.stack (look for node_modules pattern)
+    var stackPackage = null;
+    if (finding && finding.stack) {
+      var frames = Array.isArray(finding.stack) ? finding.stack : [];
+      for (var si = 0; si < frames.length; si++) {
+        var f = frames[si];
+        if (!f || !f.file) continue;
+        var fileStr = String(f.file).replace(/\\/g, '/');
+        var nmMatch = fileStr.match(/node_modules\/(@[^\/]+\/[^\/]+|[^\/]+)/);
+        if (nmMatch) {
+          stackPackage = nmMatch[1];
+          break;
+        }
+      }
+    }
+    var MAX_PER_PKG = 3;
+    var pkgCounts = {};
+    var finalCandidates = [];
+    for (var ci = 0; ci < candidates.length; ci++) {
+      var cand = candidates[ci];
+      if (cand.source === 'dependency') {
+        var candPkg = cand.package || '';
+        var candPkgName = candPkg.replace(/@[^@]+$/, ''); // strip version
+        if (candPkgName === stackPackage) {
+          // Stack package is exempt from cap
+          finalCandidates.push(cand);
+        } else {
+          pkgCounts[candPkg] = (pkgCounts[candPkg] || 0) + 1;
+          if (pkgCounts[candPkg] <= MAX_PER_PKG) {
+            finalCandidates.push(cand);
+          }
+          // else skip (over cap)
+        }
+      } else {
+        // stack and target candidates are not capped
+        finalCandidates.push(cand);
+      }
+    }
+    candidates = finalCandidates;
 
     // Re-sort after adding package candidates
     candidates.sort(function(a, b) { return b.score - a.score; });

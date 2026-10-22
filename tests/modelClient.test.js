@@ -64,6 +64,32 @@ test('parseEditSet: JSON in ```json fence', function() {
   assert.strictEqual(r.editSet.repairKind, 'config-edit');
 });
 
+test('parseEditSet: JSON with prose before and after', function() {
+  var jsonObj = {
+    repairKind: 'source-edit',
+    rationale: 'test fix',
+    edits: [{ path: 'a.js', oldString: 'x', newString: 'y' }],
+    newFiles: []
+  };
+  var input = 'Here is the fix:\n' + JSON.stringify(jsonObj) + '\nPlease apply this.';
+  var r = modelClient.parseEditSet(input);
+  assert.strictEqual(r.ok, true, 'prose around JSON should be extracted: ' + (r.error || ''));
+  assert.strictEqual(r.editSet.repairKind, 'source-edit');
+  assert.strictEqual(r.editSet.edits.length, 1);
+});
+
+test('parseEditSet: JSON in plain backticks (no language)', function() {
+  var input = '```\n' + JSON.stringify({
+    repairKind: 'migration',
+    rationale: 'migrate db',
+    edits: [],
+    newFiles: []
+  }) + '\n```';
+  var r = modelClient.parseEditSet(input);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.editSet.repairKind, 'migration');
+});
+
 test('parseEditSet: invalid JSON -> error', function() {
   var r = modelClient.parseEditSet('{ not json }');
   assert.strictEqual(r.ok, false);
@@ -124,6 +150,85 @@ test('parseEditSet: newFile missing content -> error', function() {
   var r = modelClient.parseEditSet(JSON.stringify({ repairKind: 'source-edit', rationale: 'x', edits: [], newFiles: [{ path: 'a.txt' }] }));
   assert.strictEqual(r.ok, false);
   assert.ok(r.error.indexOf('newFiles[0]') !== -1);
+});
+
+// ---------------------------------------------------------------------------
+// Regression: newFiles is optional (source-edit typically has no new files)
+// ---------------------------------------------------------------------------
+
+test('parseEditSet: missing newFiles -> ok, normalized to empty array', function() {
+  var input = JSON.stringify({
+    repairKind: 'source-edit',
+    rationale: 'Fix a bug',
+    edits: [{ path: 'src/foo.js', oldString: 'old', newString: 'new' }]
+    // newFiles omitted entirely
+  });
+  var r = modelClient.parseEditSet(input);
+  assert.strictEqual(r.ok, true, 'missing newFiles should be accepted: ' + (r.error || ''));
+  assert.deepStrictEqual(r.editSet.newFiles, [], 'newFiles should be normalized to []');
+  assert.strictEqual(r.editSet.repairKind, 'source-edit');
+  assert.strictEqual(r.editSet.edits.length, 1);
+});
+
+test('parseEditSet: null newFiles -> ok, normalized to empty array', function() {
+  var r = modelClient.parseEditSet(JSON.stringify({
+    repairKind: 'source-edit',
+    rationale: 'Fix a bug',
+    edits: [{ path: 'src/foo.js', oldString: 'old', newString: 'new' }],
+    newFiles: null
+  }));
+  assert.strictEqual(r.ok, true, 'null newFiles should be accepted: ' + (r.error || ''));
+  assert.deepStrictEqual(r.editSet.newFiles, [], 'newFiles should be normalized to []');
+});
+
+test('parseEditSet: empty edits array -> ok', function() {
+  var r = modelClient.parseEditSet(JSON.stringify({
+    repairKind: 'source-edit',
+    rationale: 'No edits needed',
+    edits: [],
+    newFiles: []
+  }));
+  assert.strictEqual(r.ok, true, 'empty edits array should be accepted');
+});
+
+test('parseEditSet: truncated JSON -> No JSON found (triggers re-ask)', function() {
+  var truncated = '{"repairKind": "source-edit", "rationale": "fix"';
+  var r = modelClient.parseEditSet(truncated);
+  assert.strictEqual(r.ok, false, 'truncated JSON should fail');
+  assert.ok(r.error.indexOf('No JSON object found') !== -1,
+    'should report No JSON found (triggers re-ask), got: ' + r.error);
+});
+
+test('parseEditSet: no JSON at all -> No JSON found (triggers re-ask)', function() {
+  var r = modelClient.parseEditSet('this is not JSON at all');
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.error.indexOf('No JSON object found') !== -1, 'should report No JSON found (triggers re-ask), got: ' + r.error);
+});
+
+test('parseEditSet: edits with string item -> error', function() {
+  var r = modelClient.parseEditSet(JSON.stringify({
+    repairKind: 'source-edit',
+    rationale: 'x',
+    edits: ['not an object'],
+    newFiles: []
+  }));
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.error.indexOf('edit[0]') !== -1, 'should report edit[0] error, got: ' + r.error);
+});
+
+test('parseEditSet: valid source-edit without newFiles preserves schema fields', function() {
+  var input = JSON.stringify({
+    repairKind: 'source-edit',
+    rationale: 'Fix the null check',
+    edits: [{ path: 'src/service.ts', oldString: 'if (x == null)', newString: 'if (x === null)' }],
+    newFiles: undefined
+  });
+  var r = modelClient.parseEditSet(input);
+  assert.strictEqual(r.ok, true, 'valid source-edit without newFiles should parse: ' + (r.error || ''));
+  assert.strictEqual(r.editSet.repairKind, 'source-edit');
+  assert.strictEqual(r.editSet.rationale, 'Fix the null check');
+  assert.strictEqual(r.editSet.edits.length, 1);
+  assert.deepStrictEqual(r.editSet.newFiles, []);
 });
 
 // ---------------------------------------------------------------------------

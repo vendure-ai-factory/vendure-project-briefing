@@ -391,7 +391,7 @@ test('locator: DIFFERENT fixture (order resolver with Not) ranks correctly', asy
   fs.mkdirSync(resolverDir, { recursive: true });
 
   var resolverCode = [
-    'async function orders(ctx, args) {',
+    'async function orderListQuery(ctx, args) {',
     '  const otherId = await this.orderService.getOtherId(ctx);',
     "  const options = { ...args.options, filter: { status: { Not: `${otherId}` } } };",
     '  return options;',
@@ -404,7 +404,7 @@ test('locator: DIFFERENT fixture (order resolver with Not) ranks correctly', asy
   var fakeFetch = function(name, version, dir) { return Promise.resolve(pkgDir); };
 
   var result = await locator.locateCandidates({
-    finding: { operator: '!=', column: 'order.status', path: 'orders' },
+    finding: { operator: '!=', column: 'order.status', path: 'orderList', rootFields: ['orderList'] },
     targetRoot: targetRoot,
     fetchPackage: fakeFetch,
     maxCandidates: 5,
@@ -542,14 +542,14 @@ test('run-repair: buildExtractInput parses GraphQL operation name from evidence'
   var patterns = require('../src/repair/locator').deriveSearchPatterns({
     operator: '!=',
     column: 'id',
-    rootFields: ['products'],
+    rootFields: ['productTags'],
     taskId: 'CAN-B1-03', // should NOT appear in patterns
-    operationName: 'ReadOnlyProducts'
+    operationName: 'ReadOnlyProductTags'
   });
 
   assert.ok(patterns.indexOf('CAN-B1-03') === -1, 'taskId must NOT be in patterns');
-  assert.ok(patterns.indexOf('products') !== -1, 'products (rootField) should be in patterns');
-  assert.ok(patterns.indexOf('productsResolver') !== -1, 'productsResolver should be in patterns');
+  assert.ok(patterns.indexOf('productTags') !== -1, 'productTags (rootField) should be in patterns');
+  assert.ok(patterns.indexOf('productTagsResolver') !== -1, 'productTagsResolver should be in patterns');
   assert.ok(patterns.indexOf('notEq') !== -1, 'notEq operator idiom should be in patterns');
 });
 
@@ -936,15 +936,15 @@ test('locator: deriveSearchPatterns excludes GraphQL pagination words, includes 
 
   // Finding with a real failing field and pagination words in rootFields.
   var finding2 = {
-    path: 'products',
+    path: 'productTags',
     operator: '!=',
     column: 'id',
-    rootFields: ['products', 'activeChannel', 'items', 'take', 'skip']
+    rootFields: ['productTags', 'activeChannel', 'items', 'take', 'skip']
   };
   var p2 = locatorMod.deriveSearchPatterns(finding2);
-  assert.ok(p2.indexOf('products') !== -1, 'failing field "products" must be in patterns');
-  assert.ok(p2.indexOf('productsResolver') !== -1, 'productsResolver must be in patterns');
-  // activeChannel is a rootField but path is set to 'products' (failing field),
+  assert.ok(p2.indexOf('productTags') !== -1, 'failing field "productTags" must be in patterns');
+  assert.ok(p2.indexOf('productTagsResolver') !== -1, 'productTagsResolver must be in patterns');
+  // activeChannel is a rootField but path is set to 'productTags' (failing field),
   // so rootFields are not used as fallback; only the failing field drives patterns.
   assert.strictEqual(p2.indexOf('items'), -1, '"items" stoplisted word must not be in patterns');
   assert.strictEqual(p2.indexOf('take'), -1, '"take" stoplisted word must not be in patterns');
@@ -963,4 +963,92 @@ test('locator: deriveSearchPatterns excludes GraphQL pagination words, includes 
   var p3 = locatorMod.deriveSearchPatterns(finding3);
   assert.ok(p3.indexOf('notEq') !== -1, 'operator idiom notEq must still appear');
   assert.strictEqual(p3.indexOf('items'), -1, '"items" excluded even as only rootField');
+});
+
+// ---------------------------------------------------------------------------
+// Per-package candidate cap: non-stack packages are capped at 3 candidates,
+// stack package is exempt, stack/target candidates are not capped.
+// ---------------------------------------------------------------------------
+test('locator: per-package cap — non-stack dep capped at 3, stack pkg exempt', async function() {
+  var workspaceDir = createTempDir();
+  var targetRoot = createTempDir();
+
+  // Target project depends on loud-pkg (non-stack) and @vendure/core (stack)
+  fs.writeFileSync(path.join(targetRoot, 'package.json'), JSON.stringify({
+    name: 'test-target',
+    version: '1.0.0',
+    dependencies: {
+      'loud-pkg': '1.0.0',
+      '@vendure/core': '2.0.0'
+    }
+  }, null, 2));
+
+  var srcDir = path.join(targetRoot, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'index.js'), 'const x = 1;\n');
+
+  // Stack points to @vendure/core (so loud-pkg is NOT the stack package)
+  var finding = {
+    operator: '!=',
+    column: 'id',
+    path: 'orders',
+    stack: [
+      { file: 'targetRoot/node_modules/@vendure/core/dist/index.js', line: 42 }
+    ]
+  };
+
+  // Create loud-pkg with 5 files that all match the notEq pattern
+  var loudPkgDir = createTempDir();
+  var loudDistDir = path.join(loudPkgDir, 'dist');
+  fs.mkdirSync(loudDistDir, { recursive: true });
+  for (var i = 1; i <= 5; i++) {
+    var code = 'async function handler' + i + '(ctx, args) {\n' +
+               '  const id = await this.svc.getId(ctx);\n' +
+               '  const filter = { id: { notEq: id } };\n' +
+               '  return filter;\n' +
+               '}\n';
+    fs.writeFileSync(path.join(loudDistDir, 'handler' + i + '.js'), code);
+  }
+  fs.writeFileSync(path.join(loudPkgDir, 'package.json'), JSON.stringify({ name: 'loud-pkg', version: '1.0.0' }, null, 2));
+
+  // Create @vendure/core with 2 files that also match (stack package, exempt from cap)
+  var vcDir = createTempDir();
+  var vcDistDir = path.join(vcDir, 'dist');
+  fs.mkdirSync(vcDistDir, { recursive: true });
+  for (var j = 1; j <= 2; j++) {
+    var vcCode = 'export async function order' + j + '(ctx) {\n' +
+                 '  const id = { notEq: ctx.orderId };\n' +
+                 '  return id;\n' +
+                 '}\n';
+    fs.writeFileSync(path.join(vcDistDir, 'order-svc-' + j + '.js'), vcCode);
+  }
+  fs.writeFileSync(path.join(vcDir, 'package.json'), JSON.stringify({ name: '@vendure/core', version: '2.0.0' }, null, 2));
+
+  var fakeFetch = function(name, version, dir) {
+    if (name === 'loud-pkg') return Promise.resolve(loudPkgDir);
+    if (name === '@vendure/core') return Promise.resolve(vcDir);
+    return Promise.resolve(createTempDir());
+  };
+
+  var result = await locator.locateCandidates({
+    finding: finding,
+    targetRoot: targetRoot,
+    fetchPackage: fakeFetch,
+    maxCandidates: 10,
+    runId: 'test-cap-' + Date.now(),
+    workspaceDir: workspaceDir
+  });
+
+  // loud-pkg is NOT the stack package (@vendure/core is), so it must be capped at 3
+  var loudCandidates = result.candidates.filter(function(c) { return c.package && c.package.indexOf('loud-pkg') !== -1; });
+  assert.strictEqual(loudCandidates.length, 3, 'loud-pkg (non-stack) must be capped at 3 candidates; got: ' + loudCandidates.length);
+
+  // @vendure/core IS the stack package, so it must NOT be capped (2 files = 2 candidates)
+  var vcCandidates = result.candidates.filter(function(c) { return c.package && c.package.indexOf('@vendure/core') !== -1; });
+  assert.strictEqual(vcCandidates.length, 2, '@vendure/core (stack pkg) must be exempt from cap; got: ' + vcCandidates.length);
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+  fs.rmSync(loudPkgDir, { recursive: true, force: true });
+  fs.rmSync(vcDir, { recursive: true, force: true });
 });

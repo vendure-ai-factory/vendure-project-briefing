@@ -272,8 +272,9 @@ test('a.2: dependency-patch bug inside node_modules -> READY', async function() 
   assert.strictEqual(result.repairKind, 'dependency-patch');
 });
 
-// b. model failures -> MODEL_FAILED
-test('b.1: invalid JSON from model -> MODEL_FAILED', async function() {
+// b. model failures -> MODEL_FAILED / REJECTED (with re-ask)
+// re-ask: invalid JSON -> re-ask -> re-ask also invalid -> REJECTED after re-ask fails
+test('b.1: invalid JSON from model -> REJECTED after re-ask fails', async function() {
   var dir = createTempProject({
     'src/x.js': 'old\n',
     'package.json': '{"name":"test","scripts":{"test":"echo ok"}}'
@@ -296,8 +297,10 @@ test('b.1: invalid JSON from model -> MODEL_FAILED', async function() {
     deps: deps
   });
 
-  assert.strictEqual(result.status, 'MODEL_FAILED');
-  assert.ok(result.errors);
+  assert.strictEqual(result.status, 'REJECTED');
+  assert.deepStrictEqual(result.rejectionCodes, ['PARSE_ERROR']);
+  assert.ok(result.blocker);
+  assert.strictEqual(result.blocker.code, 'PARSE_ERROR');
 });
 
 test('b.2: model blocker -> MODEL_FAILED', async function() {
@@ -327,7 +330,7 @@ test('b.2: model blocker -> MODEL_FAILED', async function() {
   assert.strictEqual(result.blocker.code, 'MODEL_UNAVAILABLE');
 });
 
-test('b.3: parse failure -> MODEL_FAILED', async function() {
+test('b.3: parse failure -> REJECTED after re-ask fails (mock parse always fails)', async function() {
   var dir = createTempProject({
     'src/x.js': 'old\n',
     'package.json': '{"name":"test","scripts":{"test":"echo ok"}}'
@@ -350,7 +353,10 @@ test('b.3: parse failure -> MODEL_FAILED', async function() {
     deps: deps
   });
 
-  assert.strictEqual(result.status, 'MODEL_FAILED');
+  assert.strictEqual(result.status, 'REJECTED');
+  assert.deepStrictEqual(result.rejectionCodes, ['PARSE_ERROR']);
+  assert.ok(result.blocker);
+  assert.strictEqual(result.blocker.code, 'PARSE_ERROR');
 });
 
 // c. protected path edits -> REJECTED

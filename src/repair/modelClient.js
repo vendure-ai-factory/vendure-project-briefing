@@ -398,19 +398,48 @@ function readBody(response) {
   return Promise.resolve({ ok: true, text: null, json: null, length: null });
 }
 
+function extractJson(text) {
+  if (!text || typeof text !== 'string') return null;
+  var trimmed = text.trim();
+
+  // Try fenced JSON first: ```json ... ```
+  var fencedMatch = /^```json\s*([\s\S]*?)```/im.exec(trimmed);
+  if (fencedMatch && fencedMatch[1]) {
+    var candidate = fencedMatch[1].trim();
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch (e) { /* continue to other strategies */ }
+  }
+
+  // Try fenced JSON without language tag
+  var fencedNoLang = /^```\s*([\s\S]*?)```/im.exec(trimmed);
+  if (fencedNoLang && fencedNoLang[1]) {
+    var candidate2 = fencedNoLang[1].trim();
+    try {
+      JSON.parse(candidate2);
+      return candidate2;
+    } catch (e) { /* continue */ }
+  }
+
+  // Try text before/after JSON fences (prose around JSON)
+  var jsonBlockMatch = /\{[\s\S]*\}/.exec(trimmed);
+  if (jsonBlockMatch) {
+    return jsonBlockMatch[0];
+  }
+
+  return null;
+}
+
 function parseEditSet(text) {
   if (!text || typeof text !== 'string') return { ok: false, error: 'Input is not a non-empty string' };
 
-  var trimmed = text.trim();
-  var jsonStart = trimmed.indexOf('{');
-  var jsonEnd = trimmed.lastIndexOf('}');
-  if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
-    trimmed = trimmed.substring(jsonStart, jsonEnd + 1);
-  }
+  var extracted = extractJson(text);
+  if (!extracted) return { ok: false, error: 'No JSON object found in response' };
 
   var parsed;
   try {
-    parsed = JSON.parse(trimmed);
+    parsed = JSON.parse(extracted);
   } catch (e) {
     return { ok: false, error: 'Invalid JSON: ' + e.message };
   }
@@ -420,7 +449,7 @@ function parseEditSet(text) {
   }
   if (typeof parsed.repairKind !== 'string') return { ok: false, error: 'Edit set missing required field: repairKind' };
   if (!Array.isArray(parsed.edits)) return { ok: false, error: 'Edit set missing or invalid edits array' };
-  if (!Array.isArray(parsed.newFiles)) return { ok: false, error: 'Edit set missing or invalid newFiles array' };
+  if (parsed.newFiles != null && !Array.isArray(parsed.newFiles)) return { ok: false, error: 'Edit set newFiles must be an array if present' };
   if (typeof parsed.rationale !== 'string' || parsed.rationale.trim().length === 0) return { ok: false, error: 'Edit set missing required field: rationale' };
 
   var VALID_REPAIR_KINDS = {
@@ -436,14 +465,24 @@ function parseEditSet(text) {
     if (typeof edit.oldString !== 'string') return { ok: false, error: 'edit[' + i + '] missing oldString' };
     if (typeof edit.newString !== 'string') return { ok: false, error: 'edit[' + i + '] missing newString' };
   }
-  for (var j = 0; j < parsed.newFiles.length; j++) {
-    var nf = parsed.newFiles[j];
-    if (typeof nf !== 'object' || nf === null) return { ok: false, error: 'newFiles[' + j + '] must be an object' };
-    if (typeof nf.path !== 'string') return { ok: false, error: 'newFiles[' + j + '] missing path' };
-    if (typeof nf.content !== 'string') return { ok: false, error: 'newFiles[' + j + '] missing content' };
+  if (parsed.newFiles) {
+    for (var j = 0; j < parsed.newFiles.length; j++) {
+      var nf = parsed.newFiles[j];
+      if (typeof nf !== 'object' || nf === null) return { ok: false, error: 'newFiles[' + j + '] must be an object' };
+      if (typeof nf.path !== 'string') return { ok: false, error: 'newFiles[' + j + '] missing path' };
+      if (typeof nf.content !== 'string') return { ok: false, error: 'newFiles[' + j + '] missing content' };
+    }
   }
 
-  return { ok: true, editSet: parsed };
+  // Normalize optional fields to match schema defaults
+  var normalized = {
+    repairKind: parsed.repairKind,
+    rationale: parsed.rationale,
+    edits: parsed.edits,
+    newFiles: parsed.newFiles || []
+  };
+
+  return { ok: true, editSet: normalized };
 }
 
 module.exports = {

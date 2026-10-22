@@ -616,6 +616,17 @@ function queryDependencyVersions(pkgName, fetch) {
 }
 
 /**
+ * Build the re-ask prompt with JSON schema and validation error.
+ */
+function buildReAskPrompt(validationError) {
+  var schema = '{\n  "repairKind": "source-edit|config-edit|migration|dependency-bump|dependency-patch|local-wrapper",\n  "rationale": "string",\n  "edits": [{"path": "string", "oldString": "string", "newString": "string"}],\n  "newFiles": "[optional] array of {path: string, content: string}"\n}';
+  return 'Your previous response could not be parsed as a valid edit set.\n\n' +
+    'Error: ' + validationError + '\n\n' +
+    'Required JSON structure:\n' + schema + '\n\n' +
+    'Output ONLY valid JSON that matches this structure. Do not include any explanation or prose, only the JSON object.';
+}
+
+/**
  * Compare two version strings without a dependency on semver. Returns positive
  * when b is newer than a's numeric segments are compared componentwise.
  */
@@ -838,11 +849,73 @@ async function proposeAndCheck(options) {
   // Parse edit set
   var parseResult = model.parseEditSet(modelResult.text);
   if (!parseResult.ok) {
-    return {
-      status: 'MODEL_FAILED',
-      blocker: { code: 'PARSE_ERROR', message: parseResult.error },
-      errors: ['parseEditSet failed: ' + parseResult.error]
+    // Store evidence for the failed parse (no raw content, no secrets)
+    var parseEvidence = {
+      responseLength: modelResult.text ? modelResult.text.length : 0
     };
+    try {
+      var partial = JSON.parse((modelResult.text || '{}').trim().substring(0, 500));
+      parseEvidence.topLevelKeys = Object.keys(partial).slice(0, 20);
+    } catch (e) { /* partial parse failed, keys unknown */ }
+    parseEvidence.validationRuleFailed = parseResult.error;
+
+    // Re-ask: one structured retry with JSON schema and validation error
+    var reAskPrompt = buildReAskPrompt(parseResult.error);
+    var reAskStartMs = (typeof modelNow === 'function' ? modelNow() : Date.now());
+    var reAskResult = await model.callModel({
+      prompt: reAskPrompt,
+      system: 'You are a bug fixer. Output only JSON.',
+      env: env,
+      budget: budget,
+      fetch: fetch
+    });
+    var reAskElapsedMs = (typeof modelNow === 'function' ? modelNow() : Date.now()) - reAskStartMs;
+
+    if (reAskResult.ok) {
+      var reAskParseResult = model.parseEditSet(reAskResult.text);
+      if (reAskParseResult.ok) {
+        // Re-ask succeeded - use the new result
+        modelResult = reAskResult;
+        elapsedMs = reAskElapsedMs;
+        parseResult = reAskParseResult;
+      } else {
+        // Re-ask parse failed - record REJECTED with evidence
+        writeAttemptSummary(runId, 1, {
+          status: 'REJECTED',
+          codes: ['PARSE_ERROR'],
+          requestedPaths: [],
+          candidatePaths: [],
+          tokensUsed: reAskResult.usage ? reAskResult.usage.total_tokens : null,
+          promptChars: reAskPrompt.length,
+          elapsedMs: reAskElapsedMs,
+          parseEvidence: parseEvidence
+        }, fs, now);
+        return {
+          status: 'REJECTED',
+          rejectionCodes: ['PARSE_ERROR'],
+          errors: ['parseEditSet re-ask failed: ' + reAskParseResult.error],
+          blocker: { code: 'PARSE_ERROR', message: 're-ask parse failed: ' + reAskParseResult.error, evidence: parseEvidence }
+        };
+      }
+    } else {
+      // Re-ask model call failed - record REJECTED with evidence
+      writeAttemptSummary(runId, 1, {
+        status: 'REJECTED',
+        codes: ['PARSE_ERROR'],
+        requestedPaths: [],
+        candidatePaths: [],
+        tokensUsed: null,
+        promptChars: reAskPrompt.length,
+        elapsedMs: reAskElapsedMs,
+        parseEvidence: parseEvidence
+      }, fs, now);
+      return {
+        status: 'REJECTED',
+        rejectionCodes: ['PARSE_ERROR'],
+        errors: ['model re-ask failed: ' + (reAskResult.blocker && reAskResult.blocker.message)],
+        blocker: reAskResult.blocker
+      };
+    }
   }
 
   var editSet = parseResult.editSet;
