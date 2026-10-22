@@ -1,0 +1,4 @@
+vendure-db-1  | 2026-10-21 12:00:00.001 UTC [42] ERROR:  invalid input syntax for type integer: "undefined"
+vendure-db-1  | 2026-10-21 12:00:00.002 UTC [42] CONTEXT:  unnamed portal parameter $3 = 'undefined'
+vendure-db-1  | 2026-10-21 12:00:00.003 UTC [42] STATEMENT:  SELECT * FROM "product" WHERE "product"."enabled" = $1 AND "product"."id" != $3 AND "product"."category_id" = $2 LIMIT $4
+vendure-db-1  | 2026-10-21 12:00:00.004 UTC [42] LOG:  another unrelated entry follows the error

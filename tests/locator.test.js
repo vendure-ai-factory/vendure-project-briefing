@@ -1039,9 +1039,9 @@ test('locator: per-package cap — non-stack dep capped at 3, stack pkg exempt',
     workspaceDir: workspaceDir
   });
 
-  // loud-pkg is NOT the stack package (@vendure/core is), so it must be capped at 3
+  // loud-pkg is NOT the stack package (@vendure/core is), so it must be capped at 2
   var loudCandidates = result.candidates.filter(function(c) { return c.package && c.package.indexOf('loud-pkg') !== -1; });
-  assert.strictEqual(loudCandidates.length, 3, 'loud-pkg (non-stack) must be capped at 3 candidates; got: ' + loudCandidates.length);
+  assert.strictEqual(loudCandidates.length, 2, 'loud-pkg (non-stack) must be capped at 2 candidates; got: ' + loudCandidates.length);
 
   // @vendure/core IS the stack package, so it must NOT be capped (2 files = 2 candidates)
   var vcCandidates = result.candidates.filter(function(c) { return c.package && c.package.indexOf('@vendure/core') !== -1; });

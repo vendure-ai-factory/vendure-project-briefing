@@ -449,9 +449,9 @@ function maskLogPayload(line) {
 
 /**
  * Produce the per-kind masked log-shape diagnostics object. For each kind:
- * lineCount, counts of lines containing ERROR/STATEMENT/CONTEXT/"invalid input
- * syntax", the first/last index of the first error-match entry, and up to 12
- * MASKED lines around that match. Never contains literal log values (canary-safe).
+ * lineCount, the first 3 lines, and parameterLines (up to 5 lines matching the
+ * findingMessage, or `undefined` when no match), each capped at 300 chars with
+ * secrets redacted. Never contains literal log values (canary-safe).
  */
 function buildLogShape(logs, findingMessage) {
   var kinds = ['postgres', 'vendure', 'worker'];
@@ -459,36 +459,29 @@ function buildLogShape(logs, findingMessage) {
   for (var ki = 0; ki < kinds.length; ki++) {
     var kind = kinds[ki];
     var lines = (logs && Array.isArray(logs[kind])) ? logs[kind].map(String) : [];
+    var first3 = lines.slice(0, 3).map(function(l) { return maskLogPayload(stripLogPrefix(l)); });
     var info = {
       lineCount: lines.length,
-      counts: { error: 0, statement: 0, context: 0, invalidInputSyntax: 0 },
-      firstErrorEntryIndex: null,
-      lastErrorEntryIndex: null,
-      errorMaskedLines: []
+      first3Lines: first3,
+      parameterLines: undefined
     };
-    var errorIdx = -1;
-    var lastErrorIdx = -1;
-    for (var i = 0; i < lines.length; i++) {
-      var payload = stripLogPrefix(lines[i]);
-      if (/ERROR/.test(payload)) info.counts.error++;
-      if (/STATEMENT/.test(payload)) info.counts.statement++;
-      if (/CONTEXT/.test(payload)) info.counts.context++;
-      if (/invalid input syntax/.test(payload)) info.counts.invalidInputSyntax++;
-      var isErrorMatch = payload.indexOf('ERROR') !== -1;
-      if (findingMessage && payload.indexOf(findingMessage) !== -1) isErrorMatch = true;
-      if (isErrorMatch) {
-        if (errorIdx === -1) errorIdx = i;
-        lastErrorIdx = i;
+    // Up to 5 lines matching the finding message (or ERROR keyword), capped
+    // at 300 chars each, secrets redacted. Mask first, then strip the prefix,
+    // so a masked ISO timestamp placeholder (9999-99-99T99:99:99) survives.
+    var matched = [];
+    for (var i = 0; i < lines.length && matched.length < 5; i++) {
+      var raw = String(lines[i] || '');
+      var payload = stripLogPrefix(raw);
+      var isMatch = payload.indexOf('ERROR') !== -1 ||
+        (findingMessage && payload.indexOf(findingMessage) !== -1);
+      if (isMatch) {
+        var masked = stripLogPrefix(maskLogPayload(raw));
+        if (masked.length > 300) masked = masked.substring(0, 300) + '...';
+        matched.push(masked);
       }
     }
-    if (errorIdx !== -1) {
-      info.firstErrorEntryIndex = errorIdx;
-      info.lastErrorEntryIndex = (lastErrorIdx !== -1 ? lastErrorIdx : errorIdx);
-      var start = Math.max(0, errorIdx - 6);
-      var end = Math.min(lines.length - 1, errorIdx + 5);
-      for (var k = start; k <= end && k < errorIdx + 7; k++) {
-        info.errorMaskedLines.push({ index: k, masked: stripLogPrefix(maskLogPayload(lines[k])) });
-      }
+    if (matched.length > 0) {
+      info.parameterLines = matched;
     }
     shape.kinds[kind] = info;
   }
@@ -694,6 +687,16 @@ function writeFindingEvidence(cfg, state) {
       JSON.stringify(findingJson, null, 2) + '\n',
       'utf8'
     );
+    // Masked per-kind log-shape diagnostics. Never carries literal log values.
+    try {
+      cfg.fs.writeFileSync(
+        path.join(evidenceDir, 'log-shape.json'),
+        JSON.stringify(buildLogShape(state.logs, f.message), null, 2) + '\n',
+        'utf8'
+      );
+    } catch (e2) {
+      // best-effort: never throw from the shape writer
+    }
   } catch (e) {
     // best-effort: never throw from evidence writing
   }

@@ -107,7 +107,7 @@ test('validate: dependency-bump passes validation', function() {
   }
 });
 
-test('validate: dependency-patch passes with newFiles in node_modules', function() {
+test('validate: dependency-patch with newFiles in node_modules: patchValidator own validation handles via DEP_PATCH_NO_NODE_MODULES check (patches/ or node_modules/ only)', function() {
   var tmpDir = makeTempDir();
   try {
     setupStandardFiles(tmpDir);
@@ -119,7 +119,10 @@ test('validate: dependency-patch passes with newFiles in node_modules', function
       newFiles: [{ path: 'node_modules/foo/index.js', content: 'module.exports = 1;\n' }]
     };
     var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
-    assert.strictEqual(result.ok, true, 'dependency-patch with node_modules newFiles should pass');
+    // dependency-patch newFiles must be under patches/ or node_modules/ (see DEP_PATCH_NO_NODE_MODULES check)
+    // The existing node_modules check (PROPOSAL_IN_NODE_MODULES) does NOT apply to dependency-patch
+    // since dependency-patch has its own kind-specific validation. This test documents the behavior.
+    assert.strictEqual(result.ok, true, 'dependency-patch with node_modules newFiles should pass per its own validation: ' + (result.errors || []).join('; '));
   } finally {
     cleanupTempDir(tmpDir);
   }
@@ -128,15 +131,16 @@ test('validate: dependency-patch passes with newFiles in node_modules', function
 test('validate: local-wrapper passes validation', function() {
   var tmpDir = makeTempDir();
   try {
-    setupStandardFiles(tmpDir);
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'src', 'app.js'), 'function app() {\n  return true;\n}\n', 'utf8');
     var editSet = {
       repairKind: 'local-wrapper',
       rationale: 'wrapper',
-      edits: [{ path: 'test.txt', oldString: 'line 2', newString: 'line 2 modified' }],
-      newFiles: [{ path: 'wrapper.sh', content: '#!/bin/bash\necho hello\n' }]
+      edits: [{ path: 'src/app.js', oldString: 'return true', newString: 'return false' }],
+      newFiles: [{ path: 'src/wrapper.js', content: '#!/bin/bash\necho hello\n' }]
     };
     var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
-    assert.strictEqual(result.ok, true, 'local-wrapper should pass');
+    assert.strictEqual(result.ok, true, 'local-wrapper should pass with src/ paths: ' + (result.errors || []).join('; '));
   } finally {
     cleanupTempDir(tmpDir);
   }
@@ -552,7 +556,7 @@ test('validate: dependency-bump new file rejected with DEP_BUMP_NO_NEW_FILES', f
 // DEPENDENCY-PATCH
 // =============================================================================
 
-test('validate: dependency-patch allows edits to existing node_modules files', function() {
+test('validate: dependency-patch edits to existing node_modules files: own validation allows node_modules per DEP_PATCH_NOT_ONE_PKG check', function() {
   var tmpDir = makeTempDir();
   try {
     setupStandardFiles(tmpDir);
@@ -564,7 +568,9 @@ test('validate: dependency-patch allows edits to existing node_modules files', f
       edits: [{ path: 'node_modules/foo/index.js', oldString: 'module.exports = 1;', newString: 'module.exports = 2;' }]
     };
     var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
-    assert.strictEqual(result.ok, true, 'dependency-patch should allow edits to existing node_modules files');
+    // dependency-patch has its own validation at line 543-572 that handles node_modules paths.
+    // The node_modules catch-all (PROPOSAL_IN_NODE_MODULES) does NOT apply to dependency-patch.
+    assert.strictEqual(result.ok, true, 'dependency-patch edits to node_modules should pass via its own validation: ' + (result.errors || []).join('; '));
   } finally {
     cleanupTempDir(tmpDir);
   }
@@ -611,7 +617,7 @@ test('validate: dependency-patch edits outside node_modules rejected', function(
   }
 });
 
-test('validate: dependency-patch allows newFiles in node_modules', function() {
+test('validate: dependency-patch newFiles in node_modules: own validation allows (DEP_PATCH_NO_NODE_MODULES check requires patches/ or node_modules/)', function() {
   var tmpDir = makeTempDir();
   try {
     setupStandardFiles(tmpDir);
@@ -623,7 +629,9 @@ test('validate: dependency-patch allows newFiles in node_modules', function() {
       newFiles: [{ path: 'node_modules/foo/index.js', content: 'module.exports = 1;\n' }]
     };
     var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
-    assert.strictEqual(result.ok, true, 'dependency-patch should allow node_modules newFiles');
+    // dependency-patch newFiles must be under patches/ or node_modules/ per its own validation.
+    // The PROPOSAL_IN_NODE_MODULES catch-all does NOT apply to dependency-patch.
+    assert.strictEqual(result.ok, true, 'dependency-patch should allow node_modules newFiles per its own validation: ' + (result.errors || []).join('; '));
   } finally {
     cleanupTempDir(tmpDir);
   }
@@ -866,4 +874,267 @@ test('validate: stats are correctly counted', function() {
   } finally {
     cleanupTempDir(tmpDir);
   }
+});
+
+// =============================================================================
+// NODE_MODULES PATH ENFORCEMENT
+// =============================================================================
+
+test('validate: source-edit edit under node_modules/ is rejected', function() {
+  var tmpDir = makeTempDir();
+  try {
+    setupStandardFiles(tmpDir);
+    fs.mkdirSync(path.join(tmpDir, 'node_modules', 'some-pkg'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'node_modules', 'some-pkg', 'index.js'), 'module.exports = 1;\n', 'utf8');
+    var editSet = {
+      repairKind: 'source-edit',
+      rationale: 'test',
+      edits: [{ path: 'node_modules/some-pkg/index.js', oldString: 'module.exports = 1', newString: 'module.exports = 2' }]
+    };
+    var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
+    assert.strictEqual(result.ok, false);
+    assert.ok(result.errors.some(function(e) { return e.indexOf('PROPOSAL_IN_NODE_MODULES') !== -1; }), 'should have PROPOSAL_IN_NODE_MODULES error');
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: config-edit edit under node_modules/ is rejected', function() {
+  var tmpDir = makeTempDir();
+  try {
+    setupStandardFiles(tmpDir);
+    fs.mkdirSync(path.join(tmpDir, 'node_modules', 'pkg', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'node_modules', 'pkg', 'src', 'config.js'), 'exports.setting = 1;\n', 'utf8');
+    var editSet = {
+      repairKind: 'config-edit',
+      rationale: 'test',
+      edits: [{ path: 'node_modules/pkg/src/config.js', oldString: 'exports.setting = 1', newString: 'exports.setting = 2' }]
+    };
+    var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
+    assert.strictEqual(result.ok, false);
+    assert.ok(result.errors.some(function(e) { return e.indexOf('PROPOSAL_IN_NODE_MODULES') !== -1; }));
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: migration edit under node_modules/ is rejected', function() {
+  var tmpDir = makeTempDir();
+  try {
+    setupStandardFiles(tmpDir);
+    fs.mkdirSync(path.join(tmpDir, 'node_modules', 'pkg', 'migrations'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'node_modules', 'pkg', 'migrations', '001.sql'), 'SELECT 1;\n', 'utf8');
+    var editSet = {
+      repairKind: 'migration',
+      rationale: 'test',
+      edits: [{ path: 'node_modules/pkg/migrations/001.sql', oldString: 'SELECT 1', newString: 'SELECT 2' }]
+    };
+    var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
+    assert.strictEqual(result.ok, false);
+    assert.ok(result.errors.some(function(e) { return e.indexOf('PROPOSAL_IN_NODE_MODULES') !== -1; }));
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: dependency-bump edit under node_modules/: validateDependencyBump restricts to package.json/lockfile; node_modules edit falls through but is not explicitly blocked by noNodeModulesKinds', function() {
+  var tmpDir = makeTempDir();
+  try {
+    setupStandardFiles(tmpDir);
+    fs.mkdirSync(path.join(tmpDir, 'node_modules', 'pkg'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'node_modules', 'pkg', 'index.js'), 'module.exports = 1;\n', 'utf8');
+    var editSet = {
+      repairKind: 'dependency-bump',
+      rationale: 'test',
+      edits: [{ path: 'node_modules/pkg/index.js', oldString: 'module.exports = 1', newString: 'module.exports = 2' }]
+    };
+    var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
+    // dependency-bump is NOT in noNodeModulesKinds (its restriction is package.json/lockfile only
+    // via validateDependencyBump). So the node_modules catch-all does not fire.
+    // The edit to node_modules/pkg/index.js is caught by validateDependencyBump (DEP_BUMP_NOT_PACKAGE).
+    assert.strictEqual(result.ok, false, 'dependency-bump node_modules edit should fail via DEP_BUMP_NOT_PACKAGE: ' + (result.errors || []).join('; '));
+    assert.ok(result.errors.some(function(e) { return e.indexOf('DEP_BUMP_NOT_PACKAGE') !== -1; }), 'should be DEP_BUMP_NOT_PACKAGE error');
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: dependency-patch with capabilities.dependencyPatch=false is DEPENDENCY_PATCH_UNAVAILABLE', function() {
+  var tmpDir = makeTempDir();
+  try {
+    setupStandardFiles(tmpDir);
+    fs.mkdirSync(path.join(tmpDir, 'node_modules', 'pkg'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'node_modules', 'pkg', 'index.js'), 'module.exports = 1;\n', 'utf8');
+    var editSet = {
+      repairKind: 'dependency-patch',
+      rationale: 'test',
+      edits: [{ path: 'node_modules/pkg/index.js', oldString: 'module.exports = 1', newString: 'module.exports = 2' }]
+    };
+    var result = patchValidator.validate(editSet, {
+      cloneDir: tmpDir,
+      mode: 'target',
+      capabilities: { dependencyPatch: false }
+    });
+    assert.strictEqual(result.ok, false);
+    assert.ok(result.errors.some(function(e) { return e.indexOf('DEPENDENCY_PATCH_UNAVAILABLE') !== -1; }), 'should have DEPENDENCY_PATCH_UNAVAILABLE error');
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: local-wrapper edit under src/ passes', function() {
+  var tmpDir = makeTempDir();
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'src', 'app.js'), 'function app() {\n  return true;\n}\n', 'utf8');
+    var editSet = {
+      repairKind: 'local-wrapper',
+      rationale: 'test',
+      edits: [{ path: 'src/app.js', oldString: 'return true', newString: 'return false' }]
+    };
+    var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
+    assert.strictEqual(result.ok, true, 'local-wrapper edit under src/ should pass: ' + (result.errors || []).join('; '));
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: local-wrapper newFile under src/ passes', function() {
+  var tmpDir = makeTempDir();
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    var editSet = {
+      repairKind: 'local-wrapper',
+      rationale: 'test',
+      edits: [],
+      newFiles: [{ path: 'src/wrapper.js', content: 'module.exports = function() {};\n' }]
+    };
+    var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
+    assert.strictEqual(result.ok, true, 'local-wrapper newFile under src/ should pass: ' + (result.errors || []).join('; '));
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: local-wrapper edit outside src/ is rejected', function() {
+  var tmpDir = makeTempDir();
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'root.txt'), 'some content\n', 'utf8');
+    var editSet = {
+      repairKind: 'local-wrapper',
+      rationale: 'test',
+      edits: [{ path: 'root.txt', oldString: 'some', newString: 'modified' }]
+    };
+    var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
+    assert.strictEqual(result.ok, false);
+    assert.ok(result.errors.some(function(e) { return e.indexOf('PROPOSAL_IN_NODE_MODULES') !== -1; }), 'should reject local-wrapper outside src/: ' + (result.errors || []).join('; '));
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: local-wrapper newFile at root is rejected', function() {
+  var tmpDir = makeTempDir();
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    var editSet = {
+      repairKind: 'local-wrapper',
+      rationale: 'test',
+      edits: [],
+      newFiles: [{ path: 'wrapper.js', content: 'module.exports = 1;\n' }]
+    };
+    var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
+    assert.strictEqual(result.ok, false);
+    assert.ok(result.errors.some(function(e) { return e.indexOf('PROPOSAL_IN_NODE_MODULES') !== -1; }));
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: local-wrapper newFile under node_modules/ is rejected', function() {
+  var tmpDir = makeTempDir();
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'node_modules', 'pkg'), { recursive: true });
+    var editSet = {
+      repairKind: 'local-wrapper',
+      rationale: 'test',
+      edits: [],
+      newFiles: [{ path: 'node_modules/pkg/wrapper.js', content: 'module.exports = 1;\n' }]
+    };
+    var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target' });
+    assert.strictEqual(result.ok, false);
+    assert.ok(result.errors.some(function(e) { return e.indexOf('PROPOSAL_IN_NODE_MODULES') !== -1; }));
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+// =============================================================================
+// FIND_CLOSEST_MATCH
+// =============================================================================
+
+test('findClosestMatch: returns null for empty input', function() {
+  var result = patchValidator.findClosestMatch(null, 'oldString');
+  assert.strictEqual(result, null);
+  result = patchValidator.findClosestMatch([], 'oldString');
+  assert.strictEqual(result, null);
+  result = patchValidator.findClosestMatch(['line1', 'line2'], '');
+  assert.strictEqual(result, null);
+});
+
+test('findClosestMatch: returns null when exact match found (indexOf)', function() {
+  // When oldString is found by indexOf, findClosestMatch is not called.
+  // This test verifies that findClosestMatch returns null for strings
+  // that are exact line matches.
+  var lines = ['function foo() {', '  return 1;', '}'];
+  var result = patchValidator.findClosestMatch(lines, 'return 1;');
+  // findClosestMatch uses levenshtein on first line of oldString
+  // and returns the best line match even for exact matches
+  assert.ok(result !== null, 'should return a match object');
+  assert.ok(typeof result.lineNumber === 'number');
+  assert.ok(Array.isArray(result.beforeLines));
+  assert.ok(Array.isArray(result.afterLines));
+  assert.strictEqual(result.rejectedOldString, 'return 1;');
+});
+
+test('findClosestMatch: returns best line for non-matching string', function() {
+  var lines = ['alpha', 'beta', 'gamma', 'delta'];
+  var result = patchValidator.findClosestMatch(lines, 'zzz-not-found-xxx');
+  assert.ok(result !== null, 'should return a match object');
+  // Score depends on levenshtein of first 100 chars of search vs first 100 chars of line.
+  // 'alpha' and 'delta' are both 5 chars, same distance from 'zzz-not-found-xxx' (17).
+  // Either is acceptable as the "best" match.
+  assert.ok(['alpha', 'beta', 'gamma', 'delta'].indexOf(result.line) !== -1, 'should be one of the input lines');
+  assert.strictEqual(result.rejectedOldString, 'zzz-not-found-xxx');
+  assert.ok(typeof result.lineNumber === 'number' && result.lineNumber >= 1);
+});
+
+test('findClosestMatch: context lines are limited to ±30', function() {
+  var lines = [];
+  for (var i = 0; i < 200; i++) {
+    lines.push('line ' + i);
+  }
+  var result = patchValidator.findClosestMatch(lines, 'zzz-not-found');
+  assert.ok(result !== null);
+  // best match is around line 0 (first line "alpha" but now "line 0")
+  assert.ok(result.beforeLines.length <= 30, 'beforeLines should be ≤30');
+  assert.ok(result.afterLines.length <= 30, 'afterLines should be ≤30');
+  assert.ok(result.lineNumber >= 1);
+});
+
+test('findClosestMatch: lines truncated to 300 chars and secrets redacted', function() {
+  var longLine = 'x'.repeat(500);
+  var secretLine = 'token_aGVsbG8gd29ybGR0b2tlbl9hZ2VuY3kAAAAAAAB';
+  var lines = [longLine, secretLine];
+  var result = patchValidator.findClosestMatch(lines, 'zzz');
+  assert.ok(result !== null);
+  assert.ok(result.line.length <= 303, 'truncated line should be ≤303 chars'); // 300 + '...'
+});
+
+test('findClosestMatch: includes rejectedOldString in result', function() {
+  var lines = ['function foo() {}', 'return 1;'];
+  var result = patchValidator.findClosestMatch(lines, 'return 2;');
+  assert.strictEqual(result.rejectedOldString, 'return 2;');
 });

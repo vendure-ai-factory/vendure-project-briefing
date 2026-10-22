@@ -72,9 +72,8 @@ var PROMPT_TEMPLATE = 'You are a bug fixer. Your task is to propose a JSON edit-
 '## Rules\n' +
 '- Make the smallest change possible\n' +
 '- Do not make unrelated edits\n' +
-'- Edits may only target one of the listed candidate files, or a new file under patches/, a migrations directory, or (for local-style wrappers) a new wrapper file under src/. Any other path is rejected with PROPOSAL_OUTSIDE_CANDIDATES.\n' +
-'- The local wrapper runs in-process in the same application; it must not copy secrets and must not change behavior beyond the finding.\n' +
-'- Answer with JSON only (no markdown, no explanation)\n\n' +
+'- Answer with JSON only (no markdown, no explanation)\n' +
+'{{allowedPathsPerKind}}\n' +
 '{{previousAttempts}}\n\n' +
 '## Output\n' +
 'Return a JSON object matching the Edit-Set Contract above.';
@@ -119,6 +118,21 @@ function capabilityNoteText(capabilities) {
     '- Patching a dependency inside node_modules is NOT available in this runtime: ' + (capabilities.reason || 'not applicable in this image') + '\n';
 }
 
+function allowedPathsPerKindText(opts) {
+  var d = opts || {};
+  var allowDepPatch = !d.capabilities || d.capabilities.dependencyPatch !== false;
+  var lines = ['## Allowed Paths per Kind'];
+  lines.push('- source-edit: any path EXCEPT node_modules/ and protected paths');
+  lines.push('- config-edit: any path EXCEPT node_modules/ and protected paths');
+  lines.push('- migration: under the migrations directory only');
+  lines.push('- dependency-bump: package.json and lockfile only (upgrade to a newer version)');
+  if (allowDepPatch) {
+    lines.push('- dependency-patch: files under node_modules/<pkg>/ only (apply a patch to an installed package); NOT available in all runtimes');
+  }
+  lines.push('- local-wrapper: under src/ only (creates a local in-process workaround); Reason: --ignore-scripts prevents arbitrary scripts from running, so the wrapper must be a tracked source file');
+  return lines.join('\n') + '\n';
+}
+
 
 /**
  * Format previous attempts into the prompt.
@@ -148,6 +162,31 @@ function formatPreviousAttempts(previousAttempts) {
     }
     if (attempt.errors) {
       lines.push('  errors: ' + attempt.errors);
+    }
+    // Include closest match context for OLDSTRING_NOT_FOUND rejections
+    if (attempt.rejectionCodes && attempt.rejectionCodes.indexOf('OLDSTRING_NOT_FOUND') !== -1 && attempt.closestMatch) {
+      var cm = attempt.closestMatch;
+      lines.push('  rejected oldString: ' + (cm.rejectedOldString || '').substring(0, 200));
+      lines.push('  closest match in file (line ' + cm.lineNumber + '):');
+      if (cm.beforeLines && Array.isArray(cm.beforeLines)) {
+        for (var bi = 0; bi < cm.beforeLines.length; bi++) {
+          var bLine = cm.beforeLines[bi];
+          if (bLine && typeof bLine.line === 'string') {
+            lines.push('    ' + bLine.lineNumber + ': ' + bLine.line.substring(0, 250));
+          }
+        }
+      }
+      if (cm.line) {
+        lines.push('    ' + cm.lineNumber + ': ' + cm.line.substring(0, 250) + ' <-- CLOSEST MATCH');
+      }
+      if (cm.afterLines && Array.isArray(cm.afterLines)) {
+        for (var ai = 0; ai < cm.afterLines.length; ai++) {
+          var aLine = cm.afterLines[ai];
+          if (aLine && typeof aLine.line === 'string') {
+            lines.push('    ' + aLine.lineNumber + ': ' + aLine.line.substring(0, 250));
+          }
+        }
+      }
     }
   }
   return lines.join('\n');
@@ -207,7 +246,11 @@ function formatCandidates(candidates) {
     var cand = unique[j];
     var snippet = '';
     if (cand.snippet && Array.isArray(cand.snippet)) {
-      snippet = cand.snippet.map(function(s) { return s.line; }).join('\n');
+      // Include line numbers in the snippet output: "NN: line content"
+      snippet = cand.snippet.map(function(s) {
+        var ln = s.lineNumber !== undefined ? s.lineNumber : 0;
+        return String(ln).padStart(4, ' ') + ': ' + s.line;
+      }).join('\n');
     }
     if (snippet.length > PROMPT_SNIPPET_CAP) {
       snippet = snippet.substring(0, PROMPT_SNIPPET_CAP) + '\n... (truncated)';
@@ -233,6 +276,7 @@ function buildPrompt(finding, candidates, previousAttempts, opts) {
   var allowed = opts.allowedRepairKinds || defaultAllowedRepairKinds(opts);
   var dependencyInfo = opts.dependencyInfo ? dependencyInfoText(opts.dependencyInfo) : '';
   var capabilityNote = opts.capabilities ? capabilityNoteText(opts.capabilities) : '';
+  var allowedPathsPerKind = allowedPathsPerKindText(opts);
   var prompt = PROMPT_TEMPLATE
     .replace('{{class}}', finding.class || 'unknown')
     .replace('{{message}}', finding.message || 'unknown')
@@ -246,6 +290,7 @@ function buildPrompt(finding, candidates, previousAttempts, opts) {
     .replace('{{allowedRepairKinds}}', allowed)
     .replace('{{dependencyInfo}}', dependencyInfo)
     .replace('{{capabilityNote}}', capabilityNote)
+    .replace('{{allowedPathsPerKind}}', allowedPathsPerKind)
     .replace('{{previousAttempts}}', formatPreviousAttempts(previousAttempts));
   return prompt;
 }
@@ -920,6 +965,37 @@ async function proposeAndCheck(options) {
 
   var editSet = parseResult.editSet;
 
+  // Check for identical repeat proposal: if the same repairKind+edits+newFiles
+  // appeared in a previous attempt that was rejected, reject without spending
+  // an attempt (model already "knows" this approach failed).
+  if (previousAttempts && previousAttempts.length > 0) {
+    var proposalHash = crypto.createHash('md5').update(JSON.stringify(editSet)).digest('hex');
+    for (var rpi = 0; rpi < previousAttempts.length; rpi++) {
+      var prev = previousAttempts[rpi];
+      if (prev._proposalHash && prev._proposalHash === proposalHash) {
+        // Identical proposal - reject without spending an attempt
+        var identicalResult = {
+          status: 'REJECTED',
+          rejectionCodes: ['IDENTICAL_REPEAT_PROPOSAL'],
+          errors: ['proposal is identical to a previously rejected attempt - do not repeat the same approach'],
+          blocker: { code: 'IDENTICAL_REPEAT_PROPOSAL', message: 'proposal is identical to a previously rejected attempt - do not repeat the same approach' }
+        };
+        writeAttemptSummary(runId, 1, {
+          status: 'REJECTED',
+          codes: ['IDENTICAL_REPEAT_PROPOSAL'],
+          requestedPaths: [],
+          candidatePaths: [],
+          tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+          promptChars: promptChars,
+          elapsedMs: elapsedMs
+        }, fs, now);
+        return identicalResult;
+      }
+    }
+    // Store the hash on this proposal so future attempts can detect repeats
+    editSet._proposalHash = proposalHash;
+  }
+
   // Collect the paths the model requested (trimmed to names only for evidence).
   var requestedPaths = [];
   (editSet.edits || []).forEach(function(e) { if (e && e.path) requestedPaths.push(e.path); });
@@ -956,8 +1032,10 @@ async function proposeAndCheck(options) {
   var protectedPaths = getProtectedPaths(mode, fs);
   var validationResult = validator.validate(editSet, {
     cloneDir: cloneDir,
+    requestedPaths: requestedPaths,
     protectedPaths: protectedPaths,
-    mode: mode
+    mode: mode,
+    capabilities: { dependencyPatch: capabilities.dependencyPatch }
   });
 
   if (!validationResult.ok) {

@@ -259,19 +259,19 @@ test('apply: migration applies to migration files', function() {
 // LOCAL-WRAPPER
 // =============================================================================
 
-test('apply: local-wrapper allows new files', function() {
+test('apply: local-wrapper allows new files under src/', function() {
   var tmpDir = makeTempDir();
   try {
     setupStandardFiles(tmpDir);
     var editSet = {
       repairKind: 'local-wrapper',
       rationale: 'wrapper script',
-      edits: [{ path: 'test.txt', oldString: 'line 2', newString: 'line 2 modified' }],
-      newFiles: [{ path: 'wrapper.sh', content: '#!/bin/bash\necho hello\n' }]
+      edits: [{ path: 'src/app.js', oldString: 'return true;', newString: 'return true;\n// wrapped' }],
+      newFiles: [{ path: 'src/wrapper.sh', content: '#!/bin/bash\necho hello\n' }]
     };
     var result = patchApplier.apply(editSet, { cloneDir: tmpDir });
     assert.strictEqual(result.ok, true);
-    assert.ok(fs.existsSync(path.join(tmpDir, 'wrapper.sh')));
+    assert.ok(fs.existsSync(path.join(tmpDir, 'src', 'wrapper.sh')));
   } finally {
     cleanupTempDir(tmpDir);
   }

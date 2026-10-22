@@ -33,6 +33,9 @@ function makeFakeExecCommand(results) {
 function writePkg(tmpDir, scripts) {
   fs.mkdirSync(tmpDir, { recursive: true });
   fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify({ name: 'test-project', scripts: scripts }));
+  // Provide a toolchain so the runChecks scripts execute rather than being
+  // skipped by the CHECKS_SKIPPED_NO_TOOLCHAIN gate.
+  fs.mkdirSync(path.join(tmpDir, 'node_modules'), { recursive: true });
 }
 
 test('verify: fixed - all old signatures gone', function() {
@@ -349,6 +352,63 @@ test('runChecks: runs only install/build/test scripts', async function() {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test('runChecks: missing node_modules returns CHECKS_SKIPPED_NO_TOOLCHAIN (not a failure)', async function() {
+  var tmpDir = path.join(os.tmpdir(), 'run-checks-skip-' + Date.now());
+  writePkg(tmpDir, { install: 'node --version', build: 'node -e "console.log(1)"', test: 'node -e "console.log(1)"' });
+  // Remove the node_modules the helper created so the toolchain gate fires.
+  fs.rmSync(path.join(tmpDir, 'node_modules'), { recursive: true, force: true });
+
+  var executedScripts = [];
+  var fakeExec = function(cmd, args, opts) {
+    executedScripts.push(cmd);
+    return { success: true, stdout: '', stderr: '', exitCode: 0 };
+  };
+
+  var result = await verifier.runChecks(tmpDir, {
+    execCommand: fakeExec,
+    runId: 'test-checks-skip-' + Date.now(),
+    root: TEST_EVIDENCE_ROOT
+  });
+
+  assert.strictEqual(result.ok, true, 'missing toolchain must not be reported as a failure');
+  assert.strictEqual(result.skipped, true);
+  assert.strictEqual(result.code, 'CHECKS_SKIPPED_NO_TOOLCHAIN');
+  assert.ok(result.results.length > 0);
+  result.results.forEach(function(r) {
+    assert.strictEqual(r.skipped, true);
+    assert.strictEqual(r.code, 'CHECKS_SKIPPED_NO_TOOLCHAIN');
+  });
+  assert.strictEqual(executedScripts.length, 0, 'no scripts should run without node_modules');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('runChecks: command not found (ENOENT spawn) is CHECKS_SKIPPED_NO_TOOLCHAIN, not failed', async function() {
+  var tmpDir = path.join(os.tmpdir(), 'run-checks-spawnfail-' + Date.now());
+  writePkg(tmpDir, { test: 'nonexistent-bin-xyz --flag' });
+
+  // Simulate a child 'error' event: null exit code, no output, spawn error set.
+  var fakeExec = function(cmd, args, opts) {
+    assert.strictEqual(cmd, 'nonexistent-bin-xyz');
+    return Promise.resolve({ success: false, stdout: '', stderr: '', exitCode: null, timedOut: false, error: 'spawn nonexistent-bin-xyz ENOENT' });
+  };
+
+  var result = await verifier.runChecks(tmpDir, {
+    execCommand: fakeExec,
+    runId: 'test-checks-spawnfail-' + Date.now(),
+    root: TEST_EVIDENCE_ROOT
+  });
+
+  assert.strictEqual(result.ok, true, 'spawn-not-found must not be reported as a failure');
+  assert.strictEqual(result.skipped, true);
+  assert.strictEqual(result.code, 'CHECKS_SKIPPED_NO_TOOLCHAIN');
+  assert.strictEqual(result.results[0].skipped, true);
+  assert.strictEqual(result.results[0].code, 'CHECKS_SKIPPED_NO_TOOLCHAIN');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+
 test('runChecks: index.json contains repair evidence entries', async function() {
   var tmpDir = path.join(os.tmpdir(), 'run-checks-idx-' + Date.now());
   writePkg(tmpDir, { test: 'node -e "console.log(1)"' });
@@ -499,7 +559,7 @@ test('runChecks: real child process timeout is captured', async function() {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test('runChecks: real child spawn error is captured', async function() {
+test('runChecks: real child spawn error is captured as CHECKS_SKIPPED_NO_TOOLCHAIN', async function() {
   var tmpDir = path.join(os.tmpdir(), 'run-checks-real-spawn-' + Date.now());
   writePkg(tmpDir, { test: 'definitely-not-a-real-binary-xyz --version' });
 
@@ -509,8 +569,12 @@ test('runChecks: real child spawn error is captured', async function() {
     timeout: 10000
   });
 
-  assert.strictEqual(result.ok, false);
+  assert.strictEqual(result.ok, true, 'spawn-not-found must not be a hard failure');
+  assert.strictEqual(result.skipped, true);
+  assert.strictEqual(result.code, 'CHECKS_SKIPPED_NO_TOOLCHAIN');
   assert.strictEqual(result.results[0].success, false);
+  assert.strictEqual(result.results[0].skipped, true);
+  assert.strictEqual(result.results[0].code, 'CHECKS_SKIPPED_NO_TOOLCHAIN');
   assert.ok(result.results[0].error, 'spawn error should be recorded');
 
   fs.rmSync(tmpDir, { recursive: true, force: true });

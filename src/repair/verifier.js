@@ -218,6 +218,40 @@ async function runChecks(cloneDir, options) {
   var scripts = pkg.scripts || {};
   var scriptNames = Object.keys(scripts);
 
+  // Toolchain availability gate: if no dependencies are installed, the target
+  // scripts cannot run meaningfully. This is not a failure (a fresh clone may
+  // legitimately lack node_modules); it is a skipped non-result the repair
+  // loop must treat as neutral, not as CHECKS_FAILED.
+  var hasNodeModules = fs.existsSync(path.join(cloneDir, 'node_modules'));
+  if (!hasNodeModules && scriptNames.length > 0) {
+    var skippedResults = scriptNames.map(function(n) {
+      return {
+        script: n,
+        command: null,
+        success: false,
+        exitCode: null,
+        timedOut: false,
+        skipped: true,
+        code: 'CHECKS_SKIPPED_NO_TOOLCHAIN',
+        stdout: '',
+        stderr: 'node_modules not present; skipping ' + n,
+        error: null
+      };
+    });
+    var skippedContent = JSON.stringify({ runId: runId, results: skippedResults }, null, 2) + '\n';
+    var skippedEv = writeEvidenceFile(runId, 'runChecks.json', skippedContent, options);
+    return {
+      ok: true,
+      skipped: true,
+      code: 'CHECKS_SKIPPED_NO_TOOLCHAIN',
+      runId: runId,
+      results: skippedResults,
+      evidencePath: skippedEv.path,
+      evidenceSha256: skippedEv.sha256
+    };
+  }
+
+
   var installScript = null;
   var buildScript = null;
   var testScript = null;
@@ -307,14 +341,21 @@ async function runChecks(cloneDir, options) {
     redactedOut = redactEmails(redactedOut);
     redactedErr = redactEmails(redactedErr);
 
+    // A spawn that never ran (command not found / ENOENT) surfaces as a
+    // child 'error' event with no exit code and no output. Treat it as the
+    // same non-fatal "toolchain unavailable" skip instead of a failed check.
+    var spawnFailed = execResult.exitCode === null && !(execResult.stdout || '') && !(execResult.stderr || '') && !!execResult.error;
+
     results.push({
       script: scriptName,
       command: cmd + (args.length > 0 ? ' ' + args.join(' ') : ''),
-      success: execResult.success,
+      success: !spawnFailed && execResult.success,
       exitCode: execResult.exitCode,
       timedOut: execResult.timedOut,
+      skipped: spawnFailed,
+      code: spawnFailed ? 'CHECKS_SKIPPED_NO_TOOLCHAIN' : undefined,
       stdout: redactedOut,
-      stderr: redactedErr,
+      stderr: spawnFailed ? 'command not found: ' + cmd : redactedErr,
       error: execResult.error ? redactSecrets(execResult.error, collectEnvSecrets()) : null
     });
   }
@@ -324,9 +365,12 @@ async function runChecks(cloneDir, options) {
 
   var allSuccess = results.length > 0 && results.every(function(r) { return r.success; });
   var anyTimedOut = results.some(function(r) { return r.timedOut; });
+  var allSkipped = results.length > 0 && results.every(function(r) { return r.skipped; });
 
   return {
-    ok: !anyTimedOut && allSuccess,
+    ok: allSkipped ? true : (!anyTimedOut && allSuccess),
+    skipped: allSkipped,
+    code: allSkipped ? 'CHECKS_SKIPPED_NO_TOOLCHAIN' : undefined,
     timedOut: anyTimedOut,
     runId: runId,
     results: results,

@@ -248,10 +248,10 @@ test('fixture: buildLogShape produces masked evidence with no raw values for all
     var pg = shape.kinds && shape.kinds.postgres;
     assert.ok(pg, 'shape[' + idx + '] must have postgres kind');
     assert.strictEqual(pg.lineCount, 3, 'postgres log must have 3 lines');
-    assert.ok(pg.counts && pg.counts.error >= 1, 'postgres error count must be >= 1');
-    assert.ok(pg.counts && pg.counts.context >= 1, 'postgres context count must be >= 1');
-    assert.ok(Array.isArray(pg.errorMaskedLines) && pg.errorMaskedLines.length > 0,
-      'postgres must have masked error lines');
+    assert.ok(Array.isArray(pg.first3Lines) && pg.first3Lines.length === 3,
+      'postgres must have 3 first lines');
+    assert.ok(Array.isArray(pg.parameterLines) && pg.parameterLines.length > 0,
+      'postgres must have parameter lines, got: ' + JSON.stringify(pg.parameterLines));
 
     // Canary must NEVER appear in masked output.
     var shapeJson = JSON.stringify(shape);
@@ -260,17 +260,18 @@ test('fixture: buildLogShape produces masked evidence with no raw values for all
   });
 
   // Verify masking preserves ERROR keyword and never exposes raw values.
-  var maskedLine = shape1.kinds.postgres.errorMaskedLines[0].masked;
+  var maskedLine = shape1.kinds.postgres.parameterLines[0];
+  assert.ok(typeof maskedLine === 'string', 'parameterLines entries must be strings');
   assert.ok(maskedLine.indexOf('ERROR') !== -1, 'ERROR keyword must be preserved in masked output');
   assert.ok(maskedLine.indexOf(CANARY) === -1, 'canary value must not appear in masked line');
   // Standard log: the ISO timestamp is masked to 9999-99-99T99:99:99 and that
   // placeholder survives the prefix-stripper (year 9999 is never re-stripped).
-  var maskedStd = shape3.kinds.postgres.errorMaskedLines[0].masked;
+  var maskedStd = shape3.kinds.postgres.parameterLines[0];
   assert.ok(maskedStd.indexOf('9999') !== -1, 'ISO timestamp in standard log must be masked to 9999-...');
   assert.ok(maskedStd.indexOf('9999-99-99T99:99:99') !== -1, 'ISO timestamp must retain the masked shape 9999-99-99T99:99:99');
   assert.ok(maskedStd.indexOf('ERROR') !== -1, 'ERROR keyword must be preserved in standard log masked output');
   // JSON-line log: verify timestamp masked (ISO format after JSON parsing).
-  var maskedJson = shape2.kinds.postgres.errorMaskedLines[0].masked;
+  var maskedJson = shape2.kinds.postgres.parameterLines[0];
   assert.ok(maskedJson.indexOf('ERROR') !== -1, 'ERROR keyword must be preserved in JSON-line masked output');
   assert.ok(maskedJson.indexOf(CANARY) === -1, 'canary must not appear in JSON-line masked output');
 });

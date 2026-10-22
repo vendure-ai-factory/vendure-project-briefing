@@ -10,6 +10,7 @@ var ERR_CODES = {
   SECRET_NAME: 'SECRET_NAME',
   PROTECTED_PATH: 'PROTECTED_PATH',
   KIND_NOT_ALLOWED: 'KIND_NOT_ALLOWED',
+  PROPOSAL_IN_NODE_MODULES: 'PROPOSAL_IN_NODE_MODULES',
 
   // File/content errors
   OLDSTRING_NOT_FOUND: 'OLDSTRING_NOT_FOUND',
@@ -25,6 +26,7 @@ var ERR_CODES = {
   // dependency-patch specific
   DEP_PATCH_NO_NODE_MODULES: 'DEP_PATCH_NO_NODE_MODULES',
   DEP_PATCH_NOT_ONE_PKG: 'DEP_PATCH_NOT_ONE_PKG',
+  DEPENDENCY_PATCH_UNAVAILABLE: 'DEPENDENCY_PATCH_UNAVAILABLE',
 
   // Command safety
   PACKAGE_NAME_INVALID: 'PACKAGE_NAME_INVALID',
@@ -220,10 +222,17 @@ function validateOldStringExists(filePath, oldString) {
   } catch (e) {
     return { valid: false, code: ERR_CODES.INVALID_EDIT, message: 'Could not read file: ' + filePath };
   }
-
   var idx = content.indexOf(oldString);
   if (idx === -1) {
-    return { valid: false, code: ERR_CODES.OLDSTRING_NOT_FOUND, message: 'oldString not found in file: ' + filePath };
+    // Find the closest match (Levenshtein-like: longest common subsequence)
+    // Return context around the closest match for the model's next attempt
+    var lines = content.split('\n');
+    var closestMatch = findClosestMatch(lines, oldString);
+    var errorResult = { valid: false, code: ERR_CODES.OLDSTRING_NOT_FOUND, message: 'oldString not found in file: ' + filePath };
+    if (closestMatch) {
+      errorResult.closestMatch = closestMatch;
+    }
+    return errorResult;
   }
 
   var nextIdx = content.indexOf(oldString, idx + 1);
@@ -232,6 +241,89 @@ function validateOldStringExists(filePath, oldString) {
   }
 
   return { valid: true };
+}
+
+/**
+ * Find the closest match to oldString in the file content.
+ * Returns { beforeLines, matchLine, afterLines, lineNumber } with ±30 lines of context.
+ * Lines are truncated to 300 chars max with secrets redacted.
+ */
+function findClosestMatch(lines, oldString) {
+  if (!lines || !Array.isArray(lines) || !oldString) return null;
+  var CONTEXT_LINES = 30;
+  var MAX_LINE_LEN = 300;
+  var REDACTED = '[REDACTED]';
+
+  // Simple Levenshtein distance for short strings
+  function levenshtein(a, b) {
+    if (!a || !b) return Infinity;
+    var m = a.length, n = b.length;
+    if (m === 0) return n;
+    if (n === 0) return m;
+    var dp = Array(m + 1).fill(null).map(function() { return Array(n + 1).fill(0); });
+    for (var i = 0; i <= m; i++) dp[i][0] = i;
+    for (var j = 0; j <= n; j++) dp[0][j] = j;
+    for (var ii = 1; ii <= m; ii++) {
+      for (var jj = 1; jj <= n; jj++) {
+        var cost = a[ii - 1] === b[jj - 1] ? 0 : 1;
+        dp[ii][jj] = Math.min(dp[ii - 1][jj] + 1, dp[ii][jj - 1] + 1, dp[ii - 1][jj - 1] + cost);
+      }
+    }
+    return dp[m][n];
+  }
+
+  // Score each line by similarity to oldString (line-level Levenshtein)
+  var bestLineIdx = -1;
+  var bestScore = Infinity;
+  var oldLines = oldString.split('\n');
+  var oldFirstLine = oldLines[0] || '';
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    var dist = levenshtein(line.substring(0, 100), oldFirstLine.substring(0, 100));
+    // Bonus: prefer lines that have some of the same characters in order
+    var bonus = 0;
+    for (var si = 0; si < Math.min(oldFirstLine.length, 20); si++) {
+      if (line.indexOf(oldFirstLine[si]) !== -1) bonus++;
+    }
+    var score = dist - bonus * 0.5;
+    if (score < bestScore) {
+      bestScore = score;
+      bestLineIdx = i;
+    }
+  }
+
+  if (bestLineIdx === -1) return null;
+
+  var startIdx = Math.max(0, bestLineIdx - CONTEXT_LINES);
+  var endIdx = Math.min(lines.length - 1, bestLineIdx + CONTEXT_LINES);
+
+  function truncateLine(line) {
+    if (!line) return '';
+    var truncated = line.length > MAX_LINE_LEN ? line.substring(0, MAX_LINE_LEN) + '...' : line;
+    // Redact potential secrets (long alphanumeric strings)
+    return truncated.replace(/[A-Za-z0-9+/]{20,}={0,2}/g, function(m) {
+      if (/^[A-Za-z0-9+/]+={0,2}$/.test(m)) return REDACTED;
+      return m;
+    });
+  }
+
+  var beforeLines = [];
+  for (var bi = startIdx; bi < bestLineIdx; bi++) {
+    beforeLines.push({ lineNumber: bi + 1, line: truncateLine(lines[bi]) });
+  }
+  var afterLines = [];
+  for (var ai = bestLineIdx + 1; ai <= endIdx; ai++) {
+    afterLines.push({ lineNumber: ai + 1, line: truncateLine(lines[ai]) });
+  }
+
+  return {
+    lineNumber: bestLineIdx + 1,
+    line: truncateLine(lines[bestLineIdx]),
+    beforeLines: beforeLines,
+    afterLines: afterLines,
+    rejectedOldString: oldString
+  };
 }
 
 function validateDependencyBump(editSet, cloneDir) {
@@ -411,6 +503,7 @@ function validate(editSet, options) {
   var cloneDir = options.cloneDir;
   var protectedPaths = options.protectedPaths || [];
   var mode = options.mode || 'target';
+  var capabilities = options.capabilities || {};
 
   var errors = [];
   var stats = { fileCount: 0, totalChangedLines: 0, editCount: 0, newFileCount: 0 };
@@ -476,6 +569,72 @@ function validate(editSet, options) {
       if (!depNewFilesArr[depNi].path.startsWith('patches/') && !depNewFilesArr[depNi].path.startsWith('node_modules/')) {
         errors.push({ code: ERR_CODES.DEP_PATCH_NO_NODE_MODULES, message: 'dependency-patch newFile path must be under patches/ or node_modules/: ' + depNewFilesArr[depNi].path });
       }
+    }
+  }
+
+  // node_modules path enforcement: source-edit, config-edit, and migration may NOT
+  // target node_modules/ (they are read-only context). dependency-bump,
+  // dependency-patch, and local-wrapper have their own kind-specific validation
+  // that handles node_modules paths; this catch-all only catches kinds that have
+  // NO other node_modules handling.
+  // - dependency-patch when not available in this runtime → DEPENDENCY_PATCH_UNAVAILABLE.
+  // - local-wrapper: edits/newFiles must be under src/ (tracked source only).
+  // - dependency-bump: already restricted to package.json/lockfile by validateDependencyBump.
+  var editSetKind = editSet.repairKind;
+  var allEdits = edits || [];
+  var allNewFiles = newFiles || [];
+
+  // DEPENDENCY_PATCH_UNAVAILABLE: only for dependency-patch when explicitly disabled
+  if (editSetKind === 'dependency-patch' && capabilities.dependencyPatch === false) {
+    errors.push({ code: ERR_CODES.DEPENDENCY_PATCH_UNAVAILABLE, message: 'dependency-patch is not available in this runtime' });
+  }
+
+  // node_modules catch-all: ALL repair kinds are restricted from node_modules/
+  // by default. Each kind has its own specific path validation, but the
+  // node_modules restriction is universal:
+  // - dependency-bump: already restricted to package.json/lockfile by validateDependencyBump
+  // - dependency-patch: needs node_modules for its patches
+  // - local-wrapper: src/-only enforced separately below
+  // Only source-edit, config-edit, migration get PROPOSAL_IN_NODE_MODULES here.
+  var noNodeModulesKinds = {
+    'source-edit': true,
+    'config-edit': true,
+    'migration': true
+  };
+  if (noNodeModulesKinds[editSetKind]) {
+    function checkNodeModulesPath(pathStr) {
+      if (!pathStr || pathStr.indexOf('node_modules/') === -1) return null;
+      return { code: ERR_CODES.PROPOSAL_IN_NODE_MODULES, message: 'Paths under node_modules/ are not allowed for repairKind "' + editSetKind + '" (node_modules is read-only; use dependency-bump, dependency-patch, or local-wrapper if appropriate)' };
+    }
+    for (var nmI = 0; nmI < allEdits.length; nmI++) {
+      var nmErr = checkNodeModulesPath(allEdits[nmI].path || '');
+      if (nmErr) { errors.push(nmErr); break; }
+    }
+    for (var nmJ = 0; nmJ < allNewFiles.length; nmJ++) {
+      var nmNewErr = checkNodeModulesPath(allNewFiles[nmJ].path || '');
+      if (nmNewErr) { errors.push(nmNewErr); break; }
+    }
+  }
+
+  // local-wrapper: all edits and newFiles must be under src/
+  if (editSetKind === 'local-wrapper') {
+    function checkSrcOnly(pathStr) {
+      if (!pathStr) return null;
+      var normalized = pathStr.replace(/\\/g, '/');
+      // Allow paths starting with src/ (or src\ on Windows)
+      if (normalized.startsWith('src/') || normalized.startsWith('src\\')) return null;
+      return {
+        code: ERR_CODES.PROPOSAL_IN_NODE_MODULES,
+        message: 'local-wrapper repairKind can only edit or create files under src/ (tracked source), but got: ' + pathStr + '. Reason: local wrappers are in-process fixes; --ignore-scripts prevents arbitrary scripts from running.'
+      };
+    }
+    for (var lceI = 0; lceI < allEdits.length; lceI++) {
+      var lceErr = checkSrcOnly(allEdits[lceI].path || '');
+      if (lceErr) { errors.push(lceErr); break; }
+    }
+    for (var lcnI = 0; lcnI < allNewFiles.length; lcnI++) {
+      var lcnErr = checkSrcOnly(allNewFiles[lcnI].path || '');
+      if (lcnErr) { errors.push(lcnErr); break; }
     }
   }
 
@@ -578,6 +737,7 @@ function validate(editSet, options) {
   // STEP 3: oldString validation (only for existing files, after path rules STEP)
   // This runs AFTER path validation ensures the file is in an allowed location
 
+  var pathFileMapKeys = Object.keys(pathFileMap);
   for (var pathKey in pathFileMap) {
     if (pathFileMap.hasOwnProperty(pathKey)) {
       var fileInfo = pathFileMap[pathKey];
@@ -622,5 +782,6 @@ module.exports = {
   validate: validate,
   ALLOWED_REPAIR_KINDS: ALLOWED_REPAIR_KINDS,
   isSecretLookingName: isSecretLookingName,
-  ERR_CODES: ERR_CODES
+  ERR_CODES: ERR_CODES,
+  findClosestMatch: findClosestMatch
 };

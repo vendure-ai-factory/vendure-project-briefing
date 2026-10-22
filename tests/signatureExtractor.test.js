@@ -51,6 +51,29 @@ test('signatureExtractor: WITH_SQL when logExcerpt has valid Postgres context an
   done();
 });
 
+test('signatureExtractor: docker-compose prefixed log strips container prefix and parses SQL', function(t, done) {
+  var apiErrorFixture = JSON.parse(loadFixture('apiError.json'));
+  var logExcerpt = loadFixture('postgres-docker-log.txt');
+  var input = {
+    apiErrors: apiErrorFixture.errors,
+    logExcerpt: logExcerpt,
+    operationName: 'GetProducts',
+    query: 'query GetProducts { products(filter: { id: $id }) { id } }'
+  };
+  var result = signatureExtractor.extractFinding(input);
+
+  assert.strictEqual(result.class, 'SQL_PARAM_TYPE', 'class should be SQL_PARAM_TYPE');
+  assert.strictEqual(result.confidence, 'WITH_SQL', 'confidence should be WITH_SQL when container prefix present');
+  assert.strictEqual(result.sql.column, 'id', 'column should be id');
+  assert.strictEqual(result.sql.operator, '!=', 'operator should be !=');
+  assert.strictEqual(result.sql.paramIndex, 3, 'paramIndex should be 3');
+  assert.ok(result.sql.statement && result.sql.statement.includes('"product"'),
+    'statement should contain product table: ' + result.sql.statement);
+  // The trailing LOG entry must not be swallowed into the statement capture.
+  assert.ok(result.sql.statement.indexOf('unrelated') === -1, 'statement should stop at the next timestamp entry');
+  done();
+});
+
 test('signatureExtractor: malformed input -> class UNKNOWN, note added', function(t, done) {
   var malformedFixture = JSON.parse(loadFixture('malformed.json'));
   var input = {

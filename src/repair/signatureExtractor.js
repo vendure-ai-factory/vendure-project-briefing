@@ -380,10 +380,36 @@ function parseApiErrorsIntegerMismatch(errors) {
   return null;
 }
 
+/**
+ * Strip a leading docker-compose container prefix (e.g. 'vendure-db-1  | ')
+ * from each line so the Postgres CONTEXT/STATEMENT regexes see the raw log
+ * line. No-op for lines without the prefix.
+ */
+function stripContainerPrefix(line) {
+  if (!line || typeof line !== 'string') {
+    return line;
+  }
+  // Match a container name followed by one or more spaces, '|', and space(s).
+  var m = line.match(/^\S+\s*\|\s?(.*)$/);
+  return m ? m[1] : line;
+}
+
+function stripContainerPrefixAll(text) {
+  if (!text || typeof text !== 'string') {
+    return text;
+  }
+  return text.split('\n').map(stripContainerPrefix).join('\n');
+}
+
 function parseLogExcerpt(logExcerpt) {
   if (!logExcerpt || typeof logExcerpt !== 'string') {
     return null;
   }
+  // Docker-compose prefixes the log lines with '<container> | '. Strip that
+  // prefix from every line so the timestamp/severity-anchored regexes below
+  // see a plain Postgres log entry, otherwise the STATEMENT capture swallows
+  // the following prefixed lines (they no longer start with YYYY-MM-DD).
+  logExcerpt = stripContainerPrefixAll(logExcerpt);
   // Find all CONTEXT with unnamed portal parameter $N (optional = 'value').
   // Postgres emits both "unnamed portal parameter $N" and
   // "unnamed portal parameter $N = 'value'". Prefer the LAST context in the

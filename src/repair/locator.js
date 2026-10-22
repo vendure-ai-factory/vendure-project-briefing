@@ -220,8 +220,9 @@ function getContextLines(filePath, targetLine, matchedPattern) {
   try {
     var content = fs.readFileSync(filePath, 'utf8');
     var lines = content.split('\n');
-    var startLine = Math.max(0, targetLine - 1 - 15); // 15 lines before
-    var endLine = Math.min(lines.length - 1, targetLine - 1 + 15); // 15 lines after
+    var CONTEXT_LINES = 30;
+    var startLine = Math.max(0, targetLine - 1 - CONTEXT_LINES); // 30 lines before
+    var endLine = Math.min(lines.length - 1, targetLine - 1 + CONTEXT_LINES); // 30 lines after
     var context = [];
     for (var i = startLine; i <= endLine; i++) {
       context.push({ line: lines[i], lineNumber: i + 1 });
@@ -1135,10 +1136,11 @@ async function locateCandidates(options) {
         }
       }
     }
-    var MAX_PER_PKG = 3;
+    var MAX_PER_PKG = 2;
+    var MAX_TOTAL_CANDIDATES = 8;
     var pkgCounts = {};
     var finalCandidates = [];
-    for (var ci = 0; ci < candidates.length; ci++) {
+    for (var ci = 0; ci < candidates.length && finalCandidates.length < MAX_TOTAL_CANDIDATES; ci++) {
       var cand = candidates[ci];
       if (cand.source === 'dependency') {
         var candPkg = cand.package || '';
@@ -1200,12 +1202,13 @@ function writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candida
     candidateNotFound: packageNotes || [],
     packageStatuses: packageStatuses || [],
     candidates: (candidates || []).map(function(c) {
+      var snippetArr = c.snippet && Array.isArray(c.snippet) ? c.snippet : null;
       return {
         source: c.source,
         package: c.package,
         file: c.file,
         line: c.line,
-        snippet: null,
+        snippetLines: snippetArr ? snippetArr.length : 0,
         score: c.score,
         reasons: c.reasons
       };
