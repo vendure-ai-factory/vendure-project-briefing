@@ -7,6 +7,7 @@ evaluation-demo/migration-input/**/*.psd
 pipeline/*
 !pipeline/run-staging.mjs
 !pipeline/run-repair.mjs
+!pipeline/model-constraint-test.mjs
 !pipeline/seed/
 !pipeline/seed/staging-seed.v1.json
 workspace/

@@ -410,6 +410,8 @@ function parseLogExcerpt(logExcerpt) {
   // see a plain Postgres log entry, otherwise the STATEMENT capture swallows
   // the following prefixed lines (they no longer start with YYYY-MM-DD).
   logExcerpt = stripContainerPrefixAll(logExcerpt);
+
+  // Approach 1: CONTEXT-style (from Postgres JDBC driver / parameter portals).
   // Find all CONTEXT with unnamed portal parameter $N (optional = 'value').
   // Postgres emits both "unnamed portal parameter $N" and
   // "unnamed portal parameter $N = 'value'". Prefer the LAST context in the
@@ -420,32 +422,92 @@ function parseLogExcerpt(logExcerpt) {
   while ((cm = contextRegex.exec(logExcerpt)) !== null) {
     contextMatches.push({ after: contextRegex.lastIndex, paramIndex: parseInt(cm[1], 10), paramValue: cm[2] || null });
   }
-  if (contextMatches.length === 0) {
-    return null;
+  if (contextMatches.length > 0) {
+    var lastCtx = contextMatches[contextMatches.length - 1];
+    var paramIndex = lastCtx.paramIndex;
+    // Find the STATEMENT after that CONTEXT: capture until the next timestamp
+    // line (YYYY-MM-DD), a blank line, or end, without swallowing later entries.
+    var rest = logExcerpt.substring(lastCtx.after);
+    var statementMatch = rest.match(/STATEMENT:\s*([\s\S]*?)(?=^\d{4}-\d{2}-\d{2}\b|\n\s*\n|$)/m);
+    if (statementMatch) {
+      var statement = statementMatch[1].trim();
+      // Extract the condition that references the specific parameter $N:
+      // "<table>"."<col>" != $N style, handling quoted and plain identifiers.
+      var condRegex = new RegExp('("(?:[^"]|"")+"(?:\\.\\"[^"]+\\")*|"[^"]+"|[\\w.]+)\\s*(!==|!=|>=|<=|LIKE|ILIKE|NOT LIKE|NOT ILIKE|=)\\s*\\$' + paramIndex + '(?!\\d)', 'g');
+      var condMatch;
+      while ((condMatch = condRegex.exec(statement)) !== null) {
+        var colRaw = condMatch[1].replace(/"/g, '');
+        var colParts = colRaw.split('.');
+        var column = colParts.length > 1 ? colParts[colParts.length - 1] : colRaw;
+        var operator = condMatch[2].trim();
+        var truncStmt = statement.length > 300 ? statement.substring(0, 300) + '...' : statement;
+        truncStmt = truncStmt.replace(/'[^']*'/g, '<val>').replace(/(?<!\$)\b\d+\b/g, '<val>');
+        return { statement: truncStmt, column: column, operator: operator, paramIndex: paramIndex };
+      }
+    }
   }
-  var lastCtx = contextMatches[contextMatches.length - 1];
-  var paramIndex = lastCtx.paramIndex;
-  // Find the STATEMENT after that CONTEXT: capture until the next timestamp
-  // line (YYYY-MM-DD), a blank line, or end, without swallowing later entries.
-  var rest = logExcerpt.substring(lastCtx.after);
-  var statementMatch = rest.match(/STATEMENT:\s*([\s\S]*?)(?=^\d{4}-\d{2}-\d{2}\b|\n\s*\n|$)/m);
-  if (!statementMatch) {
-    return null;
-  }
-  var statement = statementMatch[1].trim();
-  // Extract the condition that references the specific parameter $N:
-  // "<table>"."<col>" != $N style, handling quoted and plain identifiers.
-  var condRegex = new RegExp('("(?:[^"]|"")+"(?:\\.\\"[^"]+\\")*|"[^"]+"|[\\w.]+)\\s*(!==|!=|>=|<=|LIKE|ILIKE|NOT LIKE|NOT ILIKE|=)\\s*\\$' + paramIndex + '(?!\\d)', 'g');
-  var condMatch;
-  while ((condMatch = condRegex.exec(statement)) !== null) {
-    var colRaw = condMatch[1].replace(/"/g, '');
-    var colParts = colRaw.split('.');
-    var column = colParts.length > 1 ? colParts[colParts.length - 1] : colRaw;
-    var operator = condMatch[2].trim();
+
+  // Approach 2: ERROR/DETAIL/STATEMENT style (direct Postgres log output).
+  // Example:
+  //   ERROR: 23505: duplicate key value violates unique constraint "idx_product_slug"
+  //   DETAIL: Key (slug)=(nail-art-001) already exists.
+  //   STATEMENT: INSERT INTO "product" ("id", "name", "slug", ...) VALUES ($1, $2, $3, ...)
+  var errorMatch = logExcerpt.match(/ERROR:\s*(\d+[A-Z]?):\s*(.+?)(?:\n|DETAIL)/i);
+  var detailMatch = logExcerpt.match(/DETAIL:\s*Key\s+\(([^)]+)\)=\(([^)]+)\)/);
+  var stmtMatch = logExcerpt.match(/STATEMENT:\s*([\s\S]*?)(?=^\d{4}-\d{2}-\d{2}\b|\n\s*\n|$)/m);
+
+  if (errorMatch && detailMatch && stmtMatch) {
+    var sqlstate = errorMatch[1];
+    var errorMsg = errorMatch[2].trim();
+    var detailColumn = detailMatch[1];
+    var detailValue = detailMatch[2];
+    var statement = stmtMatch[1].trim();
+
+    // Derive operator from error message (constraint violation keywords).
+    var operator = 'violation';
+    if (/unique.*constraint|duplicate.*key/i.test(errorMsg)) {
+      operator = 'unique constraint';
+    } else if (/foreign.*key/i.test(errorMsg)) {
+      operator = 'foreign key';
+    } else if (/check.*constraint/i.test(errorMsg)) {
+      operator = 'check constraint';
+    }
+
+    // Try to find paramIndex by matching DETAIL column to INSERT column list.
+    // INSERT INTO t (col1, col2, col3) VALUES ($1, $2, $3) -> col2 is $2
+    var paramIndex = null;
+    // Match: INSERT INTO "table" ("col1", "col2") VALUES ($1, $2)
+    var insertMatch = statement.match(/INSERT\s+INTO\s+"[^"]+"\s*\(([^)]+)\)\s*VALUES\s*\(/i);
+    if (insertMatch) {
+      var cols = insertMatch[1].split(',').map(function(c) { return c.replace(/"/g, '').trim().toLowerCase(); });
+      var detailColLower = detailColumn.toLowerCase();
+      for (var ci = 0; ci < cols.length; ci++) {
+        if (cols[ci] === detailColLower) {
+          paramIndex = ci + 1; // 1-based $N
+          break;
+        }
+      }
+    }
+    // Also check UPDATE ... SET col = $N style
+    if (paramIndex === null) {
+      var setMatch = statement.match(/SET\s+(.*?)\s*WHERE/i);
+      if (setMatch) {
+        var setParts = setMatch[1].split(',');
+        for (var si = 0; si < setParts.length; si++) {
+          var colMatch = setParts[si].match(/"([^"]+)"\s*=/);
+          if (colMatch && colMatch[1].toLowerCase() === detailColumn.toLowerCase()) {
+            paramIndex = si + 1;
+            break;
+          }
+        }
+      }
+    }
+
     var truncStmt = statement.length > 300 ? statement.substring(0, 300) + '...' : statement;
     truncStmt = truncStmt.replace(/'[^']*'/g, '<val>').replace(/(?<!\$)\b\d+\b/g, '<val>');
-    return { statement: truncStmt, column: column, operator: operator, paramIndex: paramIndex };
+    return { statement: truncStmt, column: detailColumn, operator: operator, paramIndex: paramIndex };
   }
+
   return null;
 }
 

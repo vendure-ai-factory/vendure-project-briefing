@@ -1120,6 +1120,80 @@ async function locateCandidates(options) {
     }
     candidates = candidates.filter(function(c) { return c !== null; });
 
+    // --- (b2) Add src/ files that import dependency packages as candidates ---
+    // When a bug is in node_modules/<pkg>, the fix may be a local-wrapper in src/
+    // that imports/registers the dependency. Find src/ files that import each
+    // dependency package we found and add them as candidates with snippets.
+    if (candidates.length > 0) {
+      // Collect unique dependency package names from candidates
+      var depPkgs = {};
+      for (var depIdx = 0; depIdx < candidates.length; depIdx++) {
+        var c = candidates[depIdx];
+        if (c.source === 'dependency' && c.package) {
+          // c.package is like 'lodash@4.17.21', extract just 'lodash'
+          var pkgBase = c.package.replace(/@[^@]+$/, '');
+          depPkgs[pkgBase] = true;
+        }
+      }
+      var depPkgNames = Object.keys(depPkgs);
+
+      // If we found dependency packages, search src/ for files that import them
+      if (depPkgNames.length > 0) {
+        // Get list of src/ files to search
+        var srcDir = path.join(targetRoot, 'src');
+        var srcFiles = [];
+        try {
+          srcFiles = findSourceFiles(srcDir, []);
+        } catch (e) { /* ignore */ }
+
+        // For each package, find src/ files that import it
+        for (var pi = 0; pi < depPkgNames.length; pi++) {
+          var pkgName = depPkgNames[pi];
+          // Build patterns to find imports of this package
+          var importPatterns = [
+            "require('" + pkgName + "')",
+            'require("' + pkgName + '")',
+            "from '" + pkgName + "'",
+            'from "' + pkgName + '"',
+            "import '" + pkgName + "'",
+            'import "' + pkgName + '"',
+            'register(\'' + pkgName + '\')',
+            'register("' + pkgName + '")'
+          ];
+
+          for (var fi = 0; fi < srcFiles.length; fi++) {
+            var srcFile = srcFiles[fi];
+            // Skip if already a candidate (avoid duplicates)
+            var alreadyCandidate = candidates.some(function(c) {
+              return c.file === srcFile;
+            });
+            if (alreadyCandidate) continue;
+
+            // Search for import patterns
+            var matches = searchFileForPatterns(srcFile, importPatterns);
+            if (matches.length > 0) {
+              var context = getContextLines(srcFile, matches[0].lineNumber, matches[0].matchedPattern);
+              var relFile = path.relative(targetRoot, srcFile).replace(/\\/g, '/');
+              candidates.push({
+                source: 'import',
+                package: pkgName,
+                file: relFile,
+                line: matches[0].lineNumber,
+                snippet: context.snippet,
+                score: 50, // Moderate score - import site is relevant but not the bug site
+                reasons: ['imports: ' + pkgName],
+                why: 'src/ file that imports dependency ' + pkgName + ': ' + relFile + ':' + matches[0].lineNumber
+              });
+              // Add to searched list
+              if (searched.indexOf(relFile) === -1) {
+                searched.push(relFile);
+              }
+            }
+          }
+        }
+      }
+    }
+
     // --- (c) Per-package cap (stack package is exempt) ---
     // Identify the stack package from finding.stack (look for node_modules pattern)
     var stackPackage = null;

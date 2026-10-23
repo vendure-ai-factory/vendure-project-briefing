@@ -10,6 +10,18 @@ var REDACTED_MARKER = '[REDACTED]';
 var MAX_RAW_LOG = 500;
 var fetchUtil = require('./fetchUtil');
 
+/**
+ * Resolve the configured repair model. REPAIR_MODEL comes first (the env object
+ * passed in, then process.env), with the current model as the default.
+ */
+function resolveConfiguredModel(env) {
+  if (env && typeof env.REPAIR_MODEL === 'string' && env.REPAIR_MODEL !== '') return env.REPAIR_MODEL;
+  if (typeof process !== 'undefined' && process.env && typeof process.env.REPAIR_MODEL === 'string' && process.env.REPAIR_MODEL !== '') {
+    return process.env.REPAIR_MODEL;
+  }
+  return MODEL_CONSTANT;
+}
+
 var BUDGET_SCHEMA = {
   perSignature: 3,
   global: 15,
@@ -89,17 +101,21 @@ function callModel(opts) {
     });
   }
 
-  // Model constant enforcement: refuse any caller-supplied model option
-  if (opts.model !== undefined && opts.model !== MODEL_CONSTANT) {
+  // Model lock: the caller may only request the configured repair model
+  // (REPAIR_MODEL, defaulting to the model constant). Any other caller-supplied
+  // model is refused before a fetch is attempted.
+  var configuredModel = resolveConfiguredModel(env);
+  if (opts.model !== undefined && opts.model !== configuredModel) {
     return Promise.resolve({
       ok: false,
       blocker: {
         code: 'MODEL_NOT_ALLOWED',
-        message: 'Only model "' + MODEL_CONSTANT + '" is accepted; got "' + opts.model + '"',
+        message: 'Only model "' + configuredModel + '" is accepted; got "' + opts.model + '"',
         evidence: {}
       }
     });
   }
+  var usedModel = opts.model !== undefined ? opts.model : configuredModel;
 
   var apiKey;
   if (typeof env === 'object' && env !== null && env.OPENROUTER_API_KEY) {
@@ -167,8 +183,12 @@ function callModel(opts) {
 
   function buildBody() {
     var b = {
-      model: MODEL_CONSTANT,
-      messages: messages
+      model: usedModel,
+      messages: messages,
+      provider: {
+        data_collection: 'deny',
+        require_parameters: true
+      }
     };
     if (!dropped.max_tokens) b.max_tokens = MAX_TOKENS;
     if (!dropped.reasoning) b.reasoning = REASONING_EFFORT;
@@ -218,8 +238,9 @@ function callModel(opts) {
           blocker: {
             code: 'MODEL_TIMEOUT',
             message: 'OpenRouter request timed out after ' + Math.round(elapsedMs / 1000) + 's',
-            evidence: { stage: 'model', host: host, elapsedMs: elapsedMs, promptChars: promptChars, attempt: attempt }
-          }
+            evidence: { stage: 'model', host: host, elapsedMs: elapsedMs, promptChars: promptChars, attempt: attempt, requestedModel: usedModel }
+          },
+          requestedModel: usedModel
         };
       }
       return {
@@ -227,8 +248,9 @@ function callModel(opts) {
         blocker: {
           code: 'NETWORK_ERROR',
           message: 'Failed to reach OpenRouter: ' + fetchErr.message,
-          evidence: { stage: 'model', host: host, method: 'POST', elapsedMs: elapsedMs, promptChars: promptChars, attempt: attempt }
-        }
+          evidence: { stage: 'model', host: host, method: 'POST', elapsedMs: elapsedMs, promptChars: promptChars, attempt: attempt, requestedModel: usedModel }
+        },
+        requestedModel: usedModel
       };
     }).finally(function() {
       _clearTimeout(timerId);
@@ -283,9 +305,10 @@ function callModel(opts) {
         blocker: {
           code: 'HTTP_' + status,
           message: 'OpenRouter API returned ' + status + ' (' + reason + ')',
-          evidence: Object.assign({ stage: 'model', host: host, promptChars: meta.promptChars, attempt: meta.attempt },
+          evidence: Object.assign({ stage: 'model', host: host, promptChars: meta.promptChars, attempt: meta.attempt, requestedModel: usedModel },
             fetchUtil.fetchEvidence('model', 'POST', API_URL, response, reason))
-        }
+        },
+        requestedModel: usedModel
       };
     }
 
@@ -299,20 +322,25 @@ function callModel(opts) {
         reason2 = 'unexpected status';
       }
       var message = 'OpenRouter API returned ' + status + ' (' + reason2 + ')';
-      var evidence = Object.assign({ stage: 'model', host: host, promptChars: meta.promptChars, attempt: meta.attempt },
+      var evidence = Object.assign({ stage: 'model', host: host, promptChars: meta.promptChars, attempt: meta.attempt, requestedModel: usedModel },
         fetchUtil.fetchEvidence('model', 'POST', API_URL, response, reason2));
 
       // Detect provider rejection of an optional parameter (reasoning,
-      // response_format, max_tokens) so we can retry without it.
+      // response_format, max_tokens) so we can retry without it. An isolated
+      // "no eligible provider" error is recorded as its own code (the provider
+      // preferences cannot be satisfied) and never retried.
       if (status === 400 || status === 422) {
         return readBody(response).then(function(bodyResult) {
           var errBody = '';
           if (bodyResult.ok && bodyResult.text) errBody = bodyResult.text;
           else if (bodyResult.ok && bodyResult.json) { try { errBody = JSON.stringify(bodyResult.json); } catch (e) { errBody = ''; } }
-          return { ok: false, retryDrop: detectRejectedParam(errBody), blocker: { code: 'HTTP_' + status, message: message, evidence: evidence } };
+          if (detectNoEligibleProvider(errBody)) {
+            return { ok: false, requestedModel: usedModel, blocker: { code: 'MODEL_NO_ELIGIBLE_PROVIDER', message: 'no eligible provider for model ' + usedModel + ' matching the data collection policy and required parameters', evidence: evidence } };
+          }
+          return { ok: false, retryDrop: detectRejectedParam(errBody), requestedModel: usedModel, blocker: { code: 'HTTP_' + status, message: message, evidence: evidence } };
         });
       }
-      return { ok: false, blocker: { code: 'HTTP_' + status, message: message, evidence: evidence } };
+      return { ok: false, requestedModel: usedModel, blocker: { code: 'HTTP_' + status, message: message, evidence: evidence } };
     }
 
     return readBody(response).then(function(bodyResult) {
@@ -338,9 +366,22 @@ function callModel(opts) {
         ((typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : 0) +
          (typeof usage.completion_tokens === 'number' ? usage.completion_tokens : 0));
       budget.model.used += totalTokens;
+
+      // Record the requested model, the model actually served, and the
+      // provider name OpenRouter returned (when it returns one).
+      var servedModel = typeof data.model === 'string' && data.model !== '' ? data.model : usedModel;
+      var providerName = null;
+      if (data.provider != null) {
+        if (typeof data.provider === 'string') providerName = data.provider;
+        else if (typeof data.provider === 'object' && typeof data.provider.name === 'string') providerName = data.provider.name;
+      }
+
       return {
         ok: true,
         text: data.choices[0].message.content || '',
+        requestedModel: usedModel,
+        model: servedModel,
+        provider: providerName,
         usage: {
           prompt_tokens: usage.prompt_tokens || 0,
           completion_tokens: usage.completion_tokens || 0,
@@ -378,6 +419,24 @@ function detectRejectedParam(errBody) {
     if (hit) return entry.key;
   }
   return null;
+}
+
+/**
+ * Detect whether OpenRouter rejected the request because no eligible provider
+ * satisfies the provider preferences (data_collection deny / require_parameters
+ * true). Returns true only for the isolated no-eligible-provider case so it can
+ * be recorded as MODEL_NO_ELIGIBLE_PROVIDER instead of a generic HTTP error.
+ */
+function detectNoEligibleProvider(errBody) {
+  if (!errBody || typeof errBody !== 'string') return false;
+  var lower = errBody.toLowerCase();
+  if (lower.indexOf('no providers') !== -1 || lower.indexOf('no provider') !== -1) return true;
+  if (lower.indexOf('eligible') !== -1 && lower.indexOf('provider') !== -1) return true;
+  if (lower.indexOf('provider preference') !== -1) return true;
+  if (lower.indexOf('data policy') !== -1) return true;
+  if ((lower.indexOf('data_collection') !== -1 || lower.indexOf('data collection') !== -1) && lower.indexOf('deny') !== -1) return true;
+  if (lower.indexOf('require_parameters') !== -1 || lower.indexOf('require parameters') !== -1) return true;
+  return false;
 }
 
 /**
@@ -491,6 +550,8 @@ module.exports = {
   consume: consume,
   BUDGET_SCHEMA: BUDGET_SCHEMA,
   MODEL_CONSTANT: MODEL_CONSTANT,
+  resolveConfiguredModel: resolveConfiguredModel,
+  detectNoEligibleProvider: detectNoEligibleProvider,
   REDACTED_MARKER: REDACTED_MARKER,
   SIGNAL_TIMEOUT_MS: SIGNAL_TIMEOUT_MS,
   DEFAULT_TIMEOUT_MS: DEFAULT_TIMEOUT_MS,

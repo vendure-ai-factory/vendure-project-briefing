@@ -65,6 +65,19 @@ var SECRET_NAME_PATTERNS = [
   /credential/i
 ];
 
+/**
+ * List only the repair kinds that are currently available. The runtime may
+ * switch dependency-patch off (--ignore-scripts image), so rejection messages
+ * must not advertise a kind the model can never use.
+ */
+function currentlyAvailableKinds(capabilities) {
+  var kinds = Object.keys(ALLOWED_REPAIR_KINDS).sort();
+  if (capabilities && capabilities.dependencyPatch === false) {
+    kinds = kinds.filter(function(k) { return k !== 'dependency-patch'; });
+  }
+  return kinds;
+}
+
 function isSecretLookingName(filePath) {
   var name = path.basename(filePath);
   for (var i = 0; i < SECRET_NAME_PATTERNS.length; i++) {
@@ -523,7 +536,7 @@ function validate(editSet, options) {
   if (!editSet.repairKind) {
     errors.push({ code: ERR_CODES.MISSING_REPAIR_KIND, message: 'editSet.repairKind is required' });
   } else if (!ALLOWED_REPAIR_KINDS[editSet.repairKind]) {
-    errors.push({ code: ERR_CODES.INVALID_REPAIR_KIND, message: 'repairKind must be one of: ' + Object.keys(ALLOWED_REPAIR_KINDS).join(', ') + ', got: ' + editSet.repairKind });
+    errors.push({ code: ERR_CODES.INVALID_REPAIR_KIND, message: 'repairKind must be one of: ' + currentlyAvailableKinds(capabilities).join(', ') + ', got: ' + editSet.repairKind });
   }
 
   var edits = editSet.edits;
@@ -589,6 +602,27 @@ function validate(editSet, options) {
     errors.push({ code: ERR_CODES.DEPENDENCY_PATCH_UNAVAILABLE, message: 'dependency-patch is not available in this runtime' });
   }
 
+  // When dependency-patch is unavailable, patch files can never be applied, so
+  // NO repair kind may add or edit files under patches/ (they would be inert).
+  if (capabilities.dependencyPatch === false) {
+    function checkPatchesPath(pathStr) {
+      if (!pathStr) return null;
+      var normalized = pathStr.replace(/\\/g, '/');
+      if (normalized.indexOf('patches/') === 0) {
+        return { code: ERR_CODES.DEPENDENCY_PATCH_UNAVAILABLE, message: 'dependency-patch is not available in this runtime; files under patches/ are not allowed (got: ' + pathStr + ')' };
+      }
+      return null;
+    }
+    for (var pEd = 0; pEd < allEdits.length; pEd++) {
+      var pEdErr = checkPatchesPath(allEdits[pEd].path || '');
+      if (pEdErr) { errors.push(pEdErr); }
+    }
+    for (var pNf = 0; pNf < allNewFiles.length; pNf++) {
+      var pNfErr = checkPatchesPath(allNewFiles[pNf].path || '');
+      if (pNfErr) { errors.push(pNfErr); }
+    }
+  }
+
   // node_modules catch-all: ALL repair kinds are restricted from node_modules/
   // by default. Each kind has its own specific path validation, but the
   // node_modules restriction is universal:
@@ -616,16 +650,55 @@ function validate(editSet, options) {
     }
   }
 
-  // local-wrapper: all edits and newFiles must be under src/
+  // local-wrapper: all edits and newFiles must be under src/ (with explicit blocks for protected paths)
   if (editSetKind === 'local-wrapper') {
     function checkSrcOnly(pathStr) {
       if (!pathStr) return null;
       var normalized = pathStr.replace(/\\/g, '/');
+
+      // Block node_modules paths with specific message
+      if (normalized.indexOf('node_modules/') !== -1 || normalized.indexOf('node_modules\\') !== -1) {
+        return {
+          code: ERR_CODES.PROPOSAL_IN_NODE_MODULES,
+          message: '[PROPOSAL_IN_NODE_MODULES] local-wrapper cannot edit or create files under node_modules/: ' + pathStr + '. Use dependency-patch or local-wrapper under src/ instead.'
+        };
+      }
+
+      // Block lockfiles with specific message
+      var lockfiles = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'npm-shrinkwrap.json'];
+      var baseName = normalized.split('/').pop().split('\\').pop();
+      if (lockfiles.indexOf(baseName) !== -1) {
+        return {
+          code: ERR_CODES.PROPOSAL_IN_NODE_MODULES,
+          message: '[PROPOSAL_IN_NODE_MODULES] local-wrapper cannot modify lockfiles: ' + pathStr + '. Lockfile changes require dependency-bump repairKind.'
+        };
+      }
+
+      // Block workflow files with specific message
+      if (normalized.indexOf('.github/workflows/') !== -1 || normalized.indexOf('.github\\workflows\\') !== -1) {
+        return {
+          code: ERR_CODES.PROPOSAL_IN_NODE_MODULES,
+          message: '[PROPOSAL_IN_NODE_MODULES] local-wrapper cannot modify GitHub workflow files: ' + pathStr + '. Workflow changes require separate CI configuration.'
+        };
+      }
+
+      // Block Docker-related files with specific message
+      var fileName = baseName;
+      if (fileName === 'Dockerfile' || fileName.startsWith('Dockerfile.') ||
+          fileName === 'docker-compose.yaml' || fileName === 'docker-compose.yml' ||
+          normalized.indexOf('docker/') !== -1 || normalized.indexOf('docker\\') !== -1) {
+        return {
+          code: ERR_CODES.PROPOSAL_IN_NODE_MODULES,
+          message: '[PROPOSAL_IN_NODE_MODULES] local-wrapper cannot modify Docker files: ' + pathStr + '. Docker changes require separate container configuration.'
+        };
+      }
+
       // Allow paths starting with src/ (or src\ on Windows)
       if (normalized.startsWith('src/') || normalized.startsWith('src\\')) return null;
+
       return {
         code: ERR_CODES.PROPOSAL_IN_NODE_MODULES,
-        message: 'local-wrapper repairKind can only edit or create files under src/ (tracked source), but got: ' + pathStr + '. Reason: local wrappers are in-process fixes; --ignore-scripts prevents arbitrary scripts from running.'
+        message: '[PROPOSAL_IN_NODE_MODULES] local-wrapper repairKind can only edit or create files under src/ (tracked source), but got: ' + pathStr + '. Reason: local wrappers are in-process fixes; --ignore-scripts prevents arbitrary scripts from running.'
       };
     }
     for (var lceI = 0; lceI < allEdits.length; lceI++) {

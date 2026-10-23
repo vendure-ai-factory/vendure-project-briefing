@@ -163,6 +163,98 @@ test('validate: unknown repairKind is rejected with INVALID_REPAIR_KIND', functi
   }
 });
 
+test('validate: INVALID_REPAIR_KIND lists only currently available kinds (dependency-patch hidden when unavailable)', function() {
+  var tmpDir = makeTempDir();
+  try {
+    setupStandardFiles(tmpDir);
+    var editSet = {
+      repairKind: 'unknown-kind',
+      rationale: 'test',
+      edits: [{ path: 'test.txt', oldString: 'line 2', newString: 'line 2 modified' }]
+    };
+
+    // Default capabilities: dependency-patch is available -> all kinds listed.
+    var defaultResult = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target', capabilities: { dependencyPatch: true } });
+    var defaultMsg = defaultResult.errors.filter(function(e) { return e.indexOf('[' + ERR.INVALID_REPAIR_KIND + ']') !== -1; })[0];
+    assert.ok(defaultMsg, 'INVALID_REPAIR_KIND error present by default');
+    assert.ok(defaultMsg.indexOf('dependency-patch') !== -1, 'dependency-patch listed when available: ' + defaultMsg);
+
+    // Capability disabled -> dependency-patch must NOT be advertised.
+    var gatedResult = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target', capabilities: { dependencyPatch: false } });
+    var gatedMsg = gatedResult.errors.filter(function(e) { return e.indexOf('[' + ERR.INVALID_REPAIR_KIND + ']') !== -1; })[0];
+    assert.ok(gatedMsg, 'INVALID_REPAIR_KIND error present when capability disabled');
+    assert.ok(gatedMsg.indexOf('dependency-patch') === -1, 'dependency-patch NOT listed when unavailable: ' + gatedMsg);
+    assert.ok(gatedMsg.indexOf('source-edit') !== -1, 'still-existing kinds listed: ' + gatedMsg);
+    assert.ok(gatedMsg.indexOf('local-wrapper') !== -1, 'local-wrapper still listed: ' + gatedMsg);
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: patches/ newFile is allowed when dependencyPatch is available', function() {
+  var tmpDir = makeTempDir();
+  try {
+    setupStandardFiles(tmpDir);
+    fs.mkdirSync(path.join(tmpDir, 'patches'), { recursive: true });
+    var editSet = {
+      repairKind: 'source-edit',
+      rationale: 'add patch',
+      edits: [],
+      newFiles: [{ path: 'patches/foo.patch', content: 'diff --git a/x b/x\n' }]
+    };
+    var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target', capabilities: { dependencyPatch: true } });
+    assert.strictEqual(result.ok, true, 'patches/ newFile should pass when dependencyPatch is available: ' + (result.errors || []).join('; '));
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: patches/ newFile is rejected with DEPENDENCY_PATCH_UNAVAILABLE when dependencyPatch is false for EVERY repair kind', function() {
+  var tmpDir = makeTempDir();
+  try {
+    setupStandardFiles(tmpDir);
+    fs.mkdirSync(path.join(tmpDir, 'patches'), { recursive: true });
+    var kinds = ['source-edit', 'config-edit', 'migration', 'dependency-bump', 'dependency-patch', 'local-wrapper'];
+    kinds.forEach(function(kind) {
+      var editSet = {
+        repairKind: kind,
+        rationale: 'add patch',
+        edits: [],
+        newFiles: [{ path: 'patches/foo.patch', content: 'diff --git a/x b/x\n' }]
+      };
+      var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target', capabilities: { dependencyPatch: false } });
+      assert.strictEqual(result.ok, false, '[' + kind + '] should be rejected when dependencyPatch is false');
+      var hasUnavailable = result.errors.some(function(e) { return e.indexOf('[' + ERR.DEPENDENCY_PATCH_UNAVAILABLE + ']') !== -1; });
+      assert.ok(hasUnavailable, '[' + kind + '] must reject with DEPENDENCY_PATCH_UNAVAILABLE, got: ' + (result.errors || []).join('; '));
+    });
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
+test('validate: patches/ edit is rejected with DEPENDENCY_PATCH_UNAVAILABLE when dependencyPatch is false for EVERY repair kind', function() {
+  var tmpDir = makeTempDir();
+  try {
+    setupStandardFiles(tmpDir);
+    fs.mkdirSync(path.join(tmpDir, 'patches'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'patches', 'foo.patch'), 'diff --git a/x b/x\n', 'utf8');
+    var kinds = ['source-edit', 'config-edit', 'migration', 'dependency-bump', 'dependency-patch', 'local-wrapper'];
+    kinds.forEach(function(kind) {
+      var editSet = {
+        repairKind: kind,
+        rationale: 'edit patch',
+        edits: [{ path: 'patches/foo.patch', oldString: 'a/x', newString: 'a/y' }],
+        newFiles: []
+      };
+      var result = patchValidator.validate(editSet, { cloneDir: tmpDir, mode: 'target', capabilities: { dependencyPatch: false } });
+      var hasUnavailable = result.errors.some(function(e) { return e.indexOf('[' + ERR.DEPENDENCY_PATCH_UNAVAILABLE + ']') !== -1; });
+      assert.ok(hasUnavailable, '[' + kind + '] must reject edits under patches/ with DEPENDENCY_PATCH_UNAVAILABLE, got: ' + (result.errors || []).join('; '));
+    });
+  } finally {
+    cleanupTempDir(tmpDir);
+  }
+});
+
 // =============================================================================
 // PATH VALIDATION - PATH_ESCAPE
 // =============================================================================

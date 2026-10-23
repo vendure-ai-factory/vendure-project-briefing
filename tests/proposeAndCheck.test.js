@@ -512,6 +512,98 @@ test('e: failing check -> CHECKS_FAILED, restoreClone called, no commit', async 
   assert.strictEqual(deps._callCount.commit, 0, 'commit should not be called');
 });
 
+test('e2: CHECKS_FAILED writes check name, exit code, stderr tail in attempt-1.json with compliance-identical statuses', async function() {
+  var dir = createTempProject({
+    'src/x.js': 'old\n',
+    'package.json': '{"name":"test","scripts":{"test":"echo ok"}}'
+  });
+  var runId = 'test-run-checks-evidence-' + Date.now();
+
+  var finding = { class: 'Err', message: 'msg', domain: 'target-code', signature: 'sig-checks-evidence' };
+  var deps = createFakeDeps();
+  deps._checksFail = true;
+  // Emulate the verifier: a long stderr to prove the tail is recorded, plus a
+  // skipped check (toolchain) to prove statuses match runChecks.json exactly.
+  deps.verifier.runChecks = function(cloneDir, opts) {
+    return Promise.resolve({
+      ok: false,
+      results: [
+        { script: 'test', success: false, exitCode: 1, timedOut: false, skipped: false, stderr: 'boom at the start ' + 'x'.repeat(600) },
+        { script: 'build', success: true, exitCode: 0, timedOut: false, skipped: false, stderr: '' }
+      ]
+    });
+  };
+
+  var result = await proposeAndCheck({
+    finding: finding,
+    candidates: validCandidates(dir),
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    env: {},
+    deps: deps
+  });
+
+  assert.strictEqual(result.status, 'CHECKS_FAILED');
+
+  var attemptPath = path.join('.', 'evidence', runId, 'repair', 'attempt-1.json');
+  assert.ok(fs.existsSync(attemptPath), 'attempt-1.json should exist for CHECKS_FAILED');
+  var attempt = JSON.parse(fs.readFileSync(attemptPath, 'utf8'));
+  assert.strictEqual(attempt.status, 'CHECKS_FAILED');
+  assert.ok(Array.isArray(attempt.checks), 'attempt.checks should be an array');
+  assert.strictEqual(attempt.checks.length, 2, 'one entry per check run');
+
+  var failedCheck = attempt.checks.filter(function(c) { return c.name === 'test'; })[0];
+  assert.ok(failedCheck, 'failed check recorded');
+  assert.strictEqual(failedCheck.name, 'test', 'check name recorded');
+  assert.strictEqual(failedCheck.exitCode, 1, 'exit code recorded');
+  assert.strictEqual(failedCheck.status, 'FAIL', 'status matches compliance (success=false)');
+  assert.ok(typeof failedCheck.stderrTail === 'string' && failedCheck.stderrTail.length > 0,
+    'stderrTail captured');
+  assert.ok(failedCheck.stderrTail.length <= 500, 'stderrTail is capped (tail only, no full dump)');
+  assert.strictEqual(failedCheck.stderrTail.indexOf('x'.repeat(600)), -1, 'stderrTail is the tail not the head');
+
+  var passCheck = attempt.checks.filter(function(c) { return c.name === 'build'; })[0];
+  assert.ok(passCheck, 'passing check also recorded');
+  assert.strictEqual(passCheck.status, 'PASS', 'passing status matches compliance (success=true)');
+  assert.strictEqual(passCheck.exitCode, 0, 'pass exit code recorded');
+
+  try { fs.rmSync(path.join('.', 'evidence', runId), { recursive: true, force: true }); } catch (e) { /* ignore */ }
+});
+
+test('l: prompt local-wrapper text mandates override/wrap/guard module with real code, not placeholders', async function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var prompt = mod.buildPrompt(
+    { class: 'Err', message: 'msg', domain: 'dependency', signature: 'sig-lw', stack: [] },
+    [],
+    [],
+    { domain: 'dependency', capabilities: { dependencyPatch: true } }
+  );
+
+  assert.ok(prompt.indexOf('local-wrapper') !== -1, 'prompt lists local-wrapper');
+  assert.ok(prompt.indexOf('overrides, wraps or guards') !== -1, 'prompt describes override/wrap/guard behaviour');
+  assert.ok(prompt.indexOf('REAL working code') !== -1, 'prompt mandates real working code');
+  assert.ok(prompt.indexOf('placeholders') !== -1, 'prompt forbids placeholders/TODOs');
+  assert.ok(prompt.indexOf('plugin-registration file') !== -1, 'prompt requires wiring into plugin registration');
+});
+
+test('m: prompt allowed-paths local-wrapper text mentions module/plugin registered in config', async function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var prompt = mod.buildPrompt(
+    { class: 'Err', message: 'msg', domain: 'dependency', signature: 'sig-lwp', stack: [] },
+    [],
+    [],
+    { domain: 'dependency', capabilities: { dependencyPatch: true } }
+  );
+
+  assert.ok(prompt.indexOf('local module/plugin') !== -1, 'allowed-paths text mentions local module/plugin');
+  assert.ok(prompt.indexOf('overrides, wraps or guards') !== -1, 'allowed-paths text mentions override/wrap/guard');
+  assert.ok(prompt.indexOf('plugin-registration') !== -1, 'allowed-paths text mentions plugin-registration edit');
+});
+
 // f. domain infrastructure and client-input -> BLOCKED
 test('f.1: domain infrastructure -> BLOCKED, model call count 0', async function() {
   var finding = { class: 'Err', message: 'msg', domain: 'infrastructure', signature: 'sig-011' };
@@ -1294,4 +1386,280 @@ test('OLDSTRING_NOT_FOUND + identical repeat: does NOT call model (no attempt sp
   // depends on the repairLoop or proposeAndCheck implementation.
   // If the check is in repairLoop, the status might be different.
   // If the check is in proposeAndCheck (proposal hash), status would be REJECTED.
+});
+
+// ---------------------------------------------------------------------------
+// validateProposalPaths: local-wrapper accepts src/ new files and edits,
+// blocks node_modules/lockfile/workflow/Dockerfile
+// ---------------------------------------------------------------------------
+test('validateProposalPaths: local-wrapper new file under src/ is accepted', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    'package.json': '{"name":"test"}'
+  });
+
+  var editSet = {
+    repairKind: 'local-wrapper',
+    edits: [],
+    newFiles: [{ path: path.join(tmpDir, 'src/wrapper.ts'), content: 'export function w() {}\n' }]
+  };
+
+  var result = validateProposalPaths(editSet, [], tmpDir);
+  assert.strictEqual(result.ok, true, 'new file under src/ should be accepted for local-wrapper');
+  assert.deepStrictEqual(result.offending, [], 'no offending paths');
+});
+
+test('validateProposalPaths: local-wrapper edit to plugin-registration file is accepted', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    'package.json': '{"name":"test"}'
+  });
+
+  var editSet = {
+    repairKind: 'local-wrapper',
+    edits: [{ path: path.join(tmpDir, 'src/plugin.ts'), oldString: 'register();', newString: 'register();\nnewRegistration();' }],
+    newFiles: []
+  };
+
+  var result = validateProposalPaths(editSet, [], tmpDir);
+  assert.strictEqual(result.ok, true, 'edit to plugin file under src/ should be accepted for local-wrapper');
+  assert.deepStrictEqual(result.offending, [], 'no offending paths');
+});
+
+test('validateProposalPaths: local-wrapper node_modules/ path is blocked', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    'node_modules/pkg/index.js': 'bug\n',
+    'package.json': '{"name":"test"}'
+  });
+
+  var editSet = {
+    repairKind: 'local-wrapper',
+    edits: [{ path: path.join(tmpDir, 'node_modules/pkg/index.js'), oldString: 'bug', newString: 'fixed' }],
+    newFiles: []
+  };
+
+  var result = validateProposalPaths(editSet, [], tmpDir);
+  assert.strictEqual(result.ok, false, 'node_modules/ edit should be blocked for local-wrapper');
+  assert.ok(result.offending.length > 0, 'should have offending paths');
+  assert.ok(result.offending[0].indexOf('node_modules') !== -1, 'offending path should mention node_modules');
+});
+
+test('validateProposalPaths: local-wrapper lockfile is blocked', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    'package-lock.json': '{}',
+    'package.json': '{"name":"test"}'
+  });
+
+  var editSet = {
+    repairKind: 'local-wrapper',
+    edits: [{ path: path.join(tmpDir, 'package-lock.json'), oldString: '{}', newString: '{"new":true}' }],
+    newFiles: []
+  };
+
+  var result = validateProposalPaths(editSet, [], tmpDir);
+  assert.strictEqual(result.ok, false, 'package-lock.json edit should be blocked for local-wrapper');
+  assert.ok(result.offending[0].indexOf('package-lock.json') !== -1, 'offending path should mention lockfile');
+});
+
+test('validateProposalPaths: local-wrapper .github/workflows/ path is blocked', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    '.github/workflows/ci.yml': 'runs-on: ubuntu\n',
+    'package.json': '{"name":"test"}'
+  });
+
+  var editSet = {
+    repairKind: 'local-wrapper',
+    edits: [{ path: path.join(tmpDir, '.github/workflows/ci.yml'), oldString: 'ubuntu', newString: 'macos' }],
+    newFiles: []
+  };
+
+  var result = validateProposalPaths(editSet, [], tmpDir);
+  assert.strictEqual(result.ok, false, '.github/workflows/ edit should be blocked for local-wrapper');
+  var wfNorm = result.offending[0].replace(/\\/g, '/');
+  assert.ok(wfNorm.indexOf('.github/workflows') !== -1, 'offending path should mention workflows: ' + result.offending[0]);
+});
+
+test('validateProposalPaths: local-wrapper Dockerfile is blocked', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    'Dockerfile': 'FROM node:18\n',
+    'package.json': '{"name":"test"}'
+  });
+
+  var editSet = {
+    repairKind: 'local-wrapper',
+    edits: [{ path: path.join(tmpDir, 'Dockerfile'), oldString: 'node:18', newString: 'node:20' }],
+    newFiles: []
+  };
+
+  var result = validateProposalPaths(editSet, [], tmpDir);
+  assert.strictEqual(result.ok, false, 'Dockerfile edit should be blocked for local-wrapper');
+  assert.ok(result.offending[0].indexOf('Dockerfile') !== -1, 'offending path should mention Dockerfile');
+});
+
+test('validateProposalPaths: local-wrapper docker-compose is blocked', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    'docker-compose.yml': 'version: "3"\n',
+    'package.json': '{"name":"test"}'
+  });
+
+  var editSet = {
+    repairKind: 'local-wrapper',
+    edits: [{ path: path.join(tmpDir, 'docker-compose.yml'), oldString: 'version: "3"', newString: 'version: "3.8"' }],
+    newFiles: []
+  };
+
+  var result = validateProposalPaths(editSet, [], tmpDir);
+  assert.strictEqual(result.ok, false, 'docker-compose.yml edit should be blocked for local-wrapper');
+  assert.ok(result.offending[0].indexOf('docker-compose') !== -1, 'offending path should mention docker-compose');
+});
+
+test('validateProposalPaths: local-wrapper newFile in docker/ directory is blocked', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    'docker/my.Dockerfile': 'FROM node:18\n',
+    'package.json': '{"name":"test"}'
+  });
+
+  var editSet = {
+    repairKind: 'local-wrapper',
+    edits: [],
+    newFiles: [{ path: path.join(tmpDir, 'docker/my.Dockerfile'), content: 'FROM node:20\n' }]
+  };
+
+  var result = validateProposalPaths(editSet, [], tmpDir);
+  assert.strictEqual(result.ok, false, 'newFile in docker/ directory should be blocked for local-wrapper');
+  var dkNorm = result.offending[0].replace(/\\/g, '/');
+  assert.ok(dkNorm.indexOf('docker/') !== -1, 'offending path should mention docker/: ' + result.offending[0]);
+});
+
+test('validateProposalPaths: non-local-wrapper src/ edit without candidate is rejected', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    'package.json': '{"name":"test"}'
+  });
+
+  var editSet = {
+    repairKind: 'source-edit',
+    edits: [{ path: path.join(tmpDir, 'src/other.ts'), oldString: 'old', newString: 'new' }],
+    newFiles: []
+  };
+
+  var result = validateProposalPaths(editSet, [], tmpDir);
+  assert.strictEqual(result.ok, false, 'src/ edit without candidate should be rejected for non-local-wrapper');
+  assert.ok(result.offending.length > 0, 'should have offending paths');
+});
+
+test('validateProposalPaths: patches/ newFile is always allowed', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    'patches/test.patch': 'diff...\n',
+    'package.json': '{"name":"test"}'
+  });
+
+  var editSet = {
+    repairKind: 'source-edit',
+    edits: [],
+    newFiles: [{ path: path.join(tmpDir, 'patches/test.patch'), content: 'diff...\n' }]
+  };
+
+  var result = validateProposalPaths(editSet, [], tmpDir);
+  assert.strictEqual(result.ok, true, 'patches/ newFile should always be allowed');
+});
+
+test('validateProposalPaths: patches/ newFile allowed when dependencyPatch is true (or unspecified)', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    'patches/p.patch': 'diff...\n',
+    'package.json': '{"name":"test"}'
+  });
+  var editSet = {
+    repairKind: 'source-edit',
+    edits: [],
+    newFiles: [{ path: path.join(tmpDir, 'patches/p.patch'), content: 'diff...\n' }]
+  };
+
+  var available = validateProposalPaths(editSet, [], tmpDir, { dependencyPatch: true });
+  assert.strictEqual(available.ok, true, 'patches/ newFile allowed when dependencyPatch true');
+
+  var unspecified = validateProposalPaths(editSet, [], tmpDir);
+  assert.strictEqual(unspecified.ok, true, 'patches/ newFile allowed when capabilities unspecified');
+});
+
+test('validateProposalPaths: patches/ newFile is rejected (offending) when dependencyPatch is false', function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var validateProposalPaths = mod.validateProposalPaths;
+
+  var tmpDir = createTempProject({
+    'src/plugin.ts': 'register();\n',
+    'patches/p.patch': 'diff...\n',
+    'package.json': '{"name":"test"}'
+  });
+  var editSet = {
+    repairKind: 'source-edit',
+    edits: [],
+    newFiles: [{ path: path.join(tmpDir, 'patches/p.patch'), content: 'diff...\n' }]
+  };
+
+  var result = validateProposalPaths(editSet, [], tmpDir, { dependencyPatch: false });
+  assert.strictEqual(result.ok, false, 'patches/ newFile must be rejected when dependencyPatch is false');
+  assert.ok(result.offending.length > 0, 'should have offending paths');
+  var norm = result.offending.join('|').replace(/\\/g, '/');
+  assert.ok(norm.indexOf('patches/') !== -1, 'offending path should mention patches/: ' + result.offending.join(', '));
+});
+
+test('l-patches: prompt keeps patches/ out of allowed paths when dependencyPatch is false', async function() {
+  var mod = require('../src/repair/proposeAndCheck');
+  var disabledPrompt = mod.buildPrompt(
+    { class: 'Err', message: 'msg', domain: 'dependency', signature: 'sig-patch-off', stack: [] },
+    [],
+    [],
+    { domain: 'dependency', capabilities: { dependencyPatch: false } }
+  );
+  assert.strictEqual(disabledPrompt.indexOf('patches/'), -1, 'prompt must not advertise patches/ when dependencyPatch is false');
+
+  var enabledPrompt = mod.buildPrompt(
+    { class: 'Err', message: 'msg', domain: 'dependency', signature: 'sig-patch-on', stack: [] },
+    [],
+    [],
+    { domain: 'dependency', capabilities: { dependencyPatch: true } }
+  );
+  assert.ok(enabledPrompt.indexOf('patches/') !== -1, 'prompt advertises patches/ as an allowed path when dependencyPatch is true');
 });

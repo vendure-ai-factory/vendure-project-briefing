@@ -4,6 +4,7 @@ var fs = require('fs');
 var path = require('path');
 var crypto = require('crypto');
 var coerce = require('./coerce');
+var RESULT_PASS = require('../terminalState').RESULT_PASS;
 var stackToString = coerce.stackToString;
 var toText = coerce.toText;
 var toArray = coerce.toArray;
@@ -91,7 +92,7 @@ function defaultAllowedRepairKinds(opts) {
     if (allowDepPatch) {
       lines.push('- dependency-patch: for bugs whose code lives in node_modules/<pkg> - apply a patch');
     }
-    lines.push('- local-wrapper: for bugs in node_modules/<pkg> that need a local wrapper workaround');
+    lines.push('- local-wrapper: for bugs in node_modules/<pkg> - add a NEW local module/plugin under src/ and register it in the config file that overrides, wraps or guards the faulty behaviour using REAL working code, never placeholders/TODOs/pseudo-code (e.g. an actual wrapper class/function with real logic that intercepts the bad call and substitutes the correct value). The wrapper must compile and be wired into the plugin registration (with an edit to the plugin-registration file), not merely create unused source files.');
   }
   return lines.join('\n');
 }
@@ -127,9 +128,9 @@ function allowedPathsPerKindText(opts) {
   lines.push('- migration: under the migrations directory only');
   lines.push('- dependency-bump: package.json and lockfile only (upgrade to a newer version)');
   if (allowDepPatch) {
-    lines.push('- dependency-patch: files under node_modules/<pkg>/ only (apply a patch to an installed package); NOT available in all runtimes');
+    lines.push('- dependency-patch: edits under node_modules/<pkg>/ only or NEW patch files under patches/ (apply a patch to an installed package)');
   }
-  lines.push('- local-wrapper: under src/ only (creates a local in-process workaround); Reason: --ignore-scripts prevents arbitrary scripts from running, so the wrapper must be a tracked source file');
+  lines.push('- local-wrapper: under src/ only (adds a NEW local module/plugin registered in the config that overrides, wraps or guards the faulty behaviour with REAL code, plus an edit to the plugin-registration file); Reason: --ignore-scripts prevents arbitrary scripts from running, so the wrapper must be a tracked source file');
   return lines.join('\n') + '\n';
 }
 
@@ -318,6 +319,39 @@ function extractErrorCodes(errors) {
  * Write the compact attempt summary (evidence/<runId>/repair/attempt-<n>.json).
  * Paths and codes only — never file contents, log lines, or secrets.
  */
+var CHECK_STDERR_TAIL = 500;
+
+/**
+ * Per-check status derived from the exact fields the verifier's runChecks
+ * compliance evidence (runChecks.json) records, so attempt summaries and the
+ * compliance report never disagree. Precedence: SKIPPED, TIMED_OUT, ok-result, FAIL.
+ */
+function checkStatus(r) {
+  if (!r) return 'FAIL';
+  if (r.skipped) return 'SKIPPED';
+  if (r.timedOut) return 'TIMED_OUT';
+  if (r.success) return RESULT_PASS;
+  return 'FAIL';
+}
+
+/**
+ * Compact per-check summary for attempt-N.json: check name, status (identical
+ * to the compliance report), exit code, and the tail of stderr (redacted by
+ * the verifier already). Never full stdout/stderr contents.
+ */
+function summarizeChecks(checkData) {
+  var results = checkData && Array.isArray(checkData.results) ? checkData.results : [];
+  return results.map(function(r) {
+    var stderr = typeof r.stderr === 'string' ? r.stderr : '';
+    return {
+      name: r.script,
+      status: checkStatus(r),
+      exitCode: typeof r.exitCode === 'number' ? r.exitCode : null,
+      stderrTail: stderr.length > CHECK_STDERR_TAIL ? stderr.substring(stderr.length - CHECK_STDERR_TAIL) : stderr
+    };
+  });
+}
+
 function writeAttemptSummary(runId, attemptNumber, data, fsMod, now) {
   try {
     var dir = path.join('evidence', runId, 'repair');
@@ -331,8 +365,14 @@ function writeAttemptSummary(runId, attemptNumber, data, fsMod, now) {
       tokensUsed: typeof data.tokensUsed === 'number' ? data.tokensUsed : null,
       promptChars: typeof data.promptChars === 'number' ? data.promptChars : null,
       elapsedMs: typeof data.elapsedMs === 'number' ? data.elapsedMs : null,
+      model: typeof data.model === 'string' ? data.model : null,
+      requestedModel: typeof data.requestedModel === 'string' ? data.requestedModel : null,
+      provider: typeof data.provider === 'string' ? data.provider : null,
       timestamp: (typeof now === 'function' ? now() : new Date().toISOString())
     };
+    if (data.checks) {
+      summary.checks = summarizeChecks(data.checks);
+    }
     fsMod.writeFileSync(path.join(dir, 'attempt-' + attemptNumber + '.json'), JSON.stringify(summary, null, 2) + '\n', 'utf8');
   } catch (e) { /* best effort */ }
 }
@@ -505,21 +545,49 @@ function findMigrationsDir(cloneDir) {
 
 /**
  * Enforce that every proposed edit path is one of the listed candidate paths
- * (or an allowed new-file location: patches/, a migrations dir, or a new
- * local-wrapper file under src/). Returns { ok, offending, validPaths }.
+ * (or an allowed new-file location: patches/ when dependency-patch is
+ * available, a migrations dir, or a new local-wrapper file under src/).
+ * Returns { ok, offending, validPaths }.
  */
-function validateProposalPaths(editSet, candidates, cloneDir) {
+function validateProposalPaths(editSet, candidates, cloneDir, capabilities) {
   var allowed = candidateRelPaths(cloneDir, candidates);
   var offending = [];
   var edits = (editSet && editSet.edits) || [];
+  var isLocalWrapper = editSet && editSet.repairKind === 'local-wrapper';
+  var dependencyPatchAvailable = !capabilities || capabilities.dependencyPatch !== false;
+
+  // Helper to check if a path is a blocked local-wrapper path type
+  function isBlockedLocalWrapperPath(relPath) {
+    if (!isLocalWrapper) return false;
+    var normalized = relPath.replace(/\\/g, '/');
+    // Block node_modules
+    if (normalized.indexOf('node_modules/') !== -1 || normalized.indexOf('node_modules\\') !== -1) return true;
+    // Block lockfiles
+    var baseName = normalized.split('/').pop().split('\\').pop();
+    var lockfiles = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'npm-shrinkwrap.json'];
+    if (lockfiles.indexOf(baseName) !== -1) return true;
+    // Block workflows
+    if (normalized.indexOf('.github/workflows/') !== -1 || normalized.indexOf('.github\\workflows\\') !== -1) return true;
+    // Block Docker files
+    var fileName = baseName;
+    if (fileName === 'Dockerfile' || fileName.startsWith('Dockerfile.') ||
+        fileName === 'docker-compose.yaml' || fileName === 'docker-compose.yml' ||
+        normalized.indexOf('docker/') !== -1 || normalized.indexOf('docker\\') !== -1) return true;
+    return false;
+  }
+
   for (var i = 0; i < edits.length; i++) {
     var e = edits[i];
     if (!e || !e.path) continue;
     var rel = normRelPath(e.path, cloneDir, false);
     if (rel === '') continue;
     var isMigrationEdit = isUnderMigrationDir(rel, cloneDir);
-    var isLocalWrapperEdit = editSet.repairKind === 'local-wrapper' && rel.indexOf('src/') === 0;
-    if (allowed.indexOf(rel) === -1 && !isMigrationEdit && !isLocalWrapperEdit) {
+    var isLocalWrapperEdit = isLocalWrapper && rel.indexOf('src/') === 0;
+    var isBlocked = isBlockedLocalWrapperPath(rel);
+    // Blocked paths are explicitly rejected; valid src/ paths and candidates pass
+    if (isBlocked) {
+      if (offending.indexOf(e.path) === -1) offending.push(e.path);
+    } else if (allowed.indexOf(rel) === -1 && !isMigrationEdit && !isLocalWrapperEdit) {
       if (offending.indexOf(e.path) === -1) offending.push(e.path);
     }
   }
@@ -529,10 +597,13 @@ function validateProposalPaths(editSet, candidates, cloneDir) {
     if (!nf || !nf.path) continue;
     var relNf = normRelPath(nf.path, cloneDir, false);
     if (relNf === '') continue;
-    var inPatches = relNf.indexOf('patches/') === 0;
+    var inPatches = dependencyPatchAvailable && relNf.indexOf('patches/') === 0;
     var inMigration = isUnderMigrationDir(relNf, cloneDir);
-    var localWrapperNew = editSet.repairKind === 'local-wrapper' && relNf.indexOf('src/') === 0;
-    if (!inPatches && !inMigration && !localWrapperNew) {
+    var localWrapperNew = isLocalWrapper && relNf.indexOf('src/') === 0;
+    var isBlockedNf = isBlockedLocalWrapperPath(relNf);
+    if (isBlockedNf) {
+      if (offending.indexOf(nf.path) === -1) offending.push(nf.path);
+    } else if (!inPatches && !inMigration && !localWrapperNew) {
       if (offending.indexOf(nf.path) === -1) offending.push(nf.path);
     }
   }
@@ -771,6 +842,13 @@ async function proposeAndCheck(options) {
 
   // Step 1: domain 'infrastructure' or 'client-input' -> BLOCKED
   if (domain === 'infrastructure' || domain === 'client-input') {
+    writeAttemptSummary(runId, 1, {
+      status: 'BLOCKED',
+      codes: ['DOMAIN_NOT_REPAIRABLE'],
+      requestedPaths: [],
+      candidatePaths: (candidates || []).map(function(c) { return c.file; }),
+      domain: domain
+    }, fs, now);
     return {
       status: 'BLOCKED',
       blocker: {
@@ -824,6 +902,13 @@ async function proposeAndCheck(options) {
   // Step 2: consume budget
   var consumeResult = model.consume(budget, finding.signature);
   if (!consumeResult.ok) {
+    writeAttemptSummary(runId, 1, {
+      status: 'BLOCKED',
+      codes: ['BUDGET_EXHAUSTED'],
+      requestedPaths: [],
+      candidatePaths: (candidates || []).map(function(c) { return c.file; }),
+      reason: consumeResult.reason
+    }, fs, now);
     return {
       status: 'BUDGET_EXHAUSTED',
       blocker: { code: 'BUDGET_EXHAUSTED', message: consumeResult.reason }
@@ -838,6 +923,13 @@ async function proposeAndCheck(options) {
     var repoRoot = path.resolve(__dirname, '..', '..');
     var scratchResult = await scratchCopy(repoRoot, runId, runCommand);
     if (!scratchResult.ok) {
+      writeAttemptSummary(runId, 1, {
+        status: 'BLOCKED',
+        codes: ['SCRATCH_COPY_FAILED'],
+        requestedPaths: [],
+        candidatePaths: (candidates || []).map(function(c) { return c.file; }),
+        error: scratchResult.error
+      }, fs, now);
       return { status: 'BLOCKED', blocker: { code: 'SCRATCH_COPY_FAILED', message: scratchResult.error } };
     }
     cloneDir = scratchResult.dir;
@@ -884,6 +976,19 @@ async function proposeAndCheck(options) {
   var elapsedMs = (typeof modelNow === 'function' ? modelNow() : Date.now()) - modelStartMs;
 
   if (!modelResult.ok) {
+    writeAttemptSummary(runId, 1, {
+      status: 'MODEL_FAILED',
+      codes: [modelResult.blocker && modelResult.blocker.code ? modelResult.blocker.code : 'MODEL_FAILED'],
+      requestedPaths: [],
+      candidatePaths: (candidates || []).map(function(c) { return c.file; }),
+      tokensUsed: null,
+      promptChars: promptChars,
+      elapsedMs: elapsedMs,
+      model: modelResult.model,
+      requestedModel: modelResult.requestedModel,
+      provider: modelResult.provider,
+      blocker: modelResult.blocker
+    }, fs, now);
     return {
       status: 'MODEL_FAILED',
       blocker: modelResult.blocker,
@@ -933,6 +1038,9 @@ async function proposeAndCheck(options) {
           tokensUsed: reAskResult.usage ? reAskResult.usage.total_tokens : null,
           promptChars: reAskPrompt.length,
           elapsedMs: reAskElapsedMs,
+          model: reAskResult.model,
+          requestedModel: reAskResult.requestedModel,
+          provider: reAskResult.provider,
           parseEvidence: parseEvidence
         }, fs, now);
         return {
@@ -952,6 +1060,9 @@ async function proposeAndCheck(options) {
         tokensUsed: null,
         promptChars: reAskPrompt.length,
         elapsedMs: reAskElapsedMs,
+        model: reAskResult.model,
+        requestedModel: reAskResult.requestedModel,
+        provider: reAskResult.provider,
         parseEvidence: parseEvidence
       }, fs, now);
       return {
@@ -1005,7 +1116,7 @@ async function proposeAndCheck(options) {
   // candidate paths (plus newFiles under patches/, migrations dirs, or new
   // local-wrapper files under src/). An invented path is rejected here before
   // any general validation masking.
-  var pathGate = validateProposalPaths(editSet, realCandidates, cloneDir);
+  var pathGate = validateProposalPaths(editSet, realCandidates, cloneDir, capabilities);
   if (!pathGate.ok) {
     var rejectionCodes = ['PROPOSAL_OUTSIDE_CANDIDATES'];
     var validPaths = pathGate.validPaths;
@@ -1016,7 +1127,10 @@ async function proposeAndCheck(options) {
       candidatePaths: validPaths,
       tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
       promptChars: promptChars,
-      elapsedMs: elapsedMs
+      elapsedMs: elapsedMs,
+      model: modelResult.model,
+      requestedModel: modelResult.requestedModel,
+      provider: modelResult.provider
     }, fs, now);
     return {
       status: 'REJECTED',
@@ -1048,7 +1162,10 @@ async function proposeAndCheck(options) {
       candidatePaths: vValid,
       tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
       promptChars: promptChars,
-      elapsedMs: elapsedMs
+      elapsedMs: elapsedMs,
+      model: modelResult.model,
+      requestedModel: modelResult.requestedModel,
+      provider: modelResult.provider
     }, fs, now);
     return {
       status: 'REJECTED',
@@ -1117,6 +1234,16 @@ async function proposeAndCheck(options) {
   var checkResult = await verifier.runChecks(cloneDir, checkOptions);
 
   if (!checkResult.ok) {
+    writeAttemptSummary(runId, 1, {
+      status: 'CHECKS_FAILED',
+      codes: ['CHECKS_FAILED'],
+      requestedPaths: requestedPaths,
+      candidatePaths: (candidates || []).map(function(c) { return c.file; }),
+      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+      promptChars: promptChars,
+      elapsedMs: elapsedMs,
+      checks: { results: checkResult.results }
+    }, fs, now);
     // Restore clone
     if (mode === 'target') {
       applier.restoreClone(cloneDir, runCommand);
@@ -1167,7 +1294,10 @@ async function proposeAndCheck(options) {
     candidatePaths: candidateRelPaths(cloneDir, realCandidates),
     tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
     promptChars: promptChars,
-    elapsedMs: elapsedMs
+    elapsedMs: elapsedMs,
+    model: modelResult.model,
+    requestedModel: modelResult.requestedModel,
+    provider: modelResult.provider
   }, fs, now);
 
 

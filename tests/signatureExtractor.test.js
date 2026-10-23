@@ -471,3 +471,51 @@ test('signatureExtractor: no log frames => domain is NOT overridden', function(t
   assert.strictEqual(result.domain, 'target-code', 'no frames -> keep SQL-signal domain decision');
   done();
 });
+
+test('signatureExtractor: parseLogExcerpt parses ERROR/DETAIL/STATEMENT (unique constraint)', function(t, done) {
+  var logExcerpt = loadFixture('postgres-detail-error.txt');
+  var result = signatureExtractor.parseLogExcerpt(logExcerpt);
+
+  assert.notStrictEqual(result, null, 'parseLogExcerpt should not return null for ERROR/DETAIL/STATEMENT');
+  assert.strictEqual(result.column, 'slug', 'column should be slug from DETAIL');
+  assert.strictEqual(result.operator, 'unique constraint', 'operator should be unique constraint');
+  assert.strictEqual(result.paramIndex, 3, 'paramIndex should be 3 (slug is 3rd column in INSERT)');
+  assert.ok(result.statement && result.statement.includes('INSERT INTO'), 'statement should contain INSERT');
+  done();
+});
+
+test('signatureExtractor: ERROR/DETAIL/STATEMENT via extractFinding sets sql fields correctly', function(t, done) {
+  var apiErrorFixture = JSON.parse(loadFixture('apiError.json'));
+  var logExcerpt = loadFixture('postgres-detail-error.txt');
+  var input = {
+    apiErrors: apiErrorFixture.errors,
+    logExcerpt: logExcerpt,
+    operationName: 'CreateProduct',
+    query: 'mutation CreateProduct { createProduct(input: $input) { id } }'
+  };
+  var result = signatureExtractor.extractFinding(input);
+
+  assert.strictEqual(result.class, 'SQL_PARAM_TYPE', 'class should be SQL_PARAM_TYPE');
+  assert.strictEqual(result.confidence, 'WITH_SQL', 'confidence should be WITH_SQL');
+  assert.strictEqual(result.sql.column, 'slug', 'column should be slug from DETAIL');
+  assert.strictEqual(result.sql.operator, 'unique constraint', 'operator should be unique constraint');
+  assert.strictEqual(result.sql.paramIndex, 3, 'paramIndex should be 3 (slug is 3rd column in INSERT)');
+  assert.ok(result.sql.statement && result.sql.statement.includes('INSERT INTO'), 'statement should contain INSERT');
+  assert.strictEqual(result.sql.paramValue, 'undefined', 'paramValue comes from API error, not DETAIL');
+  done();
+});
+
+test('signatureExtractor: docker-prefixed ERROR/DETAIL/STATEMENT also parses correctly', function(t, done) {
+  var logExcerpt = [
+    'vendure-db-1  | 2026-10-21 12:00:00.001 UTC [42] ERROR:  23505: duplicate key value violates unique constraint "idx_product_slug"',
+    'vendure-db-1  | 2026-10-21 12:00:00.002 UTC [42] DETAIL:  Key (slug)=(nail-art-001) already exists.',
+    'vendure-db-1  | 2026-10-21 12:00:00.003 UTC [42] STATEMENT:  INSERT INTO "product" ("id", "name", "slug", "price") VALUES ($1, $2, $3, $4)'
+  ].join('\n');
+  var result = signatureExtractor.parseLogExcerpt(logExcerpt);
+
+  assert.notStrictEqual(result, null, 'parseLogExcerpt should parse docker-prefixed ERROR/DETAIL/STATEMENT');
+  assert.strictEqual(result.column, 'slug', 'column should be slug');
+  assert.strictEqual(result.operator, 'unique constraint', 'operator should be unique constraint');
+  assert.strictEqual(result.paramIndex, 3, 'paramIndex should be 3 (slug is 3rd column)');
+  done();
+});

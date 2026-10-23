@@ -402,6 +402,9 @@ function stripLogPrefix(line) {
  * mixed -> X... ("X"); punctuation is kept; the keywords
  * ERROR/CONTEXT/STATEMENT/DETAIL/LOG/PANIC/HINT are preserved verbatim; an ISO
  * timestamp collapses to 9999-99-99T99:99:99.
+ *
+ * NOTE: This function is DEPRECATED. Use maskSecretsOnly instead for
+ * targeted redaction that preserves operators, $N markers, and keywords.
  */
 function maskLogPayload(line) {
   if (!line || typeof line !== 'string') return '';
@@ -448,10 +451,113 @@ function maskLogPayload(line) {
 }
 
 /**
+ * Targeted redaction of secrets only: API tokens, emails, passwords, long
+ * hex/base64, and testing secrets (canary values). Also masks ISO timestamps
+ * to preserve evidence anonymity (9999-99-99T99:99:99 format). Preserves
+ * keywords (ERROR/CONTEXT/STATEMENT/DETAIL/HINT/LOG/PANIC/FATAL/NOTICE),
+ * operators (!=, LIKE, etc.), $N parameter markers, table/column names.
+ */
+function maskSecretsOnly(line) {
+  if (!line || typeof line !== 'string') return '';
+  var s = line;
+
+  // Mask ISO timestamps to canonical placeholder (for evidence anonymity)
+  // Note: timestamps may already be stripped by stripLogPrefix, but we try both formats
+  s = s.replace(/\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\.\d+/g, '9999-99-99T99:99:99');
+  s = s.replace(/\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/g, '9999-99-99T99:99:99');
+  // Mask bracketed timestamps
+  s = s.replace(/^\[\d{4}-\d{2}-\d{2}[ T][^\]]*\]/, '[9999-99-99T99:99:99]');
+
+  // Redact long hex strings (24+ hex chars = likely tokens)
+  s = s.replace(/([0-9a-fA-F]{24,})/gi, function(m) {
+    return 'TOKEN_' + 'X'.repeat(Math.min(m.length, 8));
+  });
+
+  // Redact base64-like strings (24+ chars with base64 chars)
+  s = s.replace(/([A-Za-z0-9+/]{32,}={0,2})/g, function(m) {
+    if (m.length >= 32 && /^[A-Za-z0-9+/]+={0,2}$/.test(m)) {
+      return 'B64_' + 'X'.repeat(8);
+    }
+    return m;
+  });
+
+  // Redact API tokens: sk-, ghp_, gho_, github_pat_, Bearer xxx, api_key=, secret=
+  s = s.replace(/(sk-)[A-Za-z0-9_\\-]{20,}/g, '$1XXXX');
+  s = s.replace(/(ghp_)[A-Za-z0-9\\-]{20,}/g, '$1XXXX');
+  s = s.replace(/(gho_)[A-Za-z0-9\\-]{20,}/g, '$1XXXX');
+  s = s.replace(/(github_pat_)[A-Za-z0-9_\\-]{20,}/g, '$1XXXX');
+  s = s.replace(/(Bearer )[A-Za-z0-9_\\-]{20,}/gi, '$1XXXX');
+  s = s.replace(/(api[_-]?key["\s:=]+)[A-Za-z0-9_\\-]{10,}/gi, '$1XXXX');
+  s = s.replace(/(secret[_-]?key["\s:=]+)[A-Za-z0-9_\\-]{10,}/gi, '$1XXXX');
+  s = s.replace(/(password["\s:=]+)[^\s,;]+/gi, '$1XXXX');
+  s = s.replace(/(token["\s:=]+)[^\s,;]+/gi, '$1XXXX');
+
+  // Redact email addresses
+  s = s.replace(/[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\.[A-Za-z]{2,}/g, 'EMAIL_REDACTED');
+
+  // Redact UUIDs (standard format)
+  s = s.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, 'UUID_REDACTED');
+
+  // Redact strings that look like database connection URLs with credentials
+  s = s.replace(/(postgresql:\/\/)[^@]+@/gi, '$1USER:PASSWORD@');
+
+  // Redact testing secrets: mixed-case alphanum with numbers, 12+ chars
+  // This catches CANARY-type test values that should not appear in evidence
+  // e.g. "SUP3rS3cr3tT0k3nXYZ789" -> "TEST_SECRET"
+  s = s.replace(/"([A-Za-z0-9]{12,})"/g, function(m, val) {
+    if (val.length >= 12 && /^[A-Za-z0-9]+$/.test(val) && /[0-9]/.test(val)) {
+      return '"TEST_SECRET"';
+    }
+    return m;
+  });
+  s = s.replace(/'([A-Za-z0-9]{12,})'/g, function(m, val) {
+    if (val.length >= 12 && /^[A-Za-z0-9]+$/.test(val) && /[0-9]/.test(val)) {
+      return "'TEST_SECRET'";
+    }
+    return m;
+  });
+
+  return s;
+}
+
+/**
+ * Extract ERROR context lines: up to 3 lines following an ERROR line that
+ * contain '!=' or '$N' (parameter marker). Returns array of context lines,
+ * each capped at 300 chars with secrets redacted.
+ */
+function extractErrorContextLines(allLines, maxContext) {
+  maxContext = maxContext || 3;
+  var contextLines = [];
+  for (var i = 0; i < allLines.length; i++) {
+    var line = String(allLines[i] || '');
+    var stripped = stripLogPrefix(line);
+    // Found an ERROR line - collect following lines with != or $N
+    if (/^ERROR\b/.test(stripped)) {
+      for (var j = i + 1; j < allLines.length && contextLines.length < maxContext; j++) {
+        var nextLine = String(allLines[j] || '');
+        var nextStripped = stripLogPrefix(nextLine);
+        // Stop if we hit another ERROR or severity marker
+        if (/^(ERROR|PANIC|FATAL|LOG|NOTICE|STATEMENT|CONTEXT|DETAIL|HINT|WARN)\b/.test(nextStripped)) {
+          break;
+        }
+        // Include if contains != or $N parameter marker
+        if (nextStripped.indexOf('!=') !== -1 || /\$[0-9]+/.test(nextStripped)) {
+          var masked = maskSecretsOnly(stripLogPrefix(nextLine));
+          if (masked.length > 300) masked = masked.substring(0, 300) + '...';
+          contextLines.push(masked);
+        }
+      }
+    }
+  }
+  return contextLines;
+}
+
+/**
  * Produce the per-kind masked log-shape diagnostics object. For each kind:
  * lineCount, the first 3 lines, and parameterLines (up to 5 lines matching the
  * findingMessage, or `undefined` when no match), each capped at 300 chars with
- * secrets redacted. Never contains literal log values (canary-safe).
+ * secrets redacted. Also includes errorContextLines: up to 3 lines following
+ * each ERROR line that contain '!=' or '$N' parameter markers.
  */
 function buildLogShape(logs, findingMessage) {
   var kinds = ['postgres', 'vendure', 'worker'];
@@ -459,15 +565,15 @@ function buildLogShape(logs, findingMessage) {
   for (var ki = 0; ki < kinds.length; ki++) {
     var kind = kinds[ki];
     var lines = (logs && Array.isArray(logs[kind])) ? logs[kind].map(String) : [];
-    var first3 = lines.slice(0, 3).map(function(l) { return maskLogPayload(stripLogPrefix(l)); });
+    var first3 = lines.slice(0, 3).map(function(l) { return stripLogPrefix(maskSecretsOnly(l)); });
     var info = {
       lineCount: lines.length,
       first3Lines: first3,
-      parameterLines: undefined
+      parameterLines: undefined,
+      errorContextLines: undefined
     };
     // Up to 5 lines matching the finding message (or ERROR keyword), capped
-    // at 300 chars each, secrets redacted. Mask first, then strip the prefix,
-    // so a masked ISO timestamp placeholder (9999-99-99T99:99:99) survives.
+    // at 300 chars each, secrets redacted using targeted maskSecretsOnly.
     var matched = [];
     for (var i = 0; i < lines.length && matched.length < 5; i++) {
       var raw = String(lines[i] || '');
@@ -475,13 +581,19 @@ function buildLogShape(logs, findingMessage) {
       var isMatch = payload.indexOf('ERROR') !== -1 ||
         (findingMessage && payload.indexOf(findingMessage) !== -1);
       if (isMatch) {
-        var masked = stripLogPrefix(maskLogPayload(raw));
+        var masked = stripLogPrefix(maskSecretsOnly(raw));
         if (masked.length > 300) masked = masked.substring(0, 300) + '...';
         matched.push(masked);
       }
     }
     if (matched.length > 0) {
       info.parameterLines = matched;
+    }
+    // Extract ERROR context lines: up to 3 lines following each ERROR that
+    // contain '!=' or '$N' parameter markers (used by parseLogExcerpt)
+    var errorContext = extractErrorContextLines(lines, 3);
+    if (errorContext.length > 0) {
+      info.errorContextLines = errorContext;
     }
     shape.kinds[kind] = info;
   }
@@ -1446,7 +1558,9 @@ export {
   parseGraphQlQuery,
   getGraphQlInfoFromEvidence,
   buildLogExcerptWithWindow,
-  buildLogShape
+  buildLogShape,
+  maskSecretsOnly,
+  extractErrorContextLines
 };
 
 

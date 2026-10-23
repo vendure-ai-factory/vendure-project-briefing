@@ -1052,3 +1052,152 @@ test('locator: per-package cap — non-stack dep capped at 3, stack pkg exempt',
   fs.rmSync(loudPkgDir, { recursive: true, force: true });
   fs.rmSync(vcDir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// locator importer-file candidates: src/ files that import a dependency package
+// become candidates with source='import'
+// ---------------------------------------------------------------------------
+test('locator: src/ file importing dependency becomes an import candidate', async function() {
+  var workspaceDir = createTempDir();
+  var targetRoot = createTempDir();
+
+  var pkgJson = {
+    name: 'test-target',
+    version: '1.0.0',
+    dependencies: { 'fake-import-dep': '1.0.0' }
+  };
+  fs.writeFileSync(path.join(targetRoot, 'package.json'), JSON.stringify(pkgJson, null, 2));
+
+  // The dependency source (fetched) contains the bug pattern.
+  var pkgDir = createTempDir();
+  var distDir = path.join(pkgDir, 'dist');
+  fs.mkdirSync(distDir, { recursive: true });
+  fs.writeFileSync(path.join(distDir, 'resolver.js'),
+    'async function products(ctx, args) {\n' +
+    '  return { filter: { id: { notEq: `${nppId}` } } };\n' +
+    '}\n');
+  fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: 'fake-import-dep', version: '1.0.0' }, null, 2));
+
+  // A src/ file that imports the dependency package.
+  var srcDir = path.join(targetRoot, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'index.js'),
+    'const dep = require("fake-import-dep");\n' +
+    'module.exports = dep;\n');
+
+  var fakeFetch = function(name, version, dir) { return Promise.resolve(pkgDir); };
+
+  var result = await locator.locateCandidates({
+    finding: { operator: '!=', column: 'id', path: 'products' },
+    targetRoot: targetRoot,
+    fetchPackage: fakeFetch,
+    maxCandidates: 8,
+    runId: 'test-importer-' + Date.now(),
+    workspaceDir: workspaceDir
+  });
+
+  var importCandidates = result.candidates.filter(function(c) { return c.source === 'import'; });
+  assert.ok(importCandidates.length > 0,
+    'should find import candidates for src/ files importing the dependency; got: ' + JSON.stringify(result.candidates.map(function(c){return {file:c.file,source:c.source};})));
+  assert.strictEqual(importCandidates[0].package, 'fake-import-dep', 'package should be fake-import-dep');
+  assert.ok(importCandidates[0].file.indexOf('src/index.js') !== -1, 'file should be src/index.js; got: ' + importCandidates[0].file);
+  assert.strictEqual(typeof importCandidates[0].score, 'number', 'score should be a number');
+  assert.ok(Array.isArray(importCandidates[0].reasons) && importCandidates[0].reasons.length > 0, 'reasons should be non-empty');
+  assert.ok(importCandidates[0].why && typeof importCandidates[0].why === 'string' && importCandidates[0].why.length > 0, 'why should be a non-empty string');
+  assert.ok(importCandidates[0].snippet, 'snippet should be present');
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+  fs.rmSync(pkgDir, { recursive: true, force: true });
+});
+
+test('locator: importer candidate does not duplicate an existing target candidate', async function() {
+  var workspaceDir = createTempDir();
+  var targetRoot = createTempDir();
+
+  var pkgJson = {
+    name: 'test-target',
+    version: '1.0.0',
+    dependencies: { 'fake-import-dep': '1.0.0' }
+  };
+  fs.writeFileSync(path.join(targetRoot, 'package.json'), JSON.stringify(pkgJson, null, 2));
+
+  var pkgDir = createTempDir();
+  var distDir = path.join(pkgDir, 'dist');
+  fs.mkdirSync(distDir, { recursive: true });
+  fs.writeFileSync(path.join(distDir, 'resolver.js'),
+    'async function products(ctx, args) {\n' +
+    '  return { filter: { id: { notEq: `${nppId}` } } };\n' +
+    '}\n');
+  fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: 'fake-import-dep', version: '1.0.0' }, null, 2));
+
+  // The src/ index.js BOTH matches the search pattern (so it would be a 'target'
+  // candidate) AND imports the dependency package. It must appear only once.
+  var srcDir = path.join(targetRoot, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'index.js'),
+    'const dep = require("fake-import-dep");\n' +
+    'const nppId = getNppId();\n' +
+    'async function products(ctx) { return { filter: { id: { notEq: `${nppId}` } } }; }\n');
+
+  var fakeFetch = function(name, version, dir) { return Promise.resolve(pkgDir); };
+
+  var result = await locator.locateCandidates({
+    finding: { operator: '!=', column: 'id', path: 'products' },
+    targetRoot: targetRoot,
+    fetchPackage: fakeFetch,
+    maxCandidates: 8,
+    runId: 'test-importer-dup-' + Date.now(),
+    workspaceDir: workspaceDir
+  });
+
+  // Count how many candidates point at src/index.js (normalized relative).
+  var indexTargets = result.candidates.filter(function(c) {
+    var rel = path.relative(targetRoot, c.file).replace(/\\/g, '/');
+    return rel === 'src/index.js';
+  });
+  // The file already appears as a (target) candidate, so the importer search
+  // must NOT add a second 'import' candidate for the same file.
+  var importForIndex = result.candidates.filter(function(c) {
+    return c.source === 'import' && path.relative(targetRoot, c.file).replace(/\\/g, '/') === 'src/index.js';
+  });
+  assert.strictEqual(indexTargets.length > 0, true, 'src/index.js should be a target candidate (got ' + indexTargets.length + ')');
+  assert.strictEqual(importForIndex.length, 0,
+    'src/index.js must not be duplicated as an import candidate; got: ' + JSON.stringify(importForIndex.map(function(c){return {file:c.file,source:c.source};})) + ' (targets: ' + indexTargets.length + ')');
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+  fs.rmSync(pkgDir, { recursive: true, force: true });
+});
+
+test('locator: no dependency candidates means no importer candidates', async function() {
+  var workspaceDir = createTempDir();
+  var targetRoot = createTempDir();
+
+  // No dependencies at all - no importer candidates should be produced.
+  fs.writeFileSync(path.join(targetRoot, 'package.json'), JSON.stringify({ name: 'test-target', version: '1.0.0', dependencies: {} }, null, 2));
+
+  var srcDir = path.join(targetRoot, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'index.js'),
+    'const other = require("some-other-module");\n' +
+    'module.exports = other;\n');
+
+  var fakeFetch = function(name, version, dir) { return Promise.resolve(createTempDir()); };
+
+  var result = await locator.locateCandidates({
+    finding: { operator: '!=', column: 'id', path: 'products' },
+    targetRoot: targetRoot,
+    fetchPackage: fakeFetch,
+    maxCandidates: 8,
+    runId: 'test-no-importer-' + Date.now(),
+    workspaceDir: workspaceDir
+  });
+
+  var importCandidates = result.candidates.filter(function(c) { return c.source === 'import'; });
+  assert.strictEqual(importCandidates.length, 0, 'no importer candidates when no dependency candidates');
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+});
+
