@@ -519,3 +519,36 @@ test('signatureExtractor: docker-prefixed ERROR/DETAIL/STATEMENT also parses cor
   assert.strictEqual(result.paramIndex, 3, 'paramIndex should be 3 (slug is 3rd column)');
   done();
 });
+
+test('signatureExtractor: real Postgres log shape with <ts> stderr <ts> UTC prefix, paramValue/table extracted', function(t, done) {
+  var logExcerpt = loadFixture('postgres-realtime-log.txt');
+  var result = signatureExtractor.parseLogExcerpt(logExcerpt);
+
+  assert.notStrictEqual(result, null, 'parseLogExcerpt must not return null for real Postgres log shape');
+  assert.strictEqual(result.operator, '!=', 'operator must be !=');
+  assert.strictEqual(result.column, 'id', 'column must be id');
+  assert.strictEqual(result.table, 'product', 'table must be product');
+  assert.strictEqual(result.paramIndex, 3, 'paramIndex must be 3');
+  assert.strictEqual(result.paramValue, 'undefined', 'paramValue must be undefined from ERROR text');
+  assert.ok(result.statement && result.statement.indexOf('SELECT') !== -1, 'statement must be present');
+  assert.strictEqual(result.statement.indexOf('"undefined"'), -1, 'statement must not contain raw param');
+  assert.strictEqual(result.statement.indexOf('$3'), -1, 'statement must not contain $3 marker');
+  done();
+});
+
+test('signatureExtractor: extractFinding with real Postgres log shape sets full sql object', function(t, done) {
+  var logExcerpt = loadFixture('postgres-realtime-log.txt');
+  var apiErrors = [{ message: 'invalid input syntax for type integer: "undefined"', path: ['products', 'filter', 'id'], extensions: {} }];
+  var result = signatureExtractor.extractFinding({ apiErrors: apiErrors, logExcerpt: logExcerpt, operationName: 'searchProducts' });
+
+  assert.strictEqual(result.class, 'SQL_PARAM_TYPE', 'class must be SQL_PARAM_TYPE');
+  assert.strictEqual(result.confidence, 'WITH_SQL', 'confidence must be WITH_SQL');
+  assert.strictEqual(result.sql.operator, '!=', 'operator from STATEMENT');
+  assert.strictEqual(result.sql.column, 'id', 'column from STATEMENT');
+  assert.strictEqual(result.sql.table, 'product', 'table from STATEMENT');
+  assert.strictEqual(result.sql.paramIndex, 3, 'paramIndex from CONTEXT');
+  assert.strictEqual(result.sql.paramValue, 'undefined', 'paramValue from ERROR text');
+  assert.strictEqual(result.sql.statement && result.sql.statement.length > 0, true, 'statement present');
+  assert.strictEqual(result.path && result.path.length > 0, true, 'path extracted');
+  done();
+});

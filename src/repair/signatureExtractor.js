@@ -394,6 +394,34 @@ function stripContainerPrefix(line) {
   return m ? m[1] : line;
 }
 
+/**
+ * Strip the <timestamp> <stream> <timestamp> UTC prefix that appears in real
+ * Postgres logs collected via docker-compose with json-file/json log driver.
+ * E.g.:
+ *   "2026-10-23T05:00:00.000Z stderr 2026-10-23 05:00:01.000 UTC ERROR: ..."
+ * becomes:
+ *   "ERROR:  invalid input syntax for type integer: ..."
+ * Handles both 'stderr' and 'stdout' stream identifiers.
+ */
+function stripPostgresLogPrefix(line) {
+  if (!line || typeof line !== 'string') {
+    return line;
+  }
+  // Two timestamps, a stream identifier, then " UTC " before the severity.
+  var m = line.match(/^\S+\s+(?:stderr|stdout)\s+\S+\s+UTC\s+/);
+  if (m) {
+    return line.substring(m[0].length);
+  }
+  return line;
+}
+
+function stripPostgresLogPrefixAll(text) {
+  if (!text || typeof text !== 'string') {
+    return text;
+  }
+  return text.split('\n').map(stripPostgresLogPrefix).join('\n');
+}
+
 function stripContainerPrefixAll(text) {
   if (!text || typeof text !== 'string') {
     return text;
@@ -406,10 +434,20 @@ function parseLogExcerpt(logExcerpt) {
     return null;
   }
   // Docker-compose prefixes the log lines with '<container> | '. Strip that
-  // prefix from every line so the timestamp/severity-anchored regexes below
-  // see a plain Postgres log entry, otherwise the STATEMENT capture swallows
-  // the following prefixed lines (they no longer start with YYYY-MM-DD).
+  // prefix from every line so the Postgres CONTEXT/STATEMENT regexes see the
+  // raw log entry.
   logExcerpt = stripContainerPrefixAll(logExcerpt);
+  // Also strip the real-shape <ts> stderr|stdout <ts> UTC prefix that appears
+  // in logs collected from docker-compose with json-file/json log driver.
+  logExcerpt = stripPostgresLogPrefixAll(logExcerpt);
+
+  // Extract paramValue from ERROR line (e.g., "ERROR:  invalid input syntax
+  // for type integer: \"undefined\"" -> "undefined").  Used in Approach 1.
+  var errorParamValue = null;
+  var errorLineMatch = logExcerpt.match(/ERROR:\s*invalid input syntax for type integer:\s*"([^"]*)"/i);
+  if (errorLineMatch) {
+    errorParamValue = errorLineMatch[1];
+  }
 
   // Approach 1: CONTEXT-style (from Postgres JDBC driver / parameter portals).
   // Find all CONTEXT with unnamed portal parameter $N (optional = 'value').
@@ -431,18 +469,22 @@ function parseLogExcerpt(logExcerpt) {
     var statementMatch = rest.match(/STATEMENT:\s*([\s\S]*?)(?=^\d{4}-\d{2}-\d{2}\b|\n\s*\n|$)/m);
     if (statementMatch) {
       var statement = statementMatch[1].trim();
-      // Extract the condition that references the specific parameter $N:
-      // "<table>"."<col>" != $N style, handling quoted and plain identifiers.
-      var condRegex = new RegExp('("(?:[^"]|"")+"(?:\\.\\"[^"]+\\")*|"[^"]+"|[\\w.]+)\\s*(!==|!=|>=|<=|LIKE|ILIKE|NOT LIKE|NOT ILIKE|=)\\s*\\$' + paramIndex + '(?!\\d)', 'g');
+      // Extract the condition that references the specific parameter $N by looking
+      // for the "<table>"."<column>" <operator> $N pattern, which is the canonical
+      // form in real Postgres STATEMENT output (e.g. "product"."id" != $3).
+      // This captures table and column separately from the bare identifier path.
+      var condRegex = new RegExp('"([^"]+)"\\."([^"]+)"\\s*(!==|!=|>=|<=|=|LIKE|ILIKE|NOT LIKE|NOT ILIKE)\\s*\\$' + paramIndex + '(?!\\d)', 'g');
       var condMatch;
       while ((condMatch = condRegex.exec(statement)) !== null) {
-        var colRaw = condMatch[1].replace(/"/g, '');
-        var colParts = colRaw.split('.');
-        var column = colParts.length > 1 ? colParts[colParts.length - 1] : colRaw;
-        var operator = condMatch[2].trim();
+        var table = condMatch[1];
+        var column = condMatch[2];
+        var operator = condMatch[3].trim();
         var truncStmt = statement.length > 300 ? statement.substring(0, 300) + '...' : statement;
-        truncStmt = truncStmt.replace(/'[^']*'/g, '<val>').replace(/(?<!\$)\b\d+\b/g, '<val>');
-        return { statement: truncStmt, column: column, operator: operator, paramIndex: paramIndex };
+        truncStmt = truncStmt.replace(/'[^']*'/g, '<val>').replace(/\$[0-9]+/g, '<val>').replace(/(?<!\$)\b\d+\b/g, '<val>');
+        // Prefer paramValue from the ERROR text (e.g., "undefined") over the CONTEXT
+        // line value, since the ERROR text is what drives the type mismatch.
+        var paramValue = errorParamValue !== null ? errorParamValue : (lastCtx.paramValue || null);
+        return { statement: truncStmt, column: column, operator: operator, paramIndex: paramIndex, paramValue: paramValue, table: table };
       }
     }
   }
@@ -578,6 +620,21 @@ function extractFinding(input) {
 
   var notes = [];
 
+  // Extract paramValue from the raw ERROR line before any redaction, so the
+  // value is available even when the log is subsequently redacted for emails.
+  var errorParamValue = null;
+  if (logExcerpt) {
+    var epvMatch = logExcerpt.match(/ERROR:\s*invalid input syntax for type integer:\s*"([^"]*)"/i);
+    if (epvMatch) {
+      errorParamValue = epvMatch[1];
+    }
+  }
+
+  // Keep a reference to the raw logExcerpt before redaction so parseLogExcerpt
+  // can extract paramValue from the unredacted ERROR text.  After this block,
+  // logExcerpt is reassigned to the redacted version for all subsequent use.
+  var rawLogExcerpt = logExcerpt;
+
   if (logExcerpt) {
     var redactedExcerpt = redactEmails(logExcerpt);
     if (redactedExcerpt !== logExcerpt) {
@@ -622,7 +679,7 @@ function extractFinding(input) {
       path: null,
       operationName: operationName,
       rootFields: rootFields,
-      sql: { statement: null, operator: null, column: null, paramIndex: null, paramValue: null },
+      sql: { statement: null, operator: null, column: null, paramIndex: null, paramValue: null, table: null },
       confidence: 'API_ONLY',
       notes: notes.length > 0 ? notes : ['No recognizable integer type mismatch error found in apiErrors'],
       domain: domain,
@@ -634,8 +691,10 @@ function extractFinding(input) {
 
   var sqlInfo = null;
   var confidence = 'API_ONLY';
-  if (logExcerpt) {
-    sqlInfo = parseLogExcerpt(logExcerpt);
+  if (rawLogExcerpt) {
+    // Call parseLogExcerpt with the RAW (unredacted) log so it can extract
+    // paramValue from the original ERROR text (e.g., "undefined" or email).
+    sqlInfo = parseLogExcerpt(rawLogExcerpt);
     if (sqlInfo) {
       confidence = 'WITH_SQL';
     } else {
@@ -648,7 +707,11 @@ function extractFinding(input) {
     operator: sqlInfo ? sqlInfo.operator : null,
     column: sqlInfo ? sqlInfo.column : null,
     paramIndex: sqlInfo ? sqlInfo.paramIndex : null,
-    paramValue: apiResult.paramValue
+    // Prefer paramValue from parseLogExcerpt/ERROR-text extraction (sqlInfo) when
+    // available; fall back to errorParamValue (extracted before redaction) or the
+    // value parsed from the API error body.
+    paramValue: (sqlInfo && sqlInfo.paramValue != null) ? sqlInfo.paramValue : (errorParamValue !== null ? errorParamValue : apiResult.paramValue),
+    table: sqlInfo ? sqlInfo.table : null
   };
 
   var normalized = normalizeForSignature('SQL_PARAM_TYPE', apiResult.message, apiResult.path, sql);

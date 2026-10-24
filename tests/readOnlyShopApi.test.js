@@ -13,6 +13,37 @@ var executorModule = require('../src/executor');
 
 var RESULT_PASS = terminalState.RESULT_PASS;
 
+// Pipeline env vars that must not affect test outcomes (tests inject their own getEnv)
+var PIPELINE_ENV_VARS = [
+  'REPAIR_MODEL',
+  'OPENROUTER_API_KEY',
+  'REPAIR_MAX_TOKENS',
+  'REPAIR_REASONING',
+  'REPAIR_MODEL_TIMEOUT_MS'
+];
+var _savedPipelineEnv = {};
+
+var beforeEach = require('node:test').beforeEach;
+var afterEach = require('node:test').afterEach;
+
+beforeEach(function() {
+  PIPELINE_ENV_VARS.forEach(function(k) {
+    _savedPipelineEnv[k] = process.env[k];
+    if (process.env[k] !== undefined) delete process.env[k];
+  });
+});
+
+afterEach(function() {
+  executorModule.resetTaskExecutors();
+  PIPELINE_ENV_VARS.forEach(function(k) {
+    if (_savedPipelineEnv[k] !== undefined) {
+      process.env[k] = _savedPipelineEnv[k];
+    } else {
+      delete process.env[k];
+    }
+  });
+});
+
 function fakeClock(iso) {
   var current = new Date(iso || '2026-10-07T09:00:00.000Z');
   return function() {

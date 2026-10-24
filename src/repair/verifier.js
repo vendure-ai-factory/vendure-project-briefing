@@ -268,7 +268,7 @@ async function runChecks(cloneDir, options) {
   var execCommand = options.execCommand || function(cmd, args, opts) {
     return new Promise(function(resolve) {
       var childProcess = require('child_process');
-      var result = { success: false, stdout: '', stderr: '', exitCode: null, timedOut: false, error: null };
+      var result = { success: false, stdout: '', stderr: '', exitCode: null, timedOut: false, error: null, signal: null };
       var stdout = '';
       var stderr = '';
       var timeout = opts.timeout || 120000;
@@ -289,9 +289,10 @@ async function runChecks(cloneDir, options) {
           }
         }, timeout);
 
-        proc.on('close', function(code) {
+        proc.on('close', function(code, signal) {
           clearTimeout(timer);
           result.exitCode = code;
+          result.signal = signal || null;
           result.timedOut = timedOut;
           result.stdout = stdout.substring(0, 50000);
           result.stderr = stderr.substring(0, 50000);
@@ -329,7 +330,17 @@ async function runChecks(cloneDir, options) {
     var cmd = cmdParts[0];
     var args = cmdParts.slice(1);
 
-    var execResult = await execCommand(cmd, args, {
+    // Resolve bare command names to local node_modules/.bin binaries so that
+    // `tsc` becomes `<cloneDir>/node_modules/.bin/tsc` when the tool is installed.
+    var resolvedCmd = cmd;
+    if (cmd.indexOf('/') === -1 && cmd.indexOf('\\') === -1 && cmd.indexOf('.') === -1) {
+      var localBin = path.join(cloneDir, 'node_modules', '.bin', cmd);
+      if (fs.existsSync(localBin)) {
+        resolvedCmd = localBin;
+      }
+    }
+
+    var execResult = await execCommand(resolvedCmd, args, {
       cwd: cloneDir,
       timeout: timeout
     });
@@ -345,18 +356,23 @@ async function runChecks(cloneDir, options) {
     // child 'error' event with no exit code and no output. Treat it as the
     // same non-fatal "toolchain unavailable" skip instead of a failed check.
     var spawnFailed = execResult.exitCode === null && !(execResult.stdout || '') && !(execResult.stderr || '') && !!execResult.error;
+    var isSkipped = spawnFailed;
 
     results.push({
       script: scriptName,
-      command: cmd + (args.length > 0 ? ' ' + args.join(' ') : ''),
-      success: !spawnFailed && execResult.success,
+      command: resolvedCmd + (args.length > 0 ? ' ' + args.join(' ') : ''),
+      resolvedCommand: resolvedCmd,
+      success: !isSkipped && execResult.success,
       exitCode: execResult.exitCode,
       timedOut: execResult.timedOut,
-      skipped: spawnFailed,
-      code: spawnFailed ? 'CHECKS_SKIPPED_NO_TOOLCHAIN' : undefined,
+      skipped: isSkipped,
+      code: isSkipped ? 'CHECKS_SKIPPED_NO_TOOLCHAIN' : undefined,
       stdout: redactedOut,
       stderr: spawnFailed ? 'command not found: ' + cmd : redactedErr,
-      error: execResult.error ? redactSecrets(execResult.error, collectEnvSecrets()) : null
+      error: execResult.error ? redactSecrets(execResult.error, collectEnvSecrets()) : null,
+      cwd: cloneDir,
+      hasNodeModules: hasNodeModules,
+      signal: execResult.signal || null
     });
   }
 

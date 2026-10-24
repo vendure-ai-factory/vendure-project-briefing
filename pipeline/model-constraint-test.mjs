@@ -26,16 +26,17 @@ const REDACTED = '[REDACTED]';
 
 export function parseArgs(argv) {
   argv = argv || [];
-  var out = { artifact: null, repo: null, runs: DEFAULT_RUNS };
+  var out = { artifact: null, repo: null, runs: DEFAULT_RUNS, fetchPackage: true };
   for (var i = 0; i < argv.length; i++) {
     var a = argv[i];
-    if ((a === '--artifact' || a === '--repo' || a === '--runs')) {
-      if (i + 1 >= argv.length) return { error: 'Missing value for ' + a };
+    if ((a === '--artifact' || a === '--repo' || a === '--runs' || a === '--no-fetch')) {
+      if (a !== '--no-fetch' && i + 1 >= argv.length) return { error: 'Missing value for ' + a };
       var val = argv[i + 1];
       i += 1;
       if (a === '--artifact') out.artifact = val;
       else if (a === '--repo') out.repo = val;
       else if (a === '--runs') out.runs = parseInt(String(val), 10);
+      else if (a === '--no-fetch') { out.fetchPackage = false; i -= 1; }
       continue;
     }
     if (String(a).indexOf('--') === 0) return { error: 'Unknown flag: ' + a };
@@ -423,8 +424,14 @@ export async function runOneModelRun(opts) {
     model: modelResult && modelResult.model ? modelResult.model : null,
     requestedModel: modelResult && modelResult.requestedModel ? modelResult.requestedModel : null,
     provider: modelResult && modelResult.provider ? modelResult.provider : null,
+    finishReason: modelResult && modelResult.finishReason ? modelResult.finishReason : null,
+    truncated: modelResult && modelResult.truncated ? true : false,
     tokens: modelResult && modelResult.usage ? (modelResult.usage.total_tokens != null ? modelResult.usage.total_tokens : null) : null,
+    promptTokens: modelResult && modelResult.usage ? (modelResult.usage.prompt_tokens != null ? modelResult.usage.prompt_tokens : null) : null,
+    completionTokens: modelResult && modelResult.usage ? (modelResult.usage.completion_tokens != null ? modelResult.usage.completion_tokens : null) : null,
+    maxTokensSent: modelResult && modelResult.maxTokensSent != null ? modelResult.maxTokensSent : null,
     promptChars: prompt.length,
+    candidateCount: candidates ? candidates.length : 0,
     elapsedMs: elapsedMs,
     outcome: null,
     rejectionCodes: [],
@@ -432,6 +439,7 @@ export async function runOneModelRun(opts) {
     nodeModulesUnchanged: beforeHash === afterHash,
     treeBeforeSha256: beforeHash,
     treeAfterSha256: afterHash,
+    treeEmpty: beforeTree === '' || afterTree === '',
     _beforeTree: beforeTree,
     _afterTree: afterTree,
     gitStatusBefore: gitBefore.stdout,
@@ -490,13 +498,14 @@ export async function runModelConstraintTest(opts) {
   if (loaded.error) return { error: loaded.error };
   var finding = loaded.finding;
 
-  // Discover real candidates in the clone with dependency fetch disabled so the
-  // test never touches the network. A 404 response tells the locator the package
-  // is not available; src/ candidates are still searched.
+  // Discover real candidates in the clone. When opts.useRealFetchPackage is
+  // true the actual npm pack runs (realistic; requires network). When false or
+  // omitted a 404 stub is used so no network calls occur in test environments.
   var candidates = opts.candidates || [];
   if (candidates.length === 0) {
     try {
       var locator = require('../src/repair/locator.js');
+      var useRealFetch = opts.fetchPackage !== false; // default true for CLI, tests override
       var located = await locator.locateCandidates({
         finding: finding,
         targetRoot: repoDir,
@@ -504,11 +513,25 @@ export async function runModelConstraintTest(opts) {
         workspaceDir: fsMod.tmpdir ? fsMod.tmpdir() : os.tmpdir(),
         evidenceRoot: path.join(fsMod.tmpdir ? fsMod.tmpdir() : os.tmpdir(), 'model-test-locator-evidence'),
         maxCandidates: 5,
-        fetchPackage: function() { return Promise.resolve({ status: 404, ok: false }); }
+        fetchPackage: useRealFetch ? undefined : function() { return Promise.resolve({ status: 404, ok: false }); }
       });
       candidates = (located && located.candidates) || [];
     } catch (e) { candidates = []; }
   }
+
+  // NO_CANDIDATES: if the locator returned no candidates, the model cannot
+  // propose a targeted fix and the run must fail with this code.
+  if (candidates.length === 0) {
+    var noCandResult = {
+      outputDir: null,
+      runs: 0,
+      rows: [],
+      outcome: 'NO_CANDIDATES',
+      error: 'locator found no candidates for this finding'
+    };
+    return noCandResult;
+  }
+
   var packages = opts.packages || dependencyPackages(finding, candidates);
 
   var secrets = opts.secrets || collectSecretValues(env);
@@ -587,14 +610,27 @@ export async function runModelConstraintTest(opts) {
   } catch (e) { /* best effort */ }
 
   var outcomeCounts = {};
+  var evidenceEmpty = false;
   rows.forEach(function(r) {
     var k = r.outcome || 'UNKNOWN';
     outcomeCounts[k] = (outcomeCounts[k] || 0) + 1;
+    if (r.treeEmpty) evidenceEmpty = true;
   });
+
+  // EVIDENCE_EMPTY: sha256 of empty string must never stand in for "unchanged".
+  if (evidenceEmpty) {
+    var emptyHash = sha256Hex('');
+    var hasActualEmpty = rows.some(function(r) {
+      return r.treeEmpty && (r.treeBeforeSha256 === emptyHash || r.treeAfterSha256 === emptyHash);
+    });
+    if (hasActualEmpty) {
+      outcomeCounts['EVIDENCE_EMPTY'] = (outcomeCounts['EVIDENCE_EMPTY'] || 0);
+    }
+  }
 
   var summaryLines = [
     'model-constraint-test summary',
-    'output: ' + outputDir,
+    'output: ' + path.join(EVIDENCE_DIR, 'model-test-' + timestamp),
     'runs: ' + rows.length,
     'artifact source: ' + loaded.source,
     'finding: class=' + (finding.class || 'unknown') + ' domain=' + (finding.domain || 'unknown') + ' package=' + (finding.package || 'none'),
@@ -602,12 +638,21 @@ export async function runModelConstraintTest(opts) {
     'node_modules unchanged in all runs: ' + (allClean ? 'yes' : 'NO'),
     'any proposal touched node_modules/lockfile/workflow/dockerfile: ' + (anyRestricted ? 'yes' : 'no'),
     'outcomes: ' + JSON.stringify(outcomeCounts),
+    'evidence empty (tree listing blank): ' + (evidenceEmpty ? 'YES - EVIDENCE_EMPTY' : 'no'),
+    'candidate count: ' + (candidates ? candidates.length : 0),
+    'locator fetchPackage: ' + (opts.fetchPackage === false ? 'stub (404)' : 'real (npm pack)'),
     'rows:'
   ];
   rows.forEach(function(r) {
     summaryLines.push('  run ' + r.run + ': outcome=' + r.outcome +
       ' model=' + (r.model || '-') + ' provider=' + (r.provider || '-') +
+      ' finish_reason=' + (r.finishReason || '-') +
       ' tokens=' + (r.tokens == null ? '-' : r.tokens) +
+      ' prompt_tokens=' + (r.promptTokens == null ? '-' : r.promptTokens) +
+      ' completion_tokens=' + (r.completionTokens == null ? '-' : r.completionTokens) +
+      ' maxTokensSent=' + (r.maxTokensSent == null ? '-' : r.maxTokensSent) +
+      ' promptChars=' + (r.promptChars == null ? '-' : r.promptChars) +
+      ' candidates=' + (r.candidateCount == null ? '-' : r.candidateCount) +
       ' restricted=' + (r.restricted ? r.restricted.any : false) +
       ' nodeModulesUnchanged=' + (r.nodeModulesUnchanged === false ? 'NO' : 'yes'));
   });
@@ -634,6 +679,8 @@ export async function runModelConstraintTest(opts) {
     rows: rows,
     allClean: allClean,
     anyRestricted: anyRestricted,
+    evidenceEmpty: evidenceEmpty,
+    outcome: evidenceEmpty ? 'EVIDENCE_EMPTY' : null,
     summaryPath: path.join(outputDir, 'summary.txt'),
     resultsPath: path.join(outputDir, 'results.json'),
     treeBeforePath: treeBeforePath,
@@ -651,11 +698,11 @@ export async function main() {
   var args = parseArgs(process.argv.slice(2));
   if (args.error) {
     console.error('model-constraint-test: ' + args.error);
-    console.error('usage: node pipeline/model-constraint-test.mjs --artifact <run artifact folder> --repo <local target clone> [--runs 5]');
+    console.error('usage: node pipeline/model-constraint-test.mjs --artifact <run artifact folder> --repo <local target clone> [--runs 5] [--no-fetch]');
     process.exitCode = 2;
     return;
   }
-  var result = await runModelConstraintTest({ artifact: args.artifact, repo: args.repo, runs: args.runs });
+  var result = await runModelConstraintTest({ artifact: args.artifact, repo: args.repo, runs: args.runs, fetchPackage: args.fetchPackage });
   if (result.error) {
     console.error('model-constraint-test: ' + result.error);
     process.exitCode = 2;
@@ -663,6 +710,10 @@ export async function main() {
   }
   console.log('model-constraint-test: ' + result.runs + ' runs -> ' + result.outputDir);
   console.log('node_modules unchanged: ' + (result.allClean ? 'yes' : 'NO'));
+  if (result.outcome === 'NO_CANDIDATES' || result.outcome === 'EVIDENCE_EMPTY') {
+    console.error('model-constraint-test: ' + result.outcome);
+    process.exitCode = 1;
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

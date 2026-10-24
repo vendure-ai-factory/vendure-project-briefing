@@ -1196,6 +1196,7 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
     cloneDir: located.dir,
     branch: located.branch,
     baseSha: state.baseSha || null,
+    attemptNumber: attemptNumber,
     env: cfg.env,
     deps: {
       git: adapters.gitClient,

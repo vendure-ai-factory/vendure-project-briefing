@@ -1,0 +1,4 @@
+2026-10-23T05:00:00.000Z stderr 2026-10-23 05:00:01.000 UTC ERROR:  invalid input syntax for type integer: "undefined"
+2026-10-23T05:00:00.001Z stderr 2026-10-23 05:00:01.100 UTC CONTEXT:  unnamed portal parameter $3 = 'undefined'
+2026-10-23T05:00:00.002Z stderr 2026-10-23 05:00:01.200 UTC STATEMENT:  SELECT DISTINCT "distinctAlias"."product_id" AS "ids_product_id", "product"."id" AS "product_id" FROM "product" "product" WHERE (("product"."deletedAt" IS NULL)) AND ("product"."enabled" = $2 AND ("product"."id" != $3)) ORDER BY "product"."id" ASC
+2026-10-23T05:00:00.003Z stderr 2026-10-23 05:00:01.900 UTC LOG:  duration: 1.234 ms

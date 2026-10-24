@@ -743,6 +743,21 @@ function buildReAskPrompt(validationError) {
 }
 
 /**
+ * Build a re-ask prompt specifically for when the model's response was
+ * truncated (finish_reason=length). The model is told the previous answer was
+ * cut off and asked to return a shorter edit set covering only the most
+ * critical changes.
+ */
+function buildTruncatedReAskPrompt() {
+  var schema = '{\n  "repairKind": "source-edit|config-edit|migration|dependency-bump|dependency-patch|local-wrapper",\n  "rationale": "string",\n  "edits": [{"path": "string", "oldString": "string", "newString": "string"}],\n  "newFiles": "[optional] array of {path: string, content: string}"\n}';
+  return 'Your previous response was cut off before it could be completed (the output exceeded the max token limit).\n\n' +
+    'Please provide a shorter, more concise edit set that addresses the most critical fixes only.\n\n' +
+    'Required JSON structure:\n' + schema + '\n\n' +
+    'Output ONLY valid JSON. Keep the edits array minimal — prefer 1-3 high-impact edits over exhaustive coverage.\n' +
+    'Do not include any explanation or prose, only the JSON object.';
+}
+
+/**
  * Compare two version strings without a dependency on semver. Returns positive
  * when b is newer than a's numeric segments are compared componentwise.
  */
@@ -790,6 +805,7 @@ async function proposeAndCheck(options) {
   var budget = options.budget;
   var runId = options.runId;
   var cloneDir = options.cloneDir;
+  var attemptNumber = options.attemptNumber != null ? options.attemptNumber : 1;
   var branch = options.branch;
   var baseSha = options.baseSha;
   var env = options.env;
@@ -842,7 +858,7 @@ async function proposeAndCheck(options) {
 
   // Step 1: domain 'infrastructure' or 'client-input' -> BLOCKED
   if (domain === 'infrastructure' || domain === 'client-input') {
-    writeAttemptSummary(runId, 1, {
+    writeAttemptSummary(runId, attemptNumber, {
       status: 'BLOCKED',
       codes: ['DOMAIN_NOT_REPAIRABLE'],
       requestedPaths: [],
@@ -902,7 +918,7 @@ async function proposeAndCheck(options) {
   // Step 2: consume budget
   var consumeResult = model.consume(budget, finding.signature);
   if (!consumeResult.ok) {
-    writeAttemptSummary(runId, 1, {
+    writeAttemptSummary(runId, attemptNumber, {
       status: 'BLOCKED',
       codes: ['BUDGET_EXHAUSTED'],
       requestedPaths: [],
@@ -923,7 +939,7 @@ async function proposeAndCheck(options) {
     var repoRoot = path.resolve(__dirname, '..', '..');
     var scratchResult = await scratchCopy(repoRoot, runId, runCommand);
     if (!scratchResult.ok) {
-      writeAttemptSummary(runId, 1, {
+      writeAttemptSummary(runId, attemptNumber, {
         status: 'BLOCKED',
         codes: ['SCRATCH_COPY_FAILED'],
         requestedPaths: [],
@@ -976,7 +992,7 @@ async function proposeAndCheck(options) {
   var elapsedMs = (typeof modelNow === 'function' ? modelNow() : Date.now()) - modelStartMs;
 
   if (!modelResult.ok) {
-    writeAttemptSummary(runId, 1, {
+    writeAttemptSummary(runId, attemptNumber, {
       status: 'MODEL_FAILED',
       codes: [modelResult.blocker && modelResult.blocker.code ? modelResult.blocker.code : 'MODEL_FAILED'],
       requestedPaths: [],
@@ -1001,7 +1017,9 @@ async function proposeAndCheck(options) {
   if (!parseResult.ok) {
     // Store evidence for the failed parse (no raw content, no secrets)
     var parseEvidence = {
-      responseLength: modelResult.text ? modelResult.text.length : 0
+      responseLength: modelResult.text ? modelResult.text.length : 0,
+      finishReason: modelResult.finishReason || null,
+      truncated: modelResult.truncated || false
     };
     try {
       var partial = JSON.parse((modelResult.text || '{}').trim().substring(0, 500));
@@ -1009,8 +1027,11 @@ async function proposeAndCheck(options) {
     } catch (e) { /* partial parse failed, keys unknown */ }
     parseEvidence.validationRuleFailed = parseResult.error;
 
-    // Re-ask: one structured retry with JSON schema and validation error
-    var reAskPrompt = buildReAskPrompt(parseResult.error);
+    // When finish_reason='length' the response was truncated; use a shorter
+    // re-ask that tells the model the answer was cut off.
+    var reAskPrompt = modelResult.truncated
+      ? buildTruncatedReAskPrompt()
+      : buildReAskPrompt(parseResult.error);
     var reAskStartMs = (typeof modelNow === 'function' ? modelNow() : Date.now());
     var reAskResult = await model.callModel({
       prompt: reAskPrompt,
@@ -1030,7 +1051,7 @@ async function proposeAndCheck(options) {
         parseResult = reAskParseResult;
       } else {
         // Re-ask parse failed - record REJECTED with evidence
-        writeAttemptSummary(runId, 1, {
+        writeAttemptSummary(runId, attemptNumber, {
           status: 'REJECTED',
           codes: ['PARSE_ERROR'],
           requestedPaths: [],
@@ -1052,7 +1073,7 @@ async function proposeAndCheck(options) {
       }
     } else {
       // Re-ask model call failed - record REJECTED with evidence
-      writeAttemptSummary(runId, 1, {
+      writeAttemptSummary(runId, attemptNumber, {
         status: 'REJECTED',
         codes: ['PARSE_ERROR'],
         requestedPaths: [],
@@ -1091,7 +1112,7 @@ async function proposeAndCheck(options) {
           errors: ['proposal is identical to a previously rejected attempt - do not repeat the same approach'],
           blocker: { code: 'IDENTICAL_REPEAT_PROPOSAL', message: 'proposal is identical to a previously rejected attempt - do not repeat the same approach' }
         };
-        writeAttemptSummary(runId, 1, {
+        writeAttemptSummary(runId, attemptNumber, {
           status: 'REJECTED',
           codes: ['IDENTICAL_REPEAT_PROPOSAL'],
           requestedPaths: [],
@@ -1120,7 +1141,7 @@ async function proposeAndCheck(options) {
   if (!pathGate.ok) {
     var rejectionCodes = ['PROPOSAL_OUTSIDE_CANDIDATES'];
     var validPaths = pathGate.validPaths;
-    writeAttemptSummary(runId, 1, {
+    writeAttemptSummary(runId, attemptNumber, {
       status: 'REJECTED',
       codes: rejectionCodes,
       requestedPaths: requestedPaths,
@@ -1155,7 +1176,7 @@ async function proposeAndCheck(options) {
   if (!validationResult.ok) {
     var vCodes = extractErrorCodes(validationResult.errors);
     var vValid = candidateRelPaths(cloneDir, realCandidates);
-    writeAttemptSummary(runId, 1, {
+    writeAttemptSummary(runId, attemptNumber, {
       status: 'REJECTED',
       codes: vCodes,
       requestedPaths: requestedPaths,
@@ -1190,7 +1211,7 @@ async function proposeAndCheck(options) {
     if (applyResult.blocker && (applyResult.blocker.code === 'LOCKFILE_OUT_OF_SYNC' || applyResult.blocker.code === 'LOCKFILE_REGEN_FAILED')) {
       var depCodes = [applyResult.blocker.code];
       var depValid = candidateRelPaths(cloneDir, realCandidates);
-      writeAttemptSummary(runId, 1, {
+      writeAttemptSummary(runId, attemptNumber, {
         status: 'REJECTED',
         codes: depCodes,
         requestedPaths: requestedPaths,
@@ -1234,7 +1255,7 @@ async function proposeAndCheck(options) {
   var checkResult = await verifier.runChecks(cloneDir, checkOptions);
 
   if (!checkResult.ok) {
-    writeAttemptSummary(runId, 1, {
+    writeAttemptSummary(runId, attemptNumber, {
       status: 'CHECKS_FAILED',
       codes: ['CHECKS_FAILED'],
       requestedPaths: requestedPaths,

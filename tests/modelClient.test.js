@@ -474,6 +474,116 @@ test('callModel: max_tokens=4000 constant', function() {
   });
 });
 
+test('callModel: finish_reason=length returns truncated=true and finishReason', function() {
+  var capturedBody = null;
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function(url, opts) {
+      capturedBody = opts && opts.body;
+      return Promise.resolve({ status: 200, json: function() {
+        return Promise.resolve({
+          choices: [{ message: { content: '{"repairKind":"source-edit","rationale":"' }, finish_reason: 'length' }],
+          usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
+        });
+      }});
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.finishReason, 'length');
+    assert.strictEqual(r.truncated, true);
+    assert.strictEqual(r.maxTokensSent, 4000);
+    // The response text is truncated so parse should fail
+    var p = modelClient.parseEditSet(r.text);
+    assert.strictEqual(p.ok, false);
+  });
+});
+
+test('callModel: REPAIR_MAX_TOKENS env overrides default max_tokens', function() {
+  var capturedBody = null;
+  var prev = process.env.REPAIR_MAX_TOKENS;
+  process.env.REPAIR_MAX_TOKENS = '8192';
+  var r = modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function(url, opts) {
+      capturedBody = opts && opts.body;
+      return Promise.resolve({ status: 200, json: function() { return Promise.resolve({ choices: [{ message: { content: '{}' } }], usage: { total_tokens: 10 } }); } });
+    }
+  });
+  if (prev === undefined) delete process.env.REPAIR_MAX_TOKENS; else process.env.REPAIR_MAX_TOKENS = prev;
+  return r.then(function(result) {
+    var body = JSON.parse(capturedBody);
+    assert.strictEqual(body.max_tokens, 8192, 'REPAIR_MAX_TOKENS=8192 must override default 4000');
+    assert.strictEqual(result.maxTokensSent, 8192);
+  });
+});
+
+test('callModel: REPAIR_REASONING=off disables reasoning effort', function() {
+  var capturedBody = null;
+  var prev = process.env.REPAIR_REASONING;
+  process.env.REPAIR_REASONING = 'off';
+  var r = modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function(url, opts) {
+      capturedBody = opts && opts.body;
+      return Promise.resolve({ status: 200, json: function() { return Promise.resolve({ choices: [{ message: { content: '{}' } }], usage: { total_tokens: 10 } }); } });
+    }
+  });
+  if (prev === undefined) delete process.env.REPAIR_REASONING; else process.env.REPAIR_REASONING = prev;
+  return r.then(function(result) {
+    var body = JSON.parse(capturedBody);
+    assert.deepStrictEqual(body.reasoning, { effort: 'off' }, 'REPAIR_REASONING=off must produce {effort:"off"}');
+  });
+});
+
+test('callModel: NETWORK_ERROR retry with backoff records on second failure', function() {
+  var attempts = 0;
+  var capturedAttempts = [];
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    _backoffBase: 1,
+    fetch: function() {
+      attempts += 1;
+      capturedAttempts.push(attempts);
+      return Promise.reject(new Error('ECONNREFUSED'));
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'NETWORK_ERROR');
+    assert.strictEqual(attempts, 2, 'must attempt twice before recording NETWORK_ERROR');
+  });
+});
+
+test('callModel: success returns prompt/completion/total tokens', function() {
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: { OPENROUTER_API_KEY: 'tok' },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function() {
+      return Promise.resolve({ status: 200, json: function() {
+        return Promise.resolve({
+          choices: [{ message: { content: '{"repairKind":"source-edit","rationale":"test","edits":[],"newFiles":[]}' } }],
+          usage: { prompt_tokens: 42, completion_tokens: 18, total_tokens: 60 }
+        });
+      }});
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.usage.prompt_tokens, 42);
+    assert.strictEqual(r.usage.completion_tokens, 18);
+    assert.strictEqual(r.usage.total_tokens, 60);
+    assert.strictEqual(r.finishReason, null);
+    assert.strictEqual(r.truncated, false);
+  });
+});
+
 test('callModel: wrong status code returns HTTP_502', function() {
   return modelClient.callModel({
     prompt: 'hello',

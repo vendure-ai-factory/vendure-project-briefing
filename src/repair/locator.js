@@ -697,6 +697,65 @@ function addConfigFiles(targetRoot, targets, searched) {
   } catch (err) { /* ignore unreadable dirs */ }
 }
 
+function addConfigBuildingCandidates(targetRoot, finding, candidates, searched) {
+  if (!targetRoot) return;
+  var dirs = [];
+  var srcDir = path.join(targetRoot, 'src');
+  if (fs.existsSync(srcDir)) dirs.push(srcDir);
+  var cfgRoot = path.join(targetRoot, 'config');
+  if (fs.existsSync(cfgRoot)) dirs.push(cfgRoot);
+  var scanned = [];
+  var seen = {};
+  for (var d = 0; d < dirs.length; d++) {
+    var files = [];
+    try {
+      files = findSourceFiles(dirs[d], []);
+    } catch (e) { /* ignore */ }
+    for (var i = 0; i < files.length; i++) {
+      var fp = files[i];
+      var rel2 = path.relative(targetRoot, fp).replace(/\\/g, '/');
+      if (seen[rel2]) continue;
+      seen[rel2] = true;
+      var rel2full = rel2;
+      var content;
+      try {
+        content = fs.readFileSync(fp, 'utf8');
+      } catch (e2) { /* ignore */ }
+      if (content == null) continue;
+      // Detect config-building content: a plugins array, a config object, or an
+      // import/require of any dependency matched by the finding. This is generic
+      // and never mentions a concrete filename.
+      var isConfig = /plugins\s*:\s*\[/.test(content) ||
+        /VendureConfig\b/.test(content) || /createServer\s*\(/.test(content) ||
+        /\bconfig\s*=\s*\{/.test(content) || /\bregister\s*\(/.test(content);
+      if (!isConfig && /from\s+['"]|require\s*\(\s*['"]/.test(content)) {
+        // A module that imports external packages is a plausible registration
+        // site for a fix (e.g. it may already import the plugin being fixed).
+        isConfig = true;
+      }
+      if (!isConfig) continue;
+      if (rel2full === '') continue;
+      if (searched && searched.indexOf(rel2full) === -1) searched.push(rel2full);
+      var snippet = []
+      try {
+        var ctx = getContextLines(fp, 1, null);
+        snippet = (ctx && ctx.snippet) || ctx || [];
+      } catch (e3) { snippet = []; }
+      candidates.push({
+        source: 'config',
+        package: null,
+        file: rel2full,
+        line: 1,
+        snippet: snippet,
+        score: 30,
+        reasons: ['config-building registration site'],
+        why: 'tracked config/registration file that builds the application configuration (plugins array / config object / dependency import)'
+      });
+    }
+  }
+  return { candidates: candidates, scanned: scanned };
+}
+
 function collectSearchTargets(targetRoot, finding, searched) {
   var targets = [];
   // Target src/
@@ -939,6 +998,16 @@ async function locateCandidates(options) {
 
   // Sort by score descending
   candidates.sort(function(a, b) { return b.score - a.score; });
+
+  // (3.5) Config-building registration files are ALWAYS candidates, even when
+  // no pattern matched them. A plugin/route/middleware registration lives in a
+  // config-style file (e.g. a `plugins: [...]` array, a VendureConfig-like
+  // object, or a bootstrapping module) that the bug fix may need to edit. Those
+  // files must be offered to the model regardless of pattern hits, so a
+  // proposal touching the registration site is not rejected as
+  // PROPOSAL_OUTSIDE_CANDIDATES. Detection is purely content-based (no
+  // hard-coded filenames).
+  addConfigBuildingCandidates(targetRoot, finding, candidates, searched);
 
   // Check if we have a strong match (score >= 6)
   // Strong match skips the dependency search. A candidate is strong only when

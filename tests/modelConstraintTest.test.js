@@ -297,3 +297,150 @@ test('modelClient: no eligible provider error -> MODEL_NO_ELIGIBLE_PROVIDER', as
   });
   assert.strictEqual(r2.blocker.code, 'HTTP_400', 'unrelated 400 stays HTTP_400');
 });
+
+test('run: NO_CANDIDATES when locator finds none', async function() {
+  var m = await modulePromise;
+  var repo = makeRepo({});
+  var cwd = process.cwd();
+  // A finding whose path does not exist and whose pattern matches nothing
+  // in the repo -> locator finds no candidates.
+  var result = await m.runModelConstraintTest({
+    artifact: path.join(cwd, 'manifest'),
+    repo: repo,
+    runs: 1,
+    finding: makeFinding({ path: 'nonexistent/file.ts', stack: [] }),
+    candidates: [], // triggers locator
+    fetchPackage: false // hermetic: no network in tests
+  });
+  assert.strictEqual(result.outcome, 'NO_CANDIDATES', 'empty candidates must yield NO_CANDIDATES outcome');
+  assert.strictEqual(result.error && result.error.indexOf('no candidates') !== -1, true);
+  try { fs.rmSync(result.outputDir || path.join(cwd, EVIDENCE_DIR, 'model-test-no-candidate'), { recursive: true, force: true }); } catch (e) {}
+  try { fs.rmSync(repo, { recursive: true, force: true }); } catch (e) {}
+});
+
+test('run: EVIDENCE_EMPTY when tree listing is blank', async function() {
+  var m = await modulePromise;
+  // A repo with no node_modules at all -> tree listing is empty -> EVIDENCE_EMPTY
+  var repo = makeRepo({}); // no node_modules
+  var cwd = process.cwd();
+  var stub = {
+    callModel: function(opts) {
+      return Promise.resolve({
+        ok: true,
+        text: JSON.stringify(COMPLIANT_EDIT_SET),
+        requestedModel: 'x', model: 'x', provider: 'stub',
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        finishReason: 'stop',
+        truncated: false,
+        maxTokensSent: 4000
+      });
+    },
+    parseEditSet: function(text) { return realModelClient.parseEditSet(text); }
+  };
+  var result = await m.runModelConstraintTest({
+    artifact: path.join(cwd, 'manifest'),
+    repo: repo,
+    runs: 1,
+    finding: makeFinding(),
+    candidates: [{ file: path.join(repo, 'src', 'x.js'), line: 1, snippet: [{ line: 'old content' }], source: 'target' }],
+    modelClient: stub
+  });
+  assert.strictEqual(result.evidenceEmpty, true, 'no node_modules tree means empty listing');
+  assert.strictEqual(result.outcome, 'EVIDENCE_EMPTY');
+  try { fs.rmSync(result.outputDir, { recursive: true, force: true }); } catch (e) {}
+  try { fs.rmSync(repo, { recursive: true, force: true }); } catch (e) {}
+});
+
+test('run: rows include finish_reason, token counts, maxTokensSent, candidateCount', async function() {
+  var m = await modulePromise;
+  var repo = makeRepo({});
+  var cwd = process.cwd();
+  var stub = {
+    callModel: function(opts) {
+      return Promise.resolve({
+        ok: true,
+        text: JSON.stringify(COMPLIANT_EDIT_SET),
+        requestedModel: 'z', model: 'z-model', provider: 'stub-provider',
+        usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+        finishReason: 'stop',
+        truncated: false,
+        maxTokensSent: 8192
+      });
+    },
+    parseEditSet: function(text) { return realModelClient.parseEditSet(text); }
+  };
+  var result = await m.runModelConstraintTest({
+    artifact: path.join(cwd, 'manifest'),
+    repo: repo,
+    runs: 1,
+    finding: makeFinding(),
+    candidates: [{ file: path.join(repo, 'src', 'x.js'), line: 1, snippet: [{ line: 'old content' }], source: 'target' }],
+    modelClient: stub
+  });
+  var row = result.rows[0];
+  assert.strictEqual(row.finishReason, 'stop');
+  assert.strictEqual(row.tokens, 150);
+  assert.strictEqual(row.promptTokens, 100);
+  assert.strictEqual(row.completionTokens, 50);
+  assert.strictEqual(row.maxTokensSent, 8192);
+  assert.strictEqual(row.candidateCount, 1);
+  assert.strictEqual(row.promptChars > 0, true);
+  try { fs.rmSync(result.outputDir, { recursive: true, force: true }); } catch (e) {}
+  try { fs.rmSync(repo, { recursive: true, force: true }); } catch (e) {}
+});
+
+test('run: finish_reason=length stub triggers truncated marker', async function() {
+  var m = await modulePromise;
+  var repo = makeRepo({});
+  var cwd = process.cwd();
+  var stub = {
+    callModel: function(opts) {
+      return Promise.resolve({
+        ok: true,
+        text: '{"repairKind":"source-edit","rationale":"','finish_reason':'length',
+        requestedModel: 'z', model: 'z', provider: 'stub',
+        usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+        finishReason: 'length',
+        truncated: true,
+        maxTokensSent: 4000
+      });
+    },
+    parseEditSet: function(text) { return realModelClient.parseEditSet(text); }
+  };
+  var result = await m.runModelConstraintTest({
+    artifact: path.join(cwd, 'manifest'),
+    repo: repo,
+    runs: 1,
+    finding: makeFinding(),
+    candidates: [{ file: path.join(repo, 'src', 'x.js'), line: 1, snippet: [{ line: 'old content' }], source: 'target' }],
+    modelClient: stub
+  });
+  var row = result.rows[0];
+  assert.strictEqual(row.outcome, 'PARSE_ERROR', 'truncated response must yield PARSE_ERROR');
+  assert.strictEqual(row.finishReason, 'length');
+  assert.strictEqual(row.truncated, true);
+  try { fs.rmSync(result.outputDir, { recursive: true, force: true }); } catch (e) {}
+  try { fs.rmSync(repo, { recursive: true, force: true }); } catch (e) {}
+});
+
+test('parseArgs: default runs is 5', async function() {
+  var m = await modulePromise;
+  var ok = m.parseArgs(['--artifact', '/a', '--repo', '/b']);
+  assert.strictEqual(ok.runs, 5);
+});
+
+test('parseArgs: --no-fetch sets fetchPackage to false', async function() {
+  var m = await modulePromise;
+  var ok = m.parseArgs(['--artifact', '/a', '--repo', '/b', '--no-fetch']);
+  assert.strictEqual(ok.fetchPackage, false);
+  var ok2 = m.parseArgs(['--artifact', '/a', '--repo', '/b']);
+  assert.strictEqual(ok2.fetchPackage, true, 'fetchPackage must be true by default');
+});
+
+test('parseArgs: --no-fetch can appear before other flags', async function() {
+  var m = await modulePromise;
+  var ok = m.parseArgs(['--no-fetch', '--artifact', '/a', '--repo', '/b']);
+  assert.strictEqual(ok.fetchPackage, false);
+  assert.strictEqual(ok.artifact, '/a');
+  assert.strictEqual(ok.repo, '/b');
+});

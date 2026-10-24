@@ -12,8 +12,34 @@ var cliModule = require('../src/cli');
 // a registered executor into a later test (order-independence). No test mutates
 // process.env; all env access is via injected getEnv closures.
 var afterEach = require('node:test').afterEach;
+var beforeEach = require('node:test').beforeEach;
+
+// Pipeline env vars that must not affect test outcomes
+var PIPELINE_ENV_VARS = [
+  'REPAIR_MODEL',
+  'OPENROUTER_API_KEY',
+  'REPAIR_MAX_TOKENS',
+  'REPAIR_REASONING',
+  'REPAIR_MODEL_TIMEOUT_MS'
+];
+var _savedPipelineEnv = {};
+
+beforeEach(function() {
+  PIPELINE_ENV_VARS.forEach(function(k) {
+    _savedPipelineEnv[k] = process.env[k];
+    if (process.env[k] !== undefined) delete process.env[k];
+  });
+});
+
 afterEach(function() {
   require('../src/executor').resetTaskExecutors();
+  PIPELINE_ENV_VARS.forEach(function(k) {
+    if (_savedPipelineEnv[k] !== undefined) {
+      process.env[k] = _savedPipelineEnv[k];
+    } else {
+      delete process.env[k];
+    }
+  });
 });
 
 var MANIFEST_PATH = path.join(__dirname, '..', 'manifest', 'acceptance-manifest.v0.4.json');

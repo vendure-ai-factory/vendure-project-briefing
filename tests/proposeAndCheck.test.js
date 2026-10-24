@@ -1663,3 +1663,95 @@ test('l-patches: prompt keeps patches/ out of allowed paths when dependencyPatch
   );
   assert.ok(enabledPrompt.indexOf('patches/') !== -1, 'prompt advertises patches/ as an allowed path when dependencyPatch is true');
 });
+
+test('attempt-N.json: each attemptNumber writes its own file with matching status', async function() {
+  // Test that proposeAndCheck writes attempt-1.json, attempt-2.json, attempt-3.json
+  // each with the status corresponding to that attempt's outcome.
+  var dir = createTempProject({
+    'src/x.js': 'old content\n',
+    'package.json': '{"name":"test","scripts":{"build":"echo build-ok","test":"echo test-ok"}}'
+  });
+  var candidates = validCandidates(dir);
+  var runId = 'test-attempt-n-' + Date.now();
+
+  // Attempt 1: REJECTED via PROPOSAL_OUTSIDE_CANDIDATES (invented path not in candidates)
+  var deps1 = createFakeDeps();
+  deps1._modelResponse = JSON.stringify({
+    repairKind: 'source-edit',
+    rationale: 'attempt 1 fix',
+    edits: [{ path: 'src/invented.js', oldString: 'x', newString: 'y' }],
+    newFiles: []
+  });
+  var result1 = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'target-code', signature: 'sig-att1-' + Date.now() },
+    candidates: candidates,
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    attemptNumber: 1,
+    env: {},
+    deps: deps1
+  });
+  assert.strictEqual(result1.status, 'REJECTED', 'attempt 1 should be REJECTED');
+  assert.ok(result1.rejectionCodes && result1.rejectionCodes.indexOf('PROPOSAL_OUTSIDE_CANDIDATES') !== -1,
+    'attempt 1 rejection should include PROPOSAL_OUTSIDE_CANDIDATES');
+
+  // Attempt 2: MODEL_FAILED (model unavailable)
+  var deps2 = createFakeDeps();
+  deps2._modelBlocker = { code: 'MODEL_NO_ELIGIBLE_PROVIDER', message: 'no eligible provider' };
+  var result2 = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'target-code', signature: 'sig-att2-' + Date.now() },
+    candidates: candidates,
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    attemptNumber: 2,
+    env: {},
+    deps: deps2
+  });
+  assert.strictEqual(result2.status, 'MODEL_FAILED', 'attempt 2 should be MODEL_FAILED');
+
+  // Attempt 3: BLOCKED (domain infrastructure)
+  var result3 = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'infrastructure', signature: 'sig-att3-' + Date.now() },
+    candidates: candidates,
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    attemptNumber: 3,
+    env: {},
+    deps: createFakeDeps()
+  });
+  assert.strictEqual(result3.status, 'BLOCKED', 'attempt 3 should be BLOCKED');
+
+  // Verify all three attempt files exist with correct statuses
+  var repairDir = path.join('.', 'evidence', runId, 'repair');
+  var a1 = JSON.parse(fs.readFileSync(path.join(repairDir, 'attempt-1.json'), 'utf8'));
+  assert.strictEqual(a1.attempt, 1, 'attempt-1.json has attempt=1');
+  assert.strictEqual(a1.status, 'REJECTED', 'attempt-1 status is REJECTED');
+  assert.ok(a1.codes && a1.codes.indexOf('PROPOSAL_OUTSIDE_CANDIDATES') !== -1,
+    'attempt-1 codes include PROPOSAL_OUTSIDE_CANDIDATES');
+
+  var a2 = JSON.parse(fs.readFileSync(path.join(repairDir, 'attempt-2.json'), 'utf8'));
+  assert.strictEqual(a2.attempt, 2, 'attempt-2.json has attempt=2');
+  assert.strictEqual(a2.status, 'MODEL_FAILED', 'attempt-2 status is MODEL_FAILED');
+  assert.ok(a2.codes && a2.codes.indexOf('MODEL_NO_ELIGIBLE_PROVIDER') !== -1,
+    'attempt-2 codes include MODEL_NO_ELIGIBLE_PROVIDER');
+
+  var a3 = JSON.parse(fs.readFileSync(path.join(repairDir, 'attempt-3.json'), 'utf8'));
+  assert.strictEqual(a3.attempt, 3, 'attempt-3.json has attempt=3');
+  assert.strictEqual(a3.status, 'BLOCKED', 'attempt-3 status is BLOCKED');
+  assert.ok(a3.codes && a3.codes.indexOf('DOMAIN_NOT_REPAIRABLE') !== -1,
+    'attempt-3 codes include DOMAIN_NOT_REPAIRABLE');
+
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+});

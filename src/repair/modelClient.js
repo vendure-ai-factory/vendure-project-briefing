@@ -3,7 +3,8 @@
 var BUDGET_MODEL_MAX_TOKENS = 400000;
 var SIGNAL_TIMEOUT_MS = 120000;
 var DEFAULT_TIMEOUT_MS = 300000;
-var MAX_TOKENS = 4000;
+var DEFAULT_MAX_TOKENS = 4000;
+var RAISED_MAX_TOKENS = 8192;
 var MODEL_CONSTANT = 'z-ai/glm-5.3-flash';
 var API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 var REDACTED_MARKER = '[REDACTED]';
@@ -22,6 +23,47 @@ function resolveConfiguredModel(env) {
   return MODEL_CONSTANT;
 }
 
+/**
+ * Resolve max_tokens for the request. Order: REPAIR_MAX_TOKENS env (env object
+ * or process.env), then opts.maxTokensOverride, then DEFAULT_MAX_TOKENS.
+ * When finish_reason=length is observed, the caller should retry with RAISED_MAX_TOKENS.
+ */
+function resolveMaxTokens(opts) {
+  var env = opts && opts.env && typeof opts.env === 'object' ? opts.env : null;
+  if (env && typeof env.REPAIR_MAX_TOKENS === 'string' && env.REPAIR_MAX_TOKENS !== '') {
+    var n = parseInt(env.REPAIR_MAX_TOKENS, 10);
+    if (n > 0) return n;
+  }
+  if (typeof process !== 'undefined' && process.env && typeof process.env.REPAIR_MAX_TOKENS === 'string' && process.env.REPAIR_MAX_TOKENS !== '') {
+    var pn = parseInt(process.env.REPAIR_MAX_TOKENS, 10);
+    if (pn > 0) return pn;
+  }
+  return DEFAULT_MAX_TOKENS;
+}
+
+/**
+ * Resolve reasoning effort. Order: REPAIR_REASONING env (env object or
+ * process.env), then opts.reasoningOverride, then 'low'.
+ * Recognized values: 'low', 'off', 'high', null/empty -> 'low'.
+ */
+function resolveReasoningEffort(opts) {
+  var env = opts && opts.env && typeof opts.env === 'object' ? opts.env : null;
+  var envVal = null;
+  if (env && typeof env.REPAIR_REASONING === 'string' && env.REPAIR_REASONING !== '') {
+    envVal = env.REPAIR_REASONING;
+  } else if (typeof process !== 'undefined' && process.env && typeof process.env.REPAIR_REASONING === 'string' && process.env.REPAIR_REASONING !== '') {
+    envVal = process.env.REPAIR_REASONING;
+  }
+  if (envVal !== null && (envVal === 'off' || envVal === 'low' || envVal === 'high')) {
+    return { effort: envVal };
+  }
+  var override = opts && opts.reasoningOverride;
+  if (override === 'off' || override === 'low' || override === 'high') {
+    return { effort: override };
+  }
+  return REASONING_EFFORT;
+}
+
 var BUDGET_SCHEMA = {
   perSignature: 3,
   global: 15,
@@ -30,6 +72,7 @@ var BUDGET_SCHEMA = {
 };
 
 var REASONING_EFFORT = { effort: 'low' };
+var REASONING_EFFORT_DISABLED = { effort: 'off' };
 
 function consume(budget, signature) {
   if (!budget) return { ok: false, reason: 'no budget' };
@@ -174,6 +217,9 @@ function callModel(opts) {
   var _now = opts.now || function() { return Date.now(); };
   var promptChars = prompt.length;
   var host = fetchUtil.hostOf(API_URL) || 'openrouter.ai';
+  var resolvedMaxTokens = resolveMaxTokens(opts);
+  var resolvedReasoning = resolveReasoningEffort(opts);
+  var maxTokensSent = resolvedMaxTokens;
 
   // Parameters that may be dropped if the provider rejects them.
   // reasoning/response_format/max_tokens are optional niceties; when the
@@ -181,7 +227,7 @@ function callModel(opts) {
   var dropped = {};
   var attemptsMade = { n: 0 };
 
-  function buildBody() {
+  function buildBody(reqMaxTokens, reqReasoning) {
     var b = {
       model: usedModel,
       messages: messages,
@@ -190,8 +236,8 @@ function callModel(opts) {
         require_parameters: true
       }
     };
-    if (!dropped.max_tokens) b.max_tokens = MAX_TOKENS;
-    if (!dropped.reasoning) b.reasoning = REASONING_EFFORT;
+    if (!dropped.max_tokens) b.max_tokens = (reqMaxTokens != null) ? reqMaxTokens : resolvedMaxTokens;
+    if (!dropped.reasoning) b.reasoning = reqReasoning || resolvedReasoning;
     if (!dropped.response_format) b.response_format = { type: 'json_object' };
     return JSON.stringify(b);
   }
@@ -228,7 +274,7 @@ function callModel(opts) {
     }, timeoutMs);
 
     return fetchPromise.then(function(result) {
-      return processResponse(result, { attempt: attempt, startedAt: startedAt, promptChars: promptChars, host: host });
+      return processResponse(result, { attempt: attempt, startedAt: startedAt, promptChars: promptChars, host: host, maxTokensSent: maxTokensSent });
     }).catch(function(fetchErr) {
       var elapsedMs = _now() - startedAt;
       if (fetchErr && fetchErr.name === 'AbortError') {
@@ -243,8 +289,10 @@ function callModel(opts) {
           requestedModel: usedModel
         };
       }
+      // NETWORK_ERROR: signal retry once via run() loop with backoff
       return {
         ok: false,
+        retry: true,
         blocker: {
           code: 'NETWORK_ERROR',
           message: 'Failed to reach OpenRouter: ' + fetchErr.message,
@@ -361,6 +409,12 @@ function callModel(opts) {
       if (!data.choices || !data.choices[0] || !data.choices[0].message) {
         return invalidResponse('response JSON missing choices', bodyResult.length, response, meta);
       }
+      // Record finish_reason (stop, length, content_filter, etc.) from OpenRouter.
+      var finishReason = data.choices[0].finish_reason || null;
+      // When finish_reason is 'length' the response was truncated at max_tokens;
+      // mark it so the caller can re-ask with a "shorter" prompt.
+      var wasTruncated = finishReason === 'length';
+
       var usage = data.usage || {};
       var totalTokens = typeof usage.total_tokens === 'number' ? usage.total_tokens :
         ((typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : 0) +
@@ -386,7 +440,10 @@ function callModel(opts) {
           prompt_tokens: usage.prompt_tokens || 0,
           completion_tokens: usage.completion_tokens || 0,
           total_tokens: totalTokens
-        }
+        },
+        finishReason: finishReason,
+        truncated: wasTruncated,
+        maxTokensSent: meta.maxTokensSent != null ? meta.maxTokensSent : resolvedMaxTokens
       };
     });
   }
@@ -397,6 +454,7 @@ function callModel(opts) {
     evidence.host = host;
     evidence.promptChars = meta.promptChars;
     evidence.attempt = meta.attempt;
+    evidence.maxTokensSent = meta.maxTokensSent;
     if (length != null && evidence.bodyLength == null) evidence.bodyLength = length;
     return { ok: false, blocker: { code: 'INVALID_RESPONSE', message: 'Failed to parse OpenRouter response: ' + reason, evidence: evidence } };
   }
@@ -555,6 +613,9 @@ module.exports = {
   REDACTED_MARKER: REDACTED_MARKER,
   SIGNAL_TIMEOUT_MS: SIGNAL_TIMEOUT_MS,
   DEFAULT_TIMEOUT_MS: DEFAULT_TIMEOUT_MS,
-  MAX_TOKENS: MAX_TOKENS,
-  resolveTimeoutMs: resolveTimeoutMs
+  DEFAULT_MAX_TOKENS: DEFAULT_MAX_TOKENS,
+  RAISED_MAX_TOKENS: RAISED_MAX_TOKENS,
+  resolveTimeoutMs: resolveTimeoutMs,
+  resolveMaxTokens: resolveMaxTokens,
+  resolveReasoningEffort: resolveReasoningEffort
 };
