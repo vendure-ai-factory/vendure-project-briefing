@@ -373,6 +373,9 @@ function writeAttemptSummary(runId, attemptNumber, data, fsMod, now) {
     if (data.checks) {
       summary.checks = summarizeChecks(data.checks);
     }
+    if (data.checkKilled) {
+      summary.checkKilled = data.checkKilled;
+    }
     fsMod.writeFileSync(path.join(dir, 'attempt-' + attemptNumber + '.json'), JSON.stringify(summary, null, 2) + '\n', 'utf8');
   } catch (e) { /* best effort */ }
 }

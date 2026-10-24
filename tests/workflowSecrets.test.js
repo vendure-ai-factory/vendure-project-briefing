@@ -49,7 +49,8 @@ var PIPELINE_NAMES = [
 ];
 var REPAIR_NAMES = [
   'VENDURE_STAGING_REPO_TOKEN','OPENROUTER_API_KEY',
-  'REPAIR_MODE','PIPELINE_STAGING_URL','PIPELINE_ARCHIVE_ROOT',
+  'REPAIR_MODE','REPAIR_MODEL','REPAIR_MAX_TOKENS','REPAIR_REASONING',
+  'PIPELINE_STAGING_URL','PIPELINE_ARCHIVE_ROOT',
   'STRIPE_SECRET_KEY','STAGING_ADMIN_EMAIL','STAGING_ADMIN_PASSWORD',
   'SEED_TEST_CUSTOMER_PASSWORD','CHANNEL_TOKENS'
 ];
@@ -80,4 +81,18 @@ test('workflowSecrets: pipeline run block clean', function() {
 });
 test('workflowSecrets: repair run block clean', function() {
   assert.ok(!SECRET_RE.test(rRun));
+});
+test('workflowSecrets: repair step has REPAIR_MODEL from workflow_dispatch', function() {
+  assert.ok(rKeys.indexOf('REPAIR_MODEL') !== -1, 'REPAIR_MODEL in repair env');
+});
+test('workflowSecrets: repair step has REPAIR_MAX_TOKENS from workflow_dispatch', function() {
+  assert.ok(rKeys.indexOf('REPAIR_MAX_TOKENS') !== -1, 'REPAIR_MAX_TOKENS in repair env');
+});
+test('workflowSecrets: repair step has REPAIR_REASONING from workflow_dispatch', function() {
+  assert.ok(rKeys.indexOf('REPAIR_REASONING') !== -1, 'REPAIR_REASONING in repair env');
+});
+test('workflowSecrets: repair step dispatch inputs not in pipeline step', function() {
+  assert.ok(pKeys.indexOf('REPAIR_MODEL') === -1, 'REPAIR_MODEL not in pipeline');
+  assert.ok(pKeys.indexOf('REPAIR_MAX_TOKENS') === -1, 'REPAIR_MAX_TOKENS not in pipeline');
+  assert.ok(pKeys.indexOf('REPAIR_REASONING') === -1, 'REPAIR_REASONING not in pipeline');
 });

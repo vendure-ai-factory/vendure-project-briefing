@@ -50,6 +50,9 @@ function classifyErrorCode(errorCode) {
       return FAILURE_CATEGORIES.PIPELINE_DEFECT;
     case 'INVALID_ARGS':
     case 'VALIDATION_ERROR':
+    case 'REPO_TOKEN_MISSING':
+    case 'REPO_TOKEN_INVALID_OR_EXPIRED':
+    case 'REPO_TOKEN_INSUFFICIENT_SCOPE':
       return FAILURE_CATEGORIES.CLIENT_INPUT_SCOPE;
     case 'ASSERTION_FAILED':
     case 'EXPECTED_MISMATCH':
@@ -86,6 +89,11 @@ function classifyByErrorMessage(errorMessage, errorCode) {
       lowerMessage.indexOf('forbidden') !== -1 ||
       lowerMessage.indexOf('access denied') !== -1) {
     return FAILURE_CATEGORIES.SAFETY_AUTHORIZATION;
+  }
+
+  if (lowerMessage.indexOf('could not read username') !== -1 ||
+      lowerMessage.indexOf('authentication failed') !== -1) {
+    return FAILURE_CATEGORIES.CLIENT_INPUT_SCOPE;
   }
 
   if (lowerMessage.indexOf('invalid') !== -1 ||

@@ -399,6 +399,104 @@ test('failureClassifier: findFirstUnrecoverableFailure returns null for empty ar
   done();
 });
 
+test('failureClassifier: REPO_TOKEN_MISSING maps to CLIENT_INPUT_SCOPE', function(t, done) {
+  var result = failureClassifier.classifyStepFailure({
+    success: false,
+    errorCode: 'REPO_TOKEN_MISSING',
+    error: 'VENDURE_STAGING_REPO_TOKEN is empty or not set',
+    stepId: 'step-1',
+    action: 'GIT_CLONE'
+  });
+
+  assert.strictEqual(result.failureCategory, 'CLIENT_INPUT_SCOPE', 'REPO_TOKEN_MISSING should be CLIENT_INPUT_SCOPE');
+  assert.strictEqual(result.potentiallyRecoverable, false, 'CLIENT_INPUT_SCOPE should not be recoverable');
+  done();
+});
+
+test('failureClassifier: REPO_TOKEN_INVALID_OR_EXPIRED maps to CLIENT_INPUT_SCOPE', function(t, done) {
+  var result = failureClassifier.classifyStepFailure({
+    success: false,
+    errorCode: 'REPO_TOKEN_INVALID_OR_EXPIRED',
+    error: 'GitHub API returned 401 for vendure-ai-factory/vendure-staging-baseline',
+    stepId: 'step-1',
+    action: 'GIT_PUSH'
+  });
+
+  assert.strictEqual(result.failureCategory, 'CLIENT_INPUT_SCOPE', 'REPO_TOKEN_INVALID_OR_EXPIRED should be CLIENT_INPUT_SCOPE');
+  assert.strictEqual(result.potentiallyRecoverable, false, 'CLIENT_INPUT_SCOPE should not be recoverable');
+  done();
+});
+
+test('failureClassifier: REPO_TOKEN_INSUFFICIENT_SCOPE maps to CLIENT_INPUT_SCOPE', function(t, done) {
+  var result = failureClassifier.classifyStepFailure({
+    success: false,
+    errorCode: 'REPO_TOKEN_INSUFFICIENT_SCOPE',
+    error: 'GitHub API returned 403: insufficient scope for vendure-ai-factory/vendure-staging-baseline',
+    stepId: 'step-1',
+    action: 'GIT_DISPATCH'
+  });
+
+  assert.strictEqual(result.failureCategory, 'CLIENT_INPUT_SCOPE', 'REPO_TOKEN_INSUFFICIENT_SCOPE should be CLIENT_INPUT_SCOPE');
+  assert.strictEqual(result.potentiallyRecoverable, false, 'CLIENT_INPUT_SCOPE should not be recoverable');
+  done();
+});
+
+test('failureClassifier: git "could not read Username" error is CLIENT_INPUT_SCOPE', function(t, done) {
+  var result = failureClassifier.classifyStepFailure({
+    success: false,
+    error: 'fatal: could not read Username for \'https://github.com\': No such device or address',
+    stepId: 'step-1',
+    action: 'GIT_CLONE'
+  });
+
+  assert.strictEqual(result.failureCategory, 'CLIENT_INPUT_SCOPE', '"could not read Username" should be CLIENT_INPUT_SCOPE');
+  assert.strictEqual(result.potentiallyRecoverable, false, 'CLIENT_INPUT_SCOPE should not be recoverable');
+  done();
+});
+
+test('failureClassifier: git "Authentication failed" error is CLIENT_INPUT_SCOPE', function(t, done) {
+  var result = failureClassifier.classifyStepFailure({
+    success: false,
+    error: 'fatal: Authentication failed for \'https://github.com/owner/repo.git\'',
+    stepId: 'step-1',
+    action: 'GIT_PUSH'
+  });
+
+  assert.strictEqual(result.failureCategory, 'CLIENT_INPUT_SCOPE', '"Authentication failed" should be CLIENT_INPUT_SCOPE');
+  assert.strictEqual(result.potentiallyRecoverable, false, 'CLIENT_INPUT_SCOPE should not be recoverable');
+  done();
+});
+
+test('failureClassifier: REPO_TOKEN_INVALID_OR_EXPIRED (404) maps to REPO_TOKEN_INSUFFICIENT_SCOPE', function(t, done) {
+  var result = failureClassifier.classifyStepFailure({
+    success: false,
+    errorCode: 'REPO_TOKEN_INSUFFICIENT_SCOPE',
+    error: 'GitHub API returned 404: repository not found or not accessible',
+    stepId: 'step-1',
+    action: 'GIT_CLONE'
+  });
+
+  assert.strictEqual(result.failureCategory, 'CLIENT_INPUT_SCOPE', '404 should map to REPO_TOKEN_INSUFFICIENT_SCOPE');
+  assert.strictEqual(result.potentiallyRecoverable, false, 'CLIENT_INPUT_SCOPE should not be recoverable');
+  done();
+});
+
+test('failureClassifier: credential error token content not in evidence', function(t, done) {
+  var result = failureClassifier.classifyStepFailure({
+    success: false,
+    errorCode: 'REPO_TOKEN_INVALID_OR_EXPIRED',
+    error: 'GitHub API returned 401 for vendure-ai-factory/vendure-staging-baseline',
+    stepId: 'step-1',
+    action: 'GIT_CLONE'
+  });
+
+  var serialized = JSON.stringify(result);
+  assert.strictEqual(serialized.indexOf('sk-'), -1, 'No secret token content in evidence');
+  assert.strictEqual(serialized.indexOf('ghp_'), -1, 'No GitHub token content in evidence');
+  assert.strictEqual(serialized.indexOf('github_pat'), -1, 'No GitHub PAT content in evidence');
+  done();
+});
+
 test('failureClassifier: findFirstUnrecoverableFailure returns null for null input', function(t, done) {
   var result = failureClassifier.findFirstUnrecoverableFailure(null);
   assert.strictEqual(result, null, 'Null input should return null');

@@ -16,6 +16,21 @@ on:
         required: false
         type: boolean
         default: false
+      repair_model:
+        description: "Model to use for repair (default: current model)"
+        required: false
+        type: string
+        default: ""
+      repair_max_tokens:
+        description: "Max tokens for repair (default: 8192)"
+        required: false
+        type: number
+        default: 0
+      repair_reasoning:
+        description: "Enable reasoning in repair model"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -185,6 +200,9 @@ jobs:
           VENDURE_STAGING_REPO_TOKEN: ${{ secrets.VENDURE_STAGING_REPO_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           REPAIR_MODE: ${{ inputs.repair }}
+          REPAIR_MODEL: ${{ inputs.repair_model }}
+          REPAIR_MAX_TOKENS: ${{ inputs.repair_max_tokens }}
+          REPAIR_REASONING: ${{ inputs.repair_reasoning }}
           PIPELINE_STAGING_URL: ${{ env.STAGING_API_URL }}
           PIPELINE_ARCHIVE_ROOT: ${{ env.STAGING_ARCHIVE_DIR }}
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}

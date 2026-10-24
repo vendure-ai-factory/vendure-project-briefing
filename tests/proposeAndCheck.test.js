@@ -1755,3 +1755,166 @@ test('attempt-N.json: each attemptNumber writes its own file with matching statu
 
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
 });
+
+// e-killed: process killed with signal and no output -> CHECKS_ERROR, attempt-N.json has checkKilled
+test('e-killed: process killed with signal+no-output -> CHECKS_ERROR with checkKilled metadata', async function() {
+  var dir = createTempProject({
+    'src/x.js': 'old\n',
+    'package.json': '{"name":"test","scripts":{"build":"node -e \'while(1){}\'"}}'
+  });
+  var runId = 'test-check-error-' + Date.now();
+  var deps = createFakeDeps();
+  deps.verifier.runChecks = function(cloneDir, opts) {
+    return Promise.resolve({
+      ok: false,
+      timedOut: true,
+      results: [
+        { script: 'build', success: false, exitCode: null, timedOut: true, skipped: false, signal: 'SIGKILL', stdout: '', stderr: '', cwd: cloneDir }
+      ]
+    });
+  };
+
+  var result = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'target-code', signature: 'sig-killed-' + Date.now() },
+    candidates: validCandidates(dir),
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    attemptNumber: 1,
+    env: {},
+    deps: deps
+  });
+
+  assert.strictEqual(result.status, 'CHECKS_ERROR', 'killed process should be CHECKS_ERROR not CHECKS_FAILED');
+  assert.ok(result.errors[0].indexOf('checks error') !== -1, 'error message mentions checks error');
+  assert.ok(result.errors[0].indexOf('SIGKILL') !== -1, 'error message mentions signal');
+
+  var attemptPath = path.join('.', 'evidence', runId, 'repair', 'attempt-1.json');
+  assert.ok(fs.existsSync(attemptPath), 'attempt-1.json exists for CHECKS_ERROR');
+  var attempt = JSON.parse(fs.readFileSync(attemptPath, 'utf8'));
+  assert.strictEqual(attempt.status, 'CHECKS_ERROR', 'attempt-1.json status is CHECKS_ERROR');
+  assert.deepStrictEqual(attempt.codes, ['CHECKS_ERROR']);
+  assert.ok(attempt.checkKilled, 'checkKilled metadata present');
+  assert.strictEqual(attempt.checkKilled.signal, 'SIGKILL');
+  assert.strictEqual(attempt.checkKilled.timedOut, true);
+
+  try { fs.rmSync(path.join('.', 'evidence', runId), { recursive: true, force: true }); } catch (e) {}
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+});
+
+// e-checks-failed-attempt: CHECKS_FAILED writes attempt-N.json with correct status
+test('e-checks-failed: CHECKS_FAILED writes attempt-N.json with status and codes matching compliance table', async function() {
+  var dir = createTempProject({
+    'src/x.js': 'old\n',
+    'package.json': '{"name":"test","scripts":{"build":"exit 1"}}'
+  });
+  var runId = 'test-check-failed-att-' + Date.now();
+  var deps = createFakeDeps();
+  deps._checksFail = true;
+  deps.verifier.runChecks = function(cloneDir, opts) {
+    return Promise.resolve({
+      ok: false,
+      results: [
+        { script: 'build', success: false, exitCode: 1, timedOut: false, skipped: false, signal: null, stdout: '', stderr: 'build failed' }
+      ]
+    });
+  };
+
+  var result = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'target-code', signature: 'sig-cf-' + Date.now() },
+    candidates: validCandidates(dir),
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/test',
+    baseSha: 'abc123',
+    attemptNumber: 1,
+    env: {},
+    deps: deps
+  });
+
+  assert.strictEqual(result.status, 'CHECKS_FAILED', 'check failure status is CHECKS_FAILED');
+  var attemptPath = path.join('.', 'evidence', runId, 'repair', 'attempt-1.json');
+  var attempt = JSON.parse(fs.readFileSync(attemptPath, 'utf8'));
+  assert.strictEqual(attempt.status, 'CHECKS_FAILED');
+  assert.deepStrictEqual(attempt.codes, ['CHECKS_FAILED']);
+  assert.strictEqual(attempt.attempt, 1);
+  assert.strictEqual(attempt.checks.length, 1);
+  assert.strictEqual(attempt.checks[0].exitCode, 1);
+
+  try { fs.rmSync(path.join('.', 'evidence', runId), { recursive: true, force: true }); } catch (e) {}
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+});
+
+// compliance-vs-attempt: attempt-N.json status/codes match compliance-report attempts table entries
+test('compliance-vs-attempt: attempt-N.json status/codes match compliance-report attempt table', async function() {
+  var dir = createTempProject({
+    'src/x.js': 'old\n',
+    'package.json': '{"name":"test","scripts":{"build":"exit 1"}}'
+  });
+  var runId = 'test-cmpl-att-' + Date.now();
+
+  // Attempt 1: REJECTED
+  var deps1 = createFakeDeps();
+  deps1._modelResponse = JSON.stringify({
+    repairKind: 'source-edit', rationale: 'fix',
+    edits: [{ path: 'src/invented.js', oldString: 'x', newString: 'y' }], newFiles: []
+  });
+  var result1 = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'target-code', signature: 'sig-ca1-' + Date.now() },
+    candidates: validCandidates(dir), previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId, cloneDir: dir, branch: 'test', baseSha: 'abc123',
+    attemptNumber: 1, env: {}, deps: deps1
+  });
+  assert.strictEqual(result1.status, 'REJECTED');
+
+  // Attempt 2: MODEL_FAILED
+  var deps2 = createFakeDeps();
+  deps2._modelBlocker = { code: 'MODEL_TIMEOUT', message: 'timeout' };
+  var result2 = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'target-code', signature: 'sig-ca2-' + Date.now() },
+    candidates: validCandidates(dir), previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId, cloneDir: dir, branch: 'test', baseSha: 'abc123',
+    attemptNumber: 2, env: {}, deps: deps2
+  });
+  assert.strictEqual(result2.status, 'MODEL_FAILED');
+
+  // Attempt 3: CHECKS_FAILED
+  var deps3 = createFakeDeps();
+  deps3.verifier.runChecks = function() {
+    return Promise.resolve({ ok: false, results: [{ script: 'build', success: false, exitCode: 1, timedOut: false, skipped: false, signal: null, stdout: '', stderr: '' }] });
+  };
+  var result3 = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'target-code', signature: 'sig-ca3-' + Date.now() },
+    candidates: validCandidates(dir), previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId, cloneDir: dir, branch: 'test', baseSha: 'abc123',
+    attemptNumber: 3, env: {}, deps: deps3
+  });
+  assert.strictEqual(result3.status, 'CHECKS_FAILED');
+
+  // Build a simulated compliance-report attempts table (same data from same runId)
+  var repairDir = path.join('.', 'evidence', runId, 'repair');
+  var complianceAttempts = [
+    { n: 1, status: 'REJECTED', codes: ['PROPOSAL_OUTSIDE_CANDIDATES'] },
+    { n: 2, status: 'MODEL_FAILED', codes: ['MODEL_TIMEOUT'] },
+    { n: 3, status: 'CHECKS_FAILED', codes: ['CHECKS_FAILED'] }
+  ];
+
+  // Verify each attempt-N.json matches the compliance table entry
+  for (var ci = 0; ci < complianceAttempts.length; ci++) {
+    var ca = complianceAttempts[ci];
+    var aFile = JSON.parse(fs.readFileSync(path.join(repairDir, 'attempt-' + ca.n + '.json'), 'utf8'));
+    assert.strictEqual(aFile.status, ca.status, 'attempt-' + ca.n + ' status matches compliance table: ' + ca.status);
+    assert.deepStrictEqual(aFile.codes, ca.codes, 'attempt-' + ca.n + ' codes match compliance table');
+  }
+
+  try { fs.rmSync(path.join('.', 'evidence', runId), { recursive: true, force: true }); } catch (e) {}
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+});
