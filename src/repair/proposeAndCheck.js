@@ -1254,25 +1254,48 @@ async function proposeAndCheck(options) {
 
   var checkResult = await verifier.runChecks(cloneDir, checkOptions);
 
+  // Detect if any script was killed by signal (e.g. SIGKILL on timeout) with no
+  // output — this is distinct from a clean exit-with-non-zero-code failure.
+  var killedWithNoOutput = false;
+  var killedResults = [];
+  if (!checkResult.ok && Array.isArray(checkResult.results)) {
+    for (var ci = 0; ci < checkResult.results.length; ci++) {
+      var cr = checkResult.results[ci];
+      if (cr.signal && !cr.stdout && !cr.stderr) {
+        killedWithNoOutput = true;
+        killedResults.push(cr);
+      }
+    }
+  }
+
   if (!checkResult.ok) {
+    var checkStatus = killedWithNoOutput ? 'CHECKS_ERROR' : 'CHECKS_FAILED';
+    var checkCodes = killedWithNoOutput ? ['CHECKS_ERROR'] : ['CHECKS_FAILED'];
     writeAttemptSummary(runId, attemptNumber, {
-      status: 'CHECKS_FAILED',
-      codes: ['CHECKS_FAILED'],
+      status: checkStatus,
+      codes: checkCodes,
       requestedPaths: requestedPaths,
       candidatePaths: (candidates || []).map(function(c) { return c.file; }),
       tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
       promptChars: promptChars,
       elapsedMs: elapsedMs,
-      checks: { results: checkResult.results }
+      checks: { results: checkResult.results },
+      checkKilled: killedWithNoOutput ? {
+        signal: killedResults[0] ? killedResults[0].signal : null,
+        timedOut: killedResults[0] ? killedResults[0].timedOut : null,
+        cwd: killedResults[0] ? killedResults[0].cwd : null
+      } : null
     }, fs, now);
     // Restore clone
     if (mode === 'target') {
       applier.restoreClone(cloneDir, runCommand);
     }
     return {
-      status: 'CHECKS_FAILED',
+      status: checkStatus,
       checks: { results: checkResult.results },
-      errors: ['checks failed']
+      errors: killedWithNoOutput
+        ? ['checks error: process killed with signal ' + (killedResults[0] ? killedResults[0].signal : 'unknown')]
+        : ['checks failed']
     };
   }
 
