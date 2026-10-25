@@ -272,6 +272,7 @@ test('run-repair: FIXED on attempt 1', async function() {
     cwd: cwd,
     normalRun: normalDefectTasks(),
     env: { VENDURE_STAGING_REPO_TOKEN: 'tok-secret-1', OPENROUTER_API_KEY: 'key-secret-1' },
+    fetch: validFetch(),
     adapters: fakeAdapters(ctrl, log),
     rerunTasks: async function() { return [{ taskId: 'CAN-B1-03', result: 'RESULT_PASS' }, { taskId: 'CAN-B1-04', result: 'RESULT_PASS' }, { taskId: 'CAN-B2-16', result: 'RESULT_PASS' }]; },
     extractAfter: function() { return []; }
@@ -319,6 +320,7 @@ test('run-repair: FIXED on attempt 2 after a failed first deploy retest with rol
     cwd: cwd,
     normalRun: normalDefectTasks(),
     env: { VENDURE_STAGING_REPO_TOKEN: 'tok-secret-2', OPENROUTER_API_KEY: 'key-secret-2' },
+    fetch: validFetch(),
     adapters: adapters,
     rerunTasks: async function() { return [{ taskId: 'CAN-B1-03', result: 'BLOCK' }]; },
     extractAfter: function() { 
@@ -356,6 +358,7 @@ test('run-repair: budget exhausted -> NOT_FIXED exit 3', async function() {
     cwd: cwd,
     normalRun: normalDefectTasks(),
     env: { VENDURE_STAGING_REPO_TOKEN: 'tok-test', OPENROUTER_API_KEY: 'key-test' },
+    fetch: validFetch(),
 
     adapters: fakeAdapters(ctrl, log),
     rerunTasks: async function() { return [{ taskId: 'CAN-B1-03', result: 'BLOCK' }]; },
@@ -382,6 +385,7 @@ test('run-repair: budget cap ends loop with NOT_FIXED when every attempt is refu
     cwd: cwd,
     normalRun: normalDefectTasks(),
     env: { VENDURE_STAGING_REPO_TOKEN: 'tok-test', OPENROUTER_API_KEY: 'key-test' },
+    fetch: validFetch(),
 
     adapters: fakeAdapters(ctrl, log),
     rerunTasks: async function() { return [{ taskId: 'CAN-B1-03', result: 'BLOCK' }]; },
@@ -402,6 +406,8 @@ test('run-repair: BLOCKED when log wrapper refuses (finding still extracted)', a
     runId: 'run-logblock',
     cwd: cwd,
     normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-logblock', OPENROUTER_API_KEY: 'key-logblock' },
+    fetch: validFetch(),
     adapters: fakeAdapters(ctrl, log)
   });
   assert.strictEqual(res.outcome, 'BLOCKED');
@@ -453,6 +459,7 @@ test('run-repair: BLOCKED when git clone refuses', async function() {
     cwd: cwd,
     normalRun: normalDefectTasks(),
     env: { VENDURE_STAGING_REPO_TOKEN: 'tok-test', OPENROUTER_API_KEY: 'key-test' },
+    fetch: validFetch(),
 
     adapters: fakeAdapters(ctrl, log)
   });
@@ -474,6 +481,7 @@ test('run-repair: BLOCKED when the model is unavailable', async function() {
     cwd: cwd,
     normalRun: normalDefectTasks(),
     env: { VENDURE_STAGING_REPO_TOKEN: 'tok-test', OPENROUTER_API_KEY: 'key-test' },
+    fetch: validFetch(),
 
     adapters: fakeAdapters(ctrl, log)
   });
@@ -492,6 +500,7 @@ test('run-repair: BLOCKED when image dispatch is refused (403)', async function(
     cwd: cwd,
     normalRun: normalDefectTasks(),
     env: { VENDURE_STAGING_REPO_TOKEN: 'tok-test', OPENROUTER_API_KEY: 'key-test' },
+    fetch: validFetch(),
 
     adapters: fakeAdapters(ctrl, log),
     rerunTasks: async function() { return []; },
@@ -512,6 +521,7 @@ test('run-repair: BLOCKED when deploy is refused', async function() {
     cwd: cwd,
     normalRun: normalDefectTasks(),
     env: { VENDURE_STAGING_REPO_TOKEN: 'tok-test', OPENROUTER_API_KEY: 'key-test' },
+    fetch: validFetch(),
 
     adapters: fakeAdapters(ctrl, log),
     rerunTasks: async function() { return []; },
@@ -553,6 +563,7 @@ test('run-repair: token and API key never appear in output or report', async fun
     cwd: cwd,
     normalRun: normalDefectTasks(),
     env: { VENDURE_STAGING_REPO_TOKEN: tok, OPENROUTER_API_KEY: key },
+    fetch: validFetch(),
     adapters: fakeAdapters(ctrl, log),
     rerunTasks: async function() { return []; },
     extractAfter: function() { return []; }
@@ -589,6 +600,8 @@ test('run-repair: no code path writes to the target clone outside gitClient+appl
     runId: 'run-clone',
     cwd: cwd,
     normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-clone', OPENROUTER_API_KEY: 'key-clone' },
+    fetch: validFetch(),
     adapters: adapters,
     rerunTasks: async function() { return []; },
     extractAfter: function() { return []; }
@@ -627,6 +640,7 @@ test('run-repair: an attempt that throws still writes finding.json and attempt-e
     cwd: cwd,
     normalRun: normalDefectTasks(),
     env: { VENDURE_STAGING_REPO_TOKEN: 'tok-test', OPENROUTER_API_KEY: 'key-test' },
+    fetch: validFetch(),
     adapters: fakeAdapters(ctrl, log),
     rerunTasks: async function() { return []; },
     extractAfter: function() { return []; }
@@ -661,6 +675,7 @@ test('run-repair: evidence/<runId>/repair/finding.json written BEFORE blocker re
     cwd: cwd,
     normalRun: normalDefectTasks(),
     env: { VENDURE_STAGING_REPO_TOKEN: 'tok-evid', OPENROUTER_API_KEY: 'key-evid' },
+    fetch: validFetch(),
     adapters: fakeAdapters(ctrl, log)
   });
   assert.strictEqual(res.outcome, 'BLOCKED');
@@ -688,5 +703,214 @@ test('run-repair: evidence/<runId>/repair/finding.json written BEFORE blocker re
     assert.ok(!evid.logs_collected_per_kind[kind].lines, 'no lines field (counts only)');
     assert.ok(!evid.logs_collected_per_kind[kind].content, 'no content field (counts only)');
   }
+});
+
+// ---------------------------------------------------------------------------
+// Credential preflight: VENDURE_STAGING_REPO_TOKEN is validated before any
+// clone/push/dispatch. Bad tokens are CLIENT_INPUT_SCOPE blockers and the
+// clone adapter is never reached.
+// ---------------------------------------------------------------------------
+
+function apiResponse(status) {
+  return Promise.resolve({ status: status, ok: status >= 200 && status < 300 });
+}
+
+// Mock GitHub API fetch that reports a usable token, so tests that exercise
+// the flow past the credential preflight do not hit the real GitHub API.
+function validFetch() {
+  return function() { return Promise.resolve({ status: 200, ok: true }); };
+}
+
+test('run-repair: empty VENDURE_STAGING_REPO_TOKEN -> REPO_TOKEN_MISSING, clone never called', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var called = { fetch: false };
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-tok-missing',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { OPENROUTER_API_KEY: 'key-1' }, // no VENDURE_STAGING_REPO_TOKEN
+    fetch: function() { called.fetch = true; return apiResponse(200); },
+    adapters: fakeAdapters({}, log)
+  });
+  assert.strictEqual(res.outcome, 'BLOCKED');
+  assert.strictEqual(res.exitCode, 4);
+  var blocker = res.blockers && res.blockers.find(function(b) { return b.code === 'REPO_TOKEN_MISSING'; });
+  assert.ok(blocker, 'REPO_TOKEN_MISSING blocker present');
+  assert.strictEqual(blocker.evidence && blocker.evidence.classification, 'CLIENT_INPUT_SCOPE', 'client-input classification in evidence');
+  assert.strictEqual(called.fetch, false, 'no API call when token is empty');
+  assert.ok(!hasLog(log, 'cloneTarget') && !hasLog(log, 'cloneRepoForRepair'), 'clone adapter never called');
+  assert.ok(!hasLog(log, 'collect:vendure'), 'no log collection after credential block');
+});
+
+test('run-repair: API 401 -> REPO_TOKEN_INVALID_OR_EXPIRED, clone never called', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-401bad',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-401', OPENROUTER_API_KEY: 'key-1' },
+    fetch: function() { return apiResponse(401); },
+    adapters: fakeAdapters({}, log)
+  });
+  assert.strictEqual(res.outcome, 'BLOCKED');
+  assert.strictEqual(res.exitCode, 4);
+  var blocker = res.blockers && res.blockers.find(function(b) { return b.code === 'REPO_TOKEN_INVALID_OR_EXPIRED'; });
+  assert.ok(blocker, 'REPO_TOKEN_INVALID_OR_EXPIRED blocker present');
+  assert.ok(blocker.message.indexOf('401') !== -1, 'message names 401 status');
+  assert.strictEqual(blocker.evidence && blocker.evidence.classification, 'CLIENT_INPUT_SCOPE', 'client-input classification in evidence');
+  assert.ok(!hasLog(log, 'cloneTarget') && !hasLog(log, 'cloneRepoForRepair'), 'clone adapter never called');
+  var serialized = JSON.stringify(res);
+  assert.strictEqual(serialized.indexOf('tok-401'), -1, 'token value never appears in output');
+  var repFile = path.join(cwd, 'reports', 'run-401bad', 'compliance-report.json');
+  assert.strictEqual(fs.existsSync(repFile), true, 'compliance-report.json written for token blocker');
+  var rep = JSON.parse(fs.readFileSync(repFile, 'utf8'));
+  var rb = rep && rep.repair && rep.repair.blockers;
+  assert.ok(rb && rb.some(function(b) { return b.code === 'REPO_TOKEN_INVALID_OR_EXPIRED'; }), 'blocker recorded in repair.blockers');
+  assert.strictEqual(fs.readFileSync(repFile, 'utf8').indexOf('tok-401'), -1, 'token value never appears in report');
+});
+
+test('run-repair: API 403 -> REPO_TOKEN_INSUFFICIENT_SCOPE, clone never called', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-tok-403',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-403', OPENROUTER_API_KEY: 'key-1' },
+    fetch: function() { return apiResponse(403); },
+    adapters: fakeAdapters({}, log)
+  });
+  assert.strictEqual(res.outcome, 'BLOCKED');
+  assert.strictEqual(res.exitCode, 4);
+  var blocker = res.blockers && res.blockers.find(function(b) { return b.code === 'REPO_TOKEN_INSUFFICIENT_SCOPE'; });
+  assert.ok(blocker, 'REPO_TOKEN_INSUFFICIENT_SCOPE blocker present');
+  assert.ok(blocker.message.indexOf('403') !== -1, 'message names 403 status');
+  assert.strictEqual(blocker.evidence && blocker.evidence.classification, 'CLIENT_INPUT_SCOPE', 'client-input classification in evidence');
+  assert.ok(!hasLog(log, 'cloneTarget') && !hasLog(log, 'cloneRepoForRepair'), 'clone adapter never called');
+});
+
+test('run-repair: API 404 -> REPO_TOKEN_INSUFFICIENT_SCOPE, clone never called', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-tok-404',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-404', OPENROUTER_API_KEY: 'key-1' },
+    fetch: function() { return apiResponse(404); },
+    adapters: fakeAdapters({}, log)
+  });
+  assert.strictEqual(res.outcome, 'BLOCKED');
+  assert.strictEqual(res.exitCode, 4);
+  var blocker = res.blockers && res.blockers.find(function(b) { return b.code === 'REPO_TOKEN_INSUFFICIENT_SCOPE'; });
+  assert.ok(blocker, 'REPO_TOKEN_INSUFFICIENT_SCOPE blocker present');
+  assert.ok(blocker.message.indexOf('404') !== -1, 'message names 404 status');
+  assert.strictEqual(blocker.evidence && blocker.evidence.classification, 'CLIENT_INPUT_SCOPE', 'client-input classification in evidence');
+  assert.ok(!hasLog(log, 'cloneTarget') && !hasLog(log, 'cloneRepoForRepair'), 'clone adapter never called');
+});
+
+test('run-repair: API unreachable after retries -> DEPENDENCY_ENVIRONMENT blocker, clone never called', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var calls = 0;
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-tok-net',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-net', OPENROUTER_API_KEY: 'key-1' },
+    fetch: function() {
+      calls += 1;
+      return Promise.reject(new TypeError('fetch failed: ECONNREFUSED'));
+    },
+    adapters: fakeAdapters({}, log)
+  });
+  assert.strictEqual(res.outcome, 'BLOCKED');
+  assert.strictEqual(res.exitCode, 4);
+  assert.ok(calls >= 3, 'fetch retried at least 3 times (got ' + calls + ')');
+  var blocker = res.blockers && res.blockers.find(function(b) { return b.code === 'REPO_TOKEN_NETWORK_FAILURE'; });
+  assert.ok(blocker, 'REPO_TOKEN_NETWORK_FAILURE blocker present');
+  assert.strictEqual(blocker.evidence && blocker.evidence.classification, 'DEPENDENCY_ENVIRONMENT', 'dependency classification in evidence');
+  assert.ok(!hasLog(log, 'cloneTarget') && !hasLog(log, 'cloneRepoForRepair'), 'clone adapter never called');
+});
+
+test('run-repair: valid token (API 200) proceeds to clone', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var ctrl = {};
+  ctrl.verifyCalls = 0;
+  ctrl.verifyVerdicts = [{ status: 'fixed' }];
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-tok-ok',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-200', OPENROUTER_API_KEY: 'key-1' },
+    fetch: function() { return apiResponse(200); },
+    adapters: fakeAdapters(ctrl, log),
+    rerunTasks: async function() { return [{ taskId: 'CAN-B1-03', result: 'RESULT_PASS' }, { taskId: 'CAN-B1-04', result: 'RESULT_PASS' }, { taskId: 'CAN-B2-16', result: 'RESULT_PASS' }]; },
+    extractAfter: function() { return []; }
+  });
+  assert.strictEqual(res.outcome, 'FIXED');
+  assert.strictEqual(res.exitCode, 0);
+  assert.ok(hasLog(log, 'cloneRepoForRepair:'), 'clone reached with a valid token');
+});
+
+test('run-repair: git clone "Authentication failed" -> REPO_TOKEN_INVALID_OR_EXPIRED, no push', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var ctrl = { cloneBlock: true };
+  var adapters = fakeAdapters(ctrl, log);
+  adapters.gitClient.cloneRepoForRepair = async function(opts) {
+    log.push('cloneRepoForRepair:' + opts.branch);
+    return { ok: false, blocker: { code: 'REPO_TOKEN_INVALID_OR_EXPIRED', message: 'Git auth failed: authentication rejected (token is invalid or expired)', evidence: { classification: 'CLIENT_INPUT_SCOPE', stderr: 'fatal: Authentication failed for https://github.com/vendure-ai-factory/vendure-staging-baseline' } } };
+  };
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-git-auth',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-auth', OPENROUTER_API_KEY: 'key-1' },
+    fetch: function() { return apiResponse(200); },
+    adapters: adapters
+  });
+  assert.strictEqual(res.outcome, 'BLOCKED');
+  assert.strictEqual(res.exitCode, 4);
+  var blockerA = res.blockers.find(function(b) { return b.code === 'REPO_TOKEN_INVALID_OR_EXPIRED'; });
+  assert.ok(blockerA, 'git auth failure classified as REPO_TOKEN_INVALID_OR_EXPIRED');
+  assert.ok(String(blockerA.evidence).indexOf('CLIENT_INPUT_SCOPE') !== -1, 'classification preserved');
+  assert.ok(!hasLog(log, 'push:'), 'no push after git auth failure');
+});
+
+test('run-repair: git clone "could not read Username" -> REPO_TOKEN_MISSING, no push', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var ctrl = { cloneBlock: true };
+  var adapters = fakeAdapters(ctrl, log);
+  adapters.gitClient.cloneRepoForRepair = async function(opts) {
+    log.push('cloneRepoForRepair:' + opts.branch);
+    return { ok: false, blocker: { code: 'REPO_TOKEN_MISSING', message: 'Git auth failed: could not read username for remote (token missing or URL malformed)', evidence: { classification: 'CLIENT_INPUT_SCOPE', stderr: "fatal: could not read Username for 'https://github.com': No such device or address" } } };
+  };
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-git-username',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-user', OPENROUTER_API_KEY: 'key-1' },
+    fetch: function() { return apiResponse(200); },
+    adapters: adapters
+  });
+  assert.strictEqual(res.outcome, 'BLOCKED');
+  assert.strictEqual(res.exitCode, 4);
+  var blockerU = res.blockers.find(function(b) { return b.code === 'REPO_TOKEN_MISSING'; });
+  assert.ok(blockerU, 'git username failure classified as REPO_TOKEN_MISSING');
+  assert.ok(String(blockerU.evidence).indexOf('CLIENT_INPUT_SCOPE') !== -1, 'classification preserved');
+  assert.ok(!hasLog(log, 'push:'), 'no push after git username failure');
 });
 

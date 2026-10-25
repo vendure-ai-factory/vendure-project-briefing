@@ -230,6 +230,12 @@ async function runOnce(deps) {
   return repairModule.runRepair(deps);
 }
 
+// Mock GitHub API fetch that reports a usable token, so tests that exercise
+// the flow past the credential preflight do not hit the real GitHub API.
+function validFetch() {
+  return function() { return Promise.resolve({ status: 200, ok: true }); };
+}
+
 function hasLog(log, prefix) {
   return log.some(function(s) { return s.indexOf(prefix) === 0; });
 }
@@ -302,6 +308,7 @@ test('dry-run: valid model -> FIXED, no stack in apiErrors, evidence under repai
     runId: runId,
     cwd: cwd,
     env: { VENDURE_STAGING_REPO_TOKEN: canary, OPENROUTER_API_KEY: 'key-' + canary },
+    fetch: validFetch(),
     adapters: fakeAdapters(ctrl, log, { modelMode: 'valid' }),
     rerunTasks: async function() { return [{ taskId: 'CAN-B1-03', result: 'RESULT_PASS' }]; },
     extractAfter: function() { return []; }
@@ -326,6 +333,7 @@ test('dry-run: not-fixed on every attempt -> NOT_FIXED, evidence under repair ro
     cwd: cwd,
     perSignatureBudget: 3,
     env: { VENDURE_STAGING_REPO_TOKEN: canary, OPENROUTER_API_KEY: 'key-' + canary },
+    fetch: validFetch(),
     adapters: fakeAdapters(ctrl, log, { modelMode: 'valid' }),
     rerunTasks: async function() { return [{ taskId: 'CAN-B1-03', result: 'BLOCK' }]; },
     extractAfter: function() { return [FINDING_SIG]; }
@@ -348,6 +356,7 @@ test('dry-run: log wrapper refused -> BLOCKED, finding extracted, evidence under
     runId: runId,
     cwd: cwd,
     env: { VENDURE_STAGING_REPO_TOKEN: canary, OPENROUTER_API_KEY: 'key-' + canary },
+    fetch: validFetch(),
     adapters: fakeAdapters(ctrl, log, { modelMode: 'valid' })
   });
   assert.strictEqual(res.outcome, 'BLOCKED');
@@ -376,6 +385,7 @@ test('dry-run: model response invalid JSON / empty / diagnosis none -> BLOCKED, 
       runId: runId,
       cwd: cwd,
       env: { VENDURE_STAGING_REPO_TOKEN: canary, OPENROUTER_API_KEY: 'key-' + canary },
+      fetch: validFetch(),
       adapters: fakeAdapters(ctrl, log, { modelMode: case_.mode })
     });
     // A failed model => MODEL_FAILED is a terminal blocker.
@@ -406,6 +416,7 @@ test('dry-run: logSource lines in every plausible shape never throws and keeps f
       runId: runId,
       cwd: cwd,
       env: { VENDURE_STAGING_REPO_TOKEN: canary, OPENROUTER_API_KEY: 'key-' + canary },
+      fetch: validFetch(),
       adapters: fakeAdapters(ctrl, log, { logLines: shape, modelMode: 'valid' }),
       rerunTasks: async function() { return [{ taskId: 'CAN-B1-03', result: 'RESULT_PASS' }]; },
       extractAfter: function() { return []; }

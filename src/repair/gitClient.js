@@ -68,6 +68,31 @@ function blockerFor(code, message, evidence) {
   };
 }
 
+/**
+ * Classify a git auth failure as CLIENT_INPUT_SCOPE so the pipeline
+ * surfaces it as a token problem (pending client input) rather than a
+ * generic clone failure.
+ */
+function classifyGitAuthError(stderr, error) {
+  var combined = (stderr || '') + '|' + (error || '');
+  var lower = combined.toLowerCase();
+  if (lower.indexOf('could not read username') !== -1) {
+    return {
+      code: 'REPO_TOKEN_MISSING',
+      message: 'Git auth failed: could not read username for remote (token missing or URL malformed)',
+      cls: 'CLIENT_INPUT_SCOPE'
+    };
+  }
+  if (lower.indexOf('authentication failed') !== -1) {
+    return {
+      code: 'REPO_TOKEN_INVALID_OR_EXPIRED',
+      message: 'Git auth failed: authentication rejected (token is invalid or expired)',
+      cls: 'CLIENT_INPUT_SCOPE'
+    };
+  }
+  return null;
+}
+
 function redactOutput(text, secrets) {
   var out = text || '';
   if (secrets && Array.isArray(secrets)) {
@@ -458,6 +483,14 @@ function cloneRepoForRepair(opts) {
     var r = normalizeExecResult(res);
     var stderr = redactOutput(redactOutput(r.stderr, [token]), [repoUrl]);
     if (!r.success) {
+      var authErr = classifyGitAuthError(r.stderr, r.error);
+      if (authErr) {
+        return blockerFor(authErr.code, authErr.message, {
+          exitCode: r.exitCode,
+          stderr: stderr,
+          classification: authErr.cls
+        });
+      }
       return blockerFor('CLONE_FAILED', 'git clone failed: ' + (r.error || ('exit code ' + r.exitCode)), {
         exitCode: r.exitCode,
         stderr: stderr

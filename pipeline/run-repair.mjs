@@ -1339,6 +1339,106 @@ function summarizeChecks(checks) {
 }
 
 /**
+ * Validate the VENDURE_STAGING_REPO_TOKEN before any git operation.
+ * Makes a lightweight authenticated GET to the GitHub API to verify the
+ * token is usable. Network failures are retryable (DEPENDENCY_ENVIRONMENT);
+ * token defects are CLIENT_INPUT_SCOPE blockers.
+ */
+async function credentialPreflightCheck(cfg) {
+  if (!cfg || typeof cfg !== 'object') return null;
+
+  // Empty token -> no point calling the API
+  if (!hasText(cfg.token)) {
+    return {
+      ok: false,
+      blocker: normalizeBlocker(
+        'REPO_TOKEN_MISSING',
+        'VENDURE_STAGING_REPO_TOKEN is empty or not set',
+        { classification: CLASS_CLIENT_INPUT_SCOPE }
+      )
+    };
+  }
+
+  var apiUrl = 'https://api.github.com/repos/vendure-ai-factory/vendure-staging-baseline';
+  var fetch = cfg.fetch || globalThis.fetch;
+  if (typeof fetch !== 'function') return null;
+
+  var maxRetries = 3;
+  var lastError = null;
+
+  // Matches the existing modelClient defaultBackoff pattern (base * attempt:
+  // 500ms, 1000ms before retries 2 and 3). The first attempt has no wait.
+  function preflightBackoff(attempt) {
+    var base = 500;
+    return new Promise(function(resolve) {
+      var t = setTimeout(resolve, base * attempt);
+      if (typeof t.unref === 'function') t.unref();
+    });
+  }
+
+  for (var attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      var response = await fetch(apiUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': 'Bearer ' + cfg.token,
+          'Accept': 'application/json',
+          'User-Agent': 'pipeline-repair/1.0'
+        }
+      });
+
+      if (response.status === 200 || response.status === 304) {
+        return null; // Token is valid
+      }
+      if (response.status === 401) {
+        return {
+          ok: false,
+          blocker: normalizeBlocker(
+            'REPO_TOKEN_INVALID_OR_EXPIRED',
+            'GitHub API returned 401: token is invalid or expired',
+            { classification: CLASS_CLIENT_INPUT_SCOPE, apiUrl: apiUrl, status: response.status }
+          )
+        };
+      }
+      if (response.status === 403 || response.status === 404) {
+        return {
+          ok: false,
+          blocker: normalizeBlocker(
+            'REPO_TOKEN_INSUFFICIENT_SCOPE',
+            'GitHub API returned ' + response.status + ': token lacks required scope or repository access',
+            { classification: CLASS_CLIENT_INPUT_SCOPE, apiUrl: apiUrl, status: response.status }
+          )
+        };
+      }
+      // Other HTTP errors - non-retryable, treat as token issue
+      return {
+        ok: false,
+        blocker: normalizeBlocker(
+          'REPO_TOKEN_INVALID_OR_EXPIRED',
+          'GitHub API returned ' + response.status,
+          { classification: CLASS_CLIENT_INPUT_SCOPE, apiUrl: apiUrl, status: response.status }
+        )
+      };
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries - 1) {
+        await preflightBackoff(attempt + 1);
+      }
+    }
+  }
+
+  // All retries exhausted -> network/dependency failure
+  return {
+    ok: false,
+    blocker: normalizeBlocker(
+      'REPO_TOKEN_NETWORK_FAILURE',
+      'GitHub API unreachable after ' + maxRetries + ' attempts: ' + (lastError && lastError.message ? lastError.message : 'unknown'),
+      { classification: 'DEPENDENCY_ENVIRONMENT', apiUrl: apiUrl, retries: maxRetries }
+    )
+  };
+}
+
+/**
  * R5b orchestrator entry. Opt-in via REPAIR_MODE=true; normal runs (repair
  * off) short-circuit to NO_REPAIR without touching any adapter or file.
  *
@@ -1391,6 +1491,32 @@ async function runRepair(deps) {
       exitCode: EXIT_BLOCKED,
       runId: cfg.runId || null,
       blockers: [{ code: 'REPAIR_PRECONDITION_NOT_MET', message: 'task blocked with CLIENT_INPUT_SCOPE: repair precondition not met', evidence: evidence }]
+    };
+  }
+
+  // Credential preflight: validate VENDURE_STAGING_REPO_TOKEN before any
+  // git clone/push/dispatch. This runs before adapters are touched. A token
+  // defect is a CLIENT_INPUT_SCOPE blocker and is recorded in the compliance
+  // report repair.blockers (pending client input, not a Pipeline defect).
+  var tokenCheck = await credentialPreflightCheck(cfg);
+  if (tokenCheck && tokenCheck.ok === false) {
+    var blockedState = {
+      outcome: OUTCOME_BLOCKED,
+      exitCode: EXIT_BLOCKED,
+      blockers: [tokenCheck.blocker],
+      attempts: [],
+      pipelineChanges: [],
+      targetChanges: [],
+      deploy: null,
+      rollback: null,
+      reportError: null
+    };
+    writeRepairReport(cfg, blockedState);
+    return {
+      outcome: OUTCOME_BLOCKED,
+      exitCode: EXIT_BLOCKED,
+      runId: cfg.runId || null,
+      blockers: [tokenCheck.blocker]
     };
   }
 
