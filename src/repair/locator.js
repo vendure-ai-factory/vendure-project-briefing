@@ -706,12 +706,15 @@ function addConfigBuildingCandidates(targetRoot, finding, candidates, searched) 
   if (fs.existsSync(cfgRoot)) dirs.push(cfgRoot);
   var scanned = [];
   var seen = {};
-  for (var d = 0; d < dirs.length; d++) {
+  var configCount = 0;
+  var MAX_CONFIG_CANDIDATES = 2;
+  var CONFIG_CANDIDATE_SCORE = 5; // below stack (1000) and typical matched-dependency scores
+  for (var d = 0; d < dirs.length && configCount < MAX_CONFIG_CANDIDATES; d++) {
     var files = [];
     try {
       files = findSourceFiles(dirs[d], []);
     } catch (e) { /* ignore */ }
-    for (var i = 0; i < files.length; i++) {
+    for (var i = 0; i < files.length && configCount < MAX_CONFIG_CANDIDATES; i++) {
       var fp = files[i];
       var rel2 = path.relative(targetRoot, fp).replace(/\\/g, '/');
       if (seen[rel2]) continue;
@@ -722,6 +725,9 @@ function addConfigBuildingCandidates(targetRoot, finding, candidates, searched) 
         content = fs.readFileSync(fp, 'utf8');
       } catch (e2) { /* ignore */ }
       if (content == null) continue;
+      // Never offer generated, migration, test, or .d.ts files as config
+      // candidates: they are low-signal and would displace matched code.
+      if (isExcludedConfigPath(rel2full)) continue;
       // Detect config-building content: a plugins array, a config object, or an
       // import/require of any dependency matched by the finding. This is generic
       // and never mentions a concrete filename.
@@ -747,13 +753,37 @@ function addConfigBuildingCandidates(targetRoot, finding, candidates, searched) 
         file: rel2full,
         line: 1,
         snippet: snippet,
-        score: 30,
+        score: CONFIG_CANDIDATE_SCORE,
         reasons: ['config-building registration site'],
         why: 'tracked config/registration file that builds the application configuration (plugins array / config object / dependency import)'
       });
+      configCount++;
     }
   }
   return { candidates: candidates, scanned: scanned };
+}
+
+/**
+ * True when a clone-relative path must never become a config candidate:
+ * generated code (graphql.ts / *.generated.*), migration files, tests, and
+ * type declarations (.d.ts). These low-signal paths were displacing real
+ * code/dependency candidates in the live run.
+ */
+function isExcludedConfigPath(relPath) {
+  if (!relPath) return true;
+  var norm = String(relPath).replace(/\\/g, '/');
+  if (/\.d\.ts$/.test(norm)) return true;
+  // Generated code: a file named graphql.ts (live-run regression example) or
+  // any file with a '.generated.' marker (e.g. api-client.generated.ts).
+  if (/(^|\/)graphql\.ts$/.test(norm)) return true;
+  if (/\.generated\./.test(norm)) return true;
+  if (/generated/.test(norm) && /\.(ts|js|mjs|json)$/.test(norm)) return true;
+  // Migrations: any directory whose name contains 'migration'.
+  if (/(^|\/)[^/]*migration[^/]*\//.test(norm)) return true;
+  // Tests: __tests__/, tests/ dirs or *.test.* / *.spec.* files.
+  if (/(^|\/)(tests?|__tests__)\//.test(norm)) return true;
+  if (/\.(test|spec)\.(js|ts|tsx|mjs)$/.test(norm)) return true;
+  return false;
 }
 
 function collectSearchTargets(targetRoot, finding, searched) {
@@ -1281,32 +1311,52 @@ async function locateCandidates(options) {
     }
     var MAX_PER_PKG = 2;
     var MAX_TOTAL_CANDIDATES = 8;
-    var pkgCounts = {};
-    var finalCandidates = [];
-    for (var ci = 0; ci < candidates.length && finalCandidates.length < MAX_TOTAL_CANDIDATES; ci++) {
-      var cand = candidates[ci];
-      if (cand.source === 'dependency') {
-        var candPkg = cand.package || '';
-        var candPkgName = candPkg.replace(/@[^@]+$/, ''); // strip version
-        if (candPkgName === stackPackage) {
-          // Stack package is exempt from cap
-          finalCandidates.push(cand);
-        } else {
-          pkgCounts[candPkg] = (pkgCounts[candPkg] || 0) + 1;
-          if (pkgCounts[candPkg] <= MAX_PER_PKG) {
-            finalCandidates.push(cand);
-          }
-          // else skip (over cap)
-        }
+    var MIN_DEPENDENCY_SLOTS = 4; // always reserve >=4 slots for dep candidates
+
+    // Split into dependency and non-dependency pools so the fixed cap never
+    // lets low-signal config files displace matched dependency candidates.
+    var depPool = [];
+    var nonDepPool = [];
+    for (var si2 = 0; si2 < candidates.length; si2++) {
+      if (candidates[si2] && candidates[si2].source === 'dependency') {
+        depPool.push(candidates[si2]);
       } else {
-        // stack and target candidates are not capped
-        finalCandidates.push(cand);
+        nonDepPool.push(candidates[si2]);
       }
     }
-    candidates = finalCandidates;
+    depPool.sort(function(a, b) { return b.score - a.score; });
+    nonDepPool.sort(function(a, b) { return b.score - a.score; });
 
-    // Re-sort after adding package candidates
-    candidates.sort(function(a, b) { return b.score - a.score; });
+    // (c1) Select dependency candidates (per-package cap, stack package exempt)
+    // up to MIN_DEPENDENCY_SLOTS so the highest-scoring always survives.
+    var depPkgCounts = {};
+    var selectedDep = [];
+    for (var di = 0; di < depPool.length && selectedDep.length < MIN_DEPENDENCY_SLOTS; di++) {
+      var dcand = depPool[di];
+      var depPkg = dcand.package || '';
+      var depPkgName = depPkg.replace(/@[^@]+$/, ''); // strip version
+      if (depPkgName === stackPackage) {
+        selectedDep.push(dcand);
+      } else {
+        depPkgCounts[depPkg] = (depPkgCounts[depPkg] || 0) + 1;
+        if (depPkgCounts[depPkg] <= MAX_PER_PKG) {
+          selectedDep.push(dcand);
+        }
+      }
+    }
+
+    // (c2) Non-dependency candidates fill the remaining slots, best score
+    // first (so stack/log-derived candidates always beat config candidates).
+    var finalCandidates = [];
+    var nonDepSlots = MAX_TOTAL_CANDIDATES - selectedDep.length;
+    for (var ndi = 0; ndi < nonDepPool.length && finalCandidates.length < nonDepSlots; ndi++) {
+      finalCandidates.push(nonDepPool[ndi]);
+    }
+    finalCandidates = finalCandidates.concat(selectedDep);
+
+    // (c3) Sort the merged set by score so the prompt sees the best first.
+    finalCandidates.sort(function(a, b) { return b.score - a.score; });
+    candidates = finalCandidates;
 
     // Clean up package workspace
     try {

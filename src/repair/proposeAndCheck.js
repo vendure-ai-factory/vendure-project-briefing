@@ -822,7 +822,19 @@ async function proposeAndCheck(options) {
   var verifier = deps.verifier || require('./verifier');
   var runCommand = deps.runCommand || function(cmd, args, opts) {
     var childProcess = require('child_process');
-    var result = childProcess.spawnSync(cmd, args, {
+    // Resolve a bare command name to the clone's local node_modules/.bin
+    // executable when present, exactly like the verifier does, so a script
+    // defined as 'vitest' or 'tsc' runs the right binary and a missing one
+    // surfaces as a spawn error (ENOENT) instead of a silent null status.
+    var resolvedCmd = cmd;
+    if (cmd && cmd.indexOf('/') === -1 && cmd.indexOf('\\') === -1 && cmd.indexOf('.') === -1 && opts.cwd) {
+      var localBin = path.join(opts.cwd, 'node_modules', '.bin', cmd);
+      var cmdFs = deps.fs || require('fs');
+      if (cmdFs.existsSync(localBin)) {
+        resolvedCmd = localBin;
+      }
+    }
+    var result = childProcess.spawnSync(resolvedCmd, args, {
       cwd: opts.cwd,
       timeout: opts.timeout || 120000,
       encoding: 'utf8',
@@ -832,7 +844,12 @@ async function proposeAndCheck(options) {
       success: result.status === 0,
       stdout: result.stdout || '',
       stderr: result.stderr || '',
-      exitCode: result.status
+      exitCode: result.status,
+      // A spawn that never ran (e.g. ENOENT missing binary) has status===null
+      // and error set. Pass the message and signal through so the verifier can
+      // classify it as CHECKS_SKIPPED_NO_TOOLCHAIN rather than a failed build.
+      error: result.error ? result.error.message : null,
+      signal: result.signal || null
     };
   };
   var fetch = deps.fetch || ((typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function') ? globalThis.fetch : null);
@@ -1100,6 +1117,42 @@ async function proposeAndCheck(options) {
 
   var editSet = parseResult.editSet;
 
+  // A proposal with zero edits and zero new files cannot fix anything. Reject
+  // it BEFORE any validation/apply/check so an empty proposal never burns an
+  // attempt as a failed build. Record the model's own rationale when present
+  // and give the next attempt explicit feedback: propose concrete edits or
+  // name the file you need.
+  var emptyEdits = (editSet.edits && editSet.edits.length) || 0;
+  var emptyNewFiles = (editSet.newFiles && editSet.newFiles.length) || 0;
+  if (emptyEdits === 0 && emptyNewFiles === 0) {
+    var emptyReason = (editSet && typeof editSet.rationale === 'string' && editSet.rationale !== '')
+      ? editSet.rationale : null;
+    var emptyMsg = 'proposal contained zero edits and zero new files' +
+      (emptyReason ? '; model rationale: ' + emptyReason : '') +
+      ' - propose concrete edits (each with oldString and newString) or name the new file you need, otherwise the finding cannot be fixed';
+    writeAttemptSummary(runId, attemptNumber, {
+      status: 'REJECTED',
+      codes: ['EMPTY_PROPOSAL'],
+      requestedPaths: [],
+      candidatePaths: candidateRelPaths(cloneDir, realCandidates),
+      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+      promptChars: promptChars,
+      elapsedMs: elapsedMs,
+      model: modelResult.model,
+      requestedModel: modelResult.requestedModel,
+      provider: modelResult.provider
+    }, fs, now);
+    return {
+      status: 'REJECTED',
+      rejectionCodes: ['EMPTY_PROPOSAL'],
+      requestedPaths: [],
+      validCandidatePaths: candidateRelPaths(cloneDir, realCandidates),
+      errors: ['[EMPTY_PROPOSAL] ' + emptyMsg],
+      modelReason: emptyReason,
+      blocker: { code: 'EMPTY_PROPOSAL', message: emptyMsg }
+    };
+  }
+
   // Check for identical repeat proposal: if the same repairKind+edits+newFiles
   // appeared in a previous attempt that was rejected, reject without spending
   // an attempt (model already "knows" this approach failed).
@@ -1179,26 +1232,143 @@ async function proposeAndCheck(options) {
   if (!validationResult.ok) {
     var vCodes = extractErrorCodes(validationResult.errors);
     var vValid = candidateRelPaths(cloneDir, realCandidates);
-    writeAttemptSummary(runId, attemptNumber, {
-      status: 'REJECTED',
-      codes: vCodes,
-      requestedPaths: requestedPaths,
-      candidatePaths: vValid,
-      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
-      promptChars: promptChars,
-      elapsedMs: elapsedMs,
-      model: modelResult.model,
-      requestedModel: modelResult.requestedModel,
-      provider: modelResult.provider
-    }, fs, now);
-    return {
-      status: 'REJECTED',
-      rejectionCodes: vCodes,
-      validCandidatePaths: vValid,
-      requestedPaths: requestedPaths,
-      errors: validationResult.errors,
-      blocker: { code: 'VALIDATION_FAILED', message: validationResult.errors.join('; ') }
-    };
+
+    // If the only defect is a missing newString (INVALID_EDIT) do ONE
+    // structured re-ask within the SAME attempt: tell the model every edit
+    // needs oldString and newString, and that newString may be an empty string
+    // for deletions. Only the seriously-malformed edit set (INVALID_EDIT code
+    // present) triggers the re-ask, not generic validation failures.
+    var isInvalidEdit = vCodes.indexOf('INVALID_EDIT') !== -1;
+    if (isInvalidEdit) {
+      var invalidEditPrompt = 'Your previous edit set was rejected because at least one edit is missing "newString".\n\n' +
+        'Every edit MUST have both "oldString" and "newString". For a deletion, set "newString" to an empty string "" (that is still a required field). Example:\n' +
+        '{ "path": "src/x.js", "oldString": "delete me", "newString": "" }\n\n' +
+        'Required JSON structure:\n' + '{\n  "repairKind": "source-edit|config-edit|migration|dependency-bump|dependency-patch|local-wrapper",\n  "rationale": "string",\n  "edits": [{"path": "string", "oldString": "string", "newString": "string"}],\n  "newFiles": "[optional] array of {path: string, content: string}"\n}' + '\n\n' +
+        'Output ONLY valid JSON that matches this structure. Do not include any explanation or prose, only the JSON object.';
+
+      var reAskIEStart = (typeof modelNow === 'function' ? modelNow() : Date.now());
+      var reAskIEResult = await model.callModel({
+        prompt: invalidEditPrompt,
+        system: 'You are a bug fixer. Output only JSON.',
+        env: env,
+        budget: budget,
+        fetch: fetch
+      });
+      var reAskIEElapsed = (typeof modelNow === 'function' ? modelNow() : Date.now()) - reAskIEStart;
+
+      if (reAskIEResult.ok) {
+        var reAskIEParse = model.parseEditSet(reAskIEResult.text);
+        if (reAskIEParse.ok && reAskIEParse.editSet) {
+          var reAskEditSet = reAskIEParse.editSet;
+          var reAskValidation = validator.validate(reAskEditSet, {
+            cloneDir: cloneDir,
+            requestedPaths: (reAskEditSet.edits || []).map(function(e) { return e && e.path; }).concat((reAskEditSet.newFiles || []).map(function(nf) { return nf && nf.path; })),
+            protectedPaths: protectedPaths,
+            mode: mode,
+            capabilities: { dependencyPatch: capabilities.dependencyPatch }
+          });
+          if (reAskValidation.ok) {
+            // Re-ask fixed the edit set - use it.
+            editSet = reAskEditSet;
+            validationResult = reAskValidation;
+            requestedPaths = [];
+            (editSet.edits || []).forEach(function(e) { if (e && e.path) requestedPaths.push(e.path); });
+            (editSet.newFiles || []).forEach(function(nf) { if (nf && nf.path) requestedPaths.push(nf.path); });
+            elapsedMs = (typeof elapsedMs === 'number' ? elapsedMs : 0) + reAskIEElapsed;
+            modelResult = reAskIEResult;
+          } else {
+            // Re-ask still invalid - record REJECTED with both error sources.
+            var combinedErrors = validationResult.errors.concat(reAskValidation.errors || []);
+            var combinedCodes = extractErrorCodes(combinedErrors);
+            writeAttemptSummary(runId, attemptNumber, {
+              status: 'REJECTED',
+              codes: combinedCodes.length > 0 ? combinedCodes : ['INVALID_EDIT'],
+              requestedPaths: requestedPaths,
+              candidatePaths: vValid,
+              tokensUsed: reAskIEResult.usage ? reAskIEResult.usage.total_tokens : null,
+              promptChars: invalidEditPrompt.length,
+              elapsedMs: reAskIEElapsed,
+              model: reAskIEResult.model,
+              requestedModel: reAskIEResult.requestedModel,
+              provider: reAskIEResult.provider
+            }, fs, now);
+            return {
+              status: 'REJECTED',
+              rejectionCodes: combinedCodes.length > 0 ? combinedCodes : ['INVALID_EDIT'],
+              validCandidatePaths: vValid,
+              requestedPaths: requestedPaths,
+              errors: combinedErrors,
+              blocker: { code: 'VALIDATION_FAILED', message: combinedErrors.join('; ') }
+            };
+          }
+        } else {
+          // Re-ask parse failed - record REJECTED with the original codes
+          writeAttemptSummary(runId, attemptNumber, {
+            status: 'REJECTED',
+            codes: vCodes,
+            requestedPaths: requestedPaths,
+            candidatePaths: vValid,
+            tokensUsed: reAskIEResult.usage ? reAskIEResult.usage.total_tokens : null,
+            promptChars: invalidEditPrompt.length,
+            elapsedMs: reAskIEElapsed,
+            model: reAskIEResult.model,
+            requestedModel: reAskIEResult.requestedModel,
+            provider: reAskIEResult.provider
+          }, fs, now);
+          return {
+            status: 'REJECTED',
+            rejectionCodes: vCodes,
+            validCandidatePaths: vValid,
+            requestedPaths: requestedPaths,
+            errors: validationResult.errors,
+            blocker: { code: 'VALIDATION_FAILED', message: validationResult.errors.join('; ') }
+          };
+        }
+      } else {
+        // Model blocked on the re-ask - record REJECTED with the original codes
+        writeAttemptSummary(runId, attemptNumber, {
+          status: 'REJECTED',
+          codes: vCodes,
+          requestedPaths: requestedPaths,
+          candidatePaths: vValid,
+          tokensUsed: null,
+          promptChars: invalidEditPrompt.length,
+          elapsedMs: reAskIEElapsed,
+          model: reAskIEResult.model,
+          requestedModel: reAskIEResult.requestedModel,
+          provider: reAskIEResult.provider
+        }, fs, now);
+        return {
+          status: 'REJECTED',
+          rejectionCodes: vCodes,
+          validCandidatePaths: vValid,
+          requestedPaths: requestedPaths,
+          errors: validationResult.errors,
+          blocker: reAskIEResult.blocker || { code: 'VALIDATION_FAILED', message: validationResult.errors.join('; ') }
+        };
+      }
+    } else {
+      writeAttemptSummary(runId, attemptNumber, {
+        status: 'REJECTED',
+        codes: vCodes,
+        requestedPaths: requestedPaths,
+        candidatePaths: vValid,
+        tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+        promptChars: promptChars,
+        elapsedMs: elapsedMs,
+        model: modelResult.model,
+        requestedModel: modelResult.requestedModel,
+        provider: modelResult.provider
+      }, fs, now);
+      return {
+        status: 'REJECTED',
+        rejectionCodes: vCodes,
+        validCandidatePaths: vValid,
+        requestedPaths: requestedPaths,
+        errors: validationResult.errors,
+        blocker: { code: 'VALIDATION_FAILED', message: validationResult.errors.join('; ') }
+      };
+    }
   }
 
   // Step 6: apply

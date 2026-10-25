@@ -1918,3 +1918,304 @@ test('compliance-vs-attempt: attempt-N.json status/codes match compliance-report
   try { fs.rmSync(path.join('.', 'evidence', runId), { recursive: true, force: true }); } catch (e) {}
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
 });
+
+// ---------------------------------------------------------------------------
+// #1 (live 40176357193): a check whose binary is missing (ENOENT via the
+// default spawnSync runCommand) must be SKIPPED / CHECKS_SKIPPED_NO_TOOLCHAIN,
+// NOT a failed build. The default runCommand must pass spawn error and signal
+// through and resolve bare commands to node_modules/.bin.
+// ---------------------------------------------------------------------------
+test('run1: default spawnSync runCommand passes error/signal; ENOENT is SKIPPED not FAIL', async function() {
+  var runId = 'test-spawn-skip-' + Date.now();
+  var deps = createFakeDeps();
+  // Use the REAL verifier so its ENOENT skip classification runs, and drop the
+  // fake runCommand so the DEFAULT spawnSync wrapper (under test) is used.
+  deps.verifier = require('../src/repair/verifier');
+  deps.runCommand = undefined;
+
+  // The scratch copy holds a package.json whose test script invokes a missing
+  // binary, so the verifier's spawn path must classify it as a toolchain skip.
+  // node_modules must exist so the toolchain gate passes and the real spawn
+  // runs (otherwise the node_modules gate classifies it without touching spawn).
+  deps.scratchCopy = function(rootDir, runId, runCommand) {
+    var temp = tempDir();
+    fs.mkdirSync(temp, { recursive: true });
+    fs.mkdirSync(path.join(temp, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(temp, 'node_modules'), { recursive: true });
+    fs.writeFileSync(path.join(temp, 'src', 'x.js'), 'fixed content\n');
+    fs.writeFileSync(path.join(temp, 'package.json'),
+      JSON.stringify({ name: 'test', scripts: { test: 'nonexistent-bin-xyz --flag' } }));
+    return Promise.resolve({ ok: true, dir: temp });
+  };
+
+  var result = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'pipeline', signature: 'sig-spawn-skip-' + Date.now() },
+    candidates: [{ file: 'src/x.js', line: 1, snippet: [{ line: 'fixed content' }] }],
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: '/tmp/not-used',
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    env: {},
+    deps: deps
+  });
+
+  // The missing binary must be a SKIPPED toolchain non-result, so the overall
+  // status is PIPELINE_PATCH_READY (not a failed build) and the check records
+  // error/signal instead of a silent null exit code.
+  assert.strictEqual(result.status, 'PIPELINE_PATCH_READY',
+    'a missing check binary must be a skip, not a failed build; got ' + result.status);
+  assert.ok(Array.isArray(result.checks.results) && result.checks.results.length > 0);
+  var r0 = result.checks.results[0];
+  assert.strictEqual(r0.skipped, true, 'check with missing binary must be marked skipped');
+  assert.strictEqual(r0.code, 'CHECKS_SKIPPED_NO_TOOLCHAIN', 'skip code must be CHECKS_SKIPPED_NO_TOOLCHAIN');
+  assert.strictEqual(r0.exitCode, null, 'missing binary has no exit code');
+  assert.ok(r0.error, 'missing binary error must be surfaced (ENOENT): ' + r0.error);
+
+  try { fs.rmSync(path.join('.', 'evidence', runId), { recursive: true, force: true }); } catch (e) {}
+});
+
+test('run1b: default runCommand resolves a bare command to node_modules/.bin', async function() {
+  var runId = 'test-bin-resolve-' + Date.now();
+  var deps = createFakeDeps();
+  deps.verifier = require('../src/repair/verifier');
+  deps.runCommand = undefined;
+
+  deps.scratchCopy = function(rootDir, runId, runCommand) {
+    var temp = tempDir();
+    fs.mkdirSync(temp, { recursive: true });
+    fs.mkdirSync(path.join(temp, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(temp, 'node_modules', '.bin'), { recursive: true });
+    fs.writeFileSync(path.join(temp, 'node_modules', '.bin', 'realcheck'), '#!/usr/bin/env node\nprocess.exit(0);\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(temp, 'src', 'x.js'), 'fixed content\n');
+    fs.writeFileSync(path.join(temp, 'package.json'),
+      JSON.stringify({ name: 'test', scripts: { test: 'realcheck' } }));
+    return Promise.resolve({ ok: true, dir: temp });
+  };
+
+  var result = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'pipeline', signature: 'sig-bin-' + Date.now() },
+    candidates: [{ file: 'src/x.js', line: 1, snippet: [{ line: 'fixed content' }] }],
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: '/tmp/not-used',
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    env: {},
+    deps: deps
+  });
+
+  assert.strictEqual(result.status, 'PIPELINE_PATCH_READY', 'resolved binary runs');
+
+  try { fs.rmSync(path.join('.', 'evidence', runId), { recursive: true, force: true }); } catch (e) {}
+});
+
+// ---------------------------------------------------------------------------
+// #2: empty proposal (zero edits + zero new files) is REJECTED with
+// EMPTY_PROPOSAL BEFORE any check, records the model's reason, and gives the
+// next attempt explicit feedback to propose edits or name the file.
+// ---------------------------------------------------------------------------
+test('run2: empty proposal -> REJECTED EMPTY_PROPOSAL before checks, reason recorded', async function() {
+  var dir = createTempProject({
+    'src/x.js': 'old content\n',
+    'package.json': '{"name":"test","scripts":{"test":"echo ok"}}'
+  });
+  var runId = 'test-empty-' + Date.now();
+  var deps = createFakeDeps();
+  deps._modelResponse = JSON.stringify({
+    repairKind: 'source-edit',
+    rationale: 'no files need changing, the bug is elsewhere',
+    edits: [],
+    newFiles: []
+  });
+
+  var result = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'target-code', signature: 'sig-empty-' + Date.now() },
+    candidates: validCandidates(dir),
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    attemptNumber: 1,
+    env: {},
+    deps: deps
+  });
+
+  assert.strictEqual(result.status, 'REJECTED');
+  assert.deepStrictEqual(result.rejectionCodes, ['EMPTY_PROPOSAL']);
+  assert.strictEqual(result.modelReason, 'no files need changing, the bug is elsewhere',
+    'model rationale must be recorded');
+  // No check should have been run for an empty proposal.
+  assert.strictEqual(deps._callCount.runChecks, 0, 'no checks must run for an empty proposal');
+  // Next-attempt feedback: propose concrete edits or name the file.
+  assert.ok(result.blocker.message.indexOf('propose concrete edits') !== -1,
+    'feedback must tell the next attempt to propose concrete edits: ' + result.blocker.message);
+
+  try { fs.rmSync(path.join('.', 'evidence', runId), { recursive: true, force: true }); } catch (e) {}
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+});
+
+test('run2b: EMPTY_PROPOSAL rejects with zero edits even when previousAttempts prompts mention it', async function() {
+  var dir = createTempProject({
+    'src/x.js': 'old content\n',
+    'package.json': '{"name":"test","scripts":{"test":"echo ok"}}'
+  });
+  var runId = 'test-empty2-' + Date.now();
+  var deps = createFakeDeps();
+  deps._modelResponse = JSON.stringify({
+    repairKind: 'config-edit',
+    rationale: 'advice only: no concrete file to change',
+    edits: [],
+    newFiles: []
+  });
+
+  var result = await proposeAndCheckInTarget(deps, dir, runId, 'sig-empty2-' + Date.now(), [{ rejectionCodes: ['PROPOSAL_OUTSIDE_CANDIDATES'], errors: ['old'], validCandidatePaths: ['src/x.js'] }]);
+  assert.strictEqual(result.status, 'REJECTED');
+  assert.deepStrictEqual(result.rejectionCodes, ['EMPTY_PROPOSAL']);
+  assert.strictEqual(result.modelReason, 'advice only: no concrete file to change');
+  assert.strictEqual(deps._callCount.runChecks, 0, 'no checks run');
+
+  try { fs.rmSync(path.join('.', 'evidence', runId), { recursive: true, force: true }); } catch (e) {}
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+});
+
+function proposeAndCheckInTarget(deps, dir, runId, signature, previousAttempts) {
+  var propose = require('../src/repair/proposeAndCheck').proposeAndCheck;
+  return propose({
+    finding: { class: 'Err', message: 'msg', domain: 'target-code', signature: signature },
+    candidates: [{ file: path.join(dir, 'src/x.js'), line: 1, snippet: [{ line: 'old content' }] }],
+    previousAttempts: previousAttempts || [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    attemptNumber: runId ? 1 : 1,
+    env: {},
+    deps: deps
+  });
+}
+
+// ---------------------------------------------------------------------------
+// #3: INVALID_EDIT (edit missing newString) triggers ONE structured re-ask
+// within the same attempt; a corrected re-ask fixes the set -> applied/checks
+// run; a still-invalid re-ask -> REJECTED INVALID_EDIT (not a failed build).
+// ---------------------------------------------------------------------------
+test('run3: INVALID_EDIT (missing newString) -> structured re-ask within the SAME attempt fixes it', async function() {
+  var dir = createTempProject({
+    'src/x.js': 'old content\n',
+    'package.json': '{"name":"test","scripts":{"test":"echo ok"}}'
+  });
+  var runId = 'test-invalidedit-' + Date.now();
+  var deps = createFakeDeps();
+  var callCount = 0;
+
+  // First response: an edit missing newString (INVALID_EDIT). Second response
+  // (the re-ask within the same attempt) provides a valid edit set.
+  var responses = [
+    JSON.stringify({ repairKind: 'source-edit', rationale: 'r1', edits: [{ path: 'src/x.js', oldString: 'old content' }], newFiles: [] }),
+    JSON.stringify({ repairKind: 'source-edit', rationale: 'r2', edits: [{ path: 'src/x.js', oldString: 'old content', newString: 'new content' }], newFiles: [] })
+  ];
+  deps.model.callModel = function(opts) {
+    var resp = responses[Math.min(callCount, responses.length - 1)];
+    callCount++;
+    return Promise.resolve({ ok: true, text: resp });
+  };
+  // Reject an edit that omits newString with INVALID_EDIT (like the real
+  // patchValidator does) so the re-ask path is exercised; accept otherwise.
+  deps.validator.validate = function(editSet, opts) {
+    var errs = [];
+    (editSet.edits || []).forEach(function(e, i) {
+      if (!e || typeof e.newString !== 'string') {
+        errs.push('[INVALID_EDIT] edit at index ' + i + ' must have newString (may be empty string for deletions)');
+      }
+    });
+    if (errs.length > 0) return { ok: false, errors: errs, stats: {} };
+    return { ok: true, errors: [], stats: { fileCount: 1 } };
+  };
+
+  var result = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'target-code', signature: 'sig-ie-' + Date.now() },
+    candidates: validCandidates(dir),
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    attemptNumber: 1,
+    env: {},
+    deps: deps
+  });
+
+  // One structured re-ask within the SAME attempt: model called twice.
+  assert.strictEqual(callCount, 2, 'model must be called exactly twice (initial + one re-ask)');
+  assert.strictEqual(result.status, 'READY', 're-ask must produce a valid edit set that applies');
+  assert.strictEqual(deps._callCount.apply, 1, 'applier must run on the corrected edit set');
+  assert.strictEqual(deps._callCount.runChecks, 1, 'checks must run after the corrected edit set');
+
+  try { fs.rmSync(path.join('.', 'evidence', runId), { recursive: true, force: true }); } catch (e) {}
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+});
+
+test('run3b: INVALID_EDIT that stays invalid across the re-ask -> REJECTED INVALID_EDIT, no apply', async function() {
+  var dir = createTempProject({
+    'src/x.js': 'old content\n',
+    'package.json': '{"name":"test","scripts":{"test":"echo ok"}}'
+  });
+  var runId = 'test-ie-persist-' + Date.now();
+  var deps = createFakeDeps();
+  var callCount = 0;
+  // Both the initial and the re-ask responses omit newString -> still INVALID_EDIT.
+  deps.model.callModel = function(opts) {
+    callCount++;
+    return Promise.resolve({ ok: true, text: JSON.stringify({
+      repairKind: 'source-edit',
+      rationale: 'still missing newString',
+      edits: [{ path: 'src/x.js', oldString: 'old content' }],
+      newFiles: []
+    }) });
+  };
+  deps.model.parseEditSet = function(text) {
+    try { return { ok: true, editSet: JSON.parse(text) }; } catch (e) { return { ok: false, error: e.message }; }
+  };
+  // Always reject with INVALID_EDIT: newString never supplied even after the
+  // structured re-prompt, so the REJECTED path (not apply) is exercised.
+  deps.validator.validate = function(editSet, opts) {
+    var errs = [];
+    (editSet.edits || []).forEach(function(e, i) {
+      if (!e || typeof e.newString !== 'string') {
+        errs.push('[INVALID_EDIT] edit at index ' + i + ' must have newString (may be empty string for deletions)');
+      }
+    });
+    if (errs.length > 0) return { ok: false, errors: errs, stats: {} };
+    return { ok: true, errors: [], stats: { fileCount: 1 } };
+  };
+
+  var result = await proposeAndCheck({
+    finding: { class: 'Err', message: 'msg', domain: 'target-code', signature: 'sig-ie2-' + Date.now() },
+    candidates: validCandidates(dir),
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    attemptNumber: 1,
+    env: {},
+    deps: deps
+  });
+
+  assert.strictEqual(callCount, 2, 'one re-ask attempted');
+  assert.strictEqual(result.status, 'REJECTED');
+  assert.ok(result.rejectionCodes.indexOf('INVALID_EDIT') !== -1, 'rejects with INVALID_EDIT');
+  assert.strictEqual(deps._callCount.apply, 0, 'no apply on invalid edit sets');
+  assert.strictEqual(deps._callCount.runChecks, 0, 'no checks on invalid edit sets');
+
+  try { fs.rmSync(path.join('.', 'evidence', runId), { recursive: true, force: true }); } catch (e) {}
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+});

@@ -558,6 +558,11 @@ function extractErrorContextLines(allLines, maxContext) {
  * findingMessage, or `undefined` when no match), each capped at 300 chars with
  * secrets redacted. Also includes errorContextLines: up to 3 lines following
  * each ERROR line that contain '!=' or '$N' parameter markers.
+ *
+ * Counts-only SQL diagnostics per kind (never raw values): the number of
+ * ERROR, CONTEXT, STATEMENT and DETAIL lines, and how many ERROR lines have a
+ * STATEMENT line within the next 3 lines. These numbers reveal whether the
+ * log source kept the triples that extractFinding needs.
  */
 function buildLogShape(logs, findingMessage) {
   var kinds = ['postgres', 'vendure', 'worker'];
@@ -572,6 +577,34 @@ function buildLogShape(logs, findingMessage) {
       parameterLines: undefined,
       errorContextLines: undefined
     };
+    // Counts-only SQL diagnostics: a count of lines whose stripped payload
+    // carries each Postgres severity keyword, and how many ERROR lines have a
+    // STATEMENT within the next 3 lines. Numeric only - never raw log values.
+    info.severityCounts = { error: 0, context: 0, statement: 0, detail: 0 };
+    info.errorLinesWithStatementWithin3 = 0;
+    if (lines.length > 0) {
+      var strippedLines = [];
+      for (var sli = 0; sli < lines.length; sli++) {
+        strippedLines.push(stripLogPrefix(String(lines[sli] || '')));
+      }
+      for (var ci = 0; ci < strippedLines.length; ci++) {
+        var pl = strippedLines[ci];
+        if (/^ERROR(?:\b|:| )/.test(pl)) info.severityCounts.error++;
+        else if (/^CONTEXT(?:\b|:| )/.test(pl)) info.severityCounts.context++;
+        else if (/^STATEMENT(?:\b|:| )/.test(pl)) info.severityCounts.statement++;
+        else if (/^DETAIL(?:\b|:| )/.test(pl)) info.severityCounts.detail++;
+      }
+      for (var ei = 0; ei < strippedLines.length; ei++) {
+        if (!/^ERROR(?:\b|:| )/.test(strippedLines[ei])) continue;
+        var hasStmt = false;
+        for (var w = 1; w <= 3; w++) {
+          var idx = ei + w;
+          if (idx >= strippedLines.length) break;
+          if (/^STATEMENT(?:\b|:| )/.test(strippedLines[idx])) { hasStmt = true; break; }
+        }
+        if (hasStmt) info.errorLinesWithStatementWithin3++;
+      }
+    }
     // Up to 5 lines matching the finding message (or ERROR keyword), capped
     // at 300 chars each, secrets redacted using targeted maskSecretsOnly.
     var matched = [];
@@ -1242,7 +1275,7 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
       previousEvidence: {
         diff: propose.diffText || null,
         checks: propose.checks || null,
-        errors: [propose.status],
+        errors: (propose.errors && propose.errors.length > 0) ? propose.errors : [propose.status],
         rejectionCodes: propose.rejectionCodes || null,
         validCandidatePaths: propose.validCandidatePaths || null,
         requestedPaths: propose.requestedPaths || null

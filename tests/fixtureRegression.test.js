@@ -310,3 +310,77 @@ test('fixture: parseLogExcerpt handles docker-prefixed Postgres ERROR/CONTEXT/ST
   assert.strictEqual(result2.column, 'active', 'column correct for docker-prefix format');
   assert.strictEqual(result2.paramIndex, 2, 'paramIndex correct for docker-prefix format');
 });
+
+// ---------------------------------------------------------------------------
+// F: SQL still null live. Counts-only diagnostics to log-shape.json per kind
+//    (ERROR/CONTEXT/STATEMENT/DETAIL counts, and how many ERROR lines have a
+//    STATEMENT within the next 3 lines), and the log source keeps the tail so
+//    a checkpoint-LOG-heavy head never drops the ERROR/CONTEXT/STATEMENT
+//    triple that extractFinding needs.
+// ---------------------------------------------------------------------------
+test('fixture: log-shape severity counts and tail-kept excerpt keep SQL parseable', async function() {
+  var repairModule = await repairModulePromise;
+  var logSource = require('../src/repair/logSource');
+  var signatureExtractor = require('../src/repair/signatureExtractor');
+
+  // A log whose HEAD is a flood of checkpoint LOG lines and whose TAIL holds
+  // the SQL triple. More lines than any maxLines the source may impose.
+  var lines = [];
+  for (var i = 0; i < 160; i++) {
+    lines.push('2026-10-21 12:00:00.' + String(i).padStart(3, '0') + ' UTC [42] LOG:  checkpoint complete: wrote ' + i + ' buffers');
+  }
+  lines.push('2026-10-21 12:01:00.001 UTC [42] ERROR:  invalid input syntax for type integer: "undefined"');
+  lines.push('2026-10-21 12:01:00.002 UTC [42] CONTEXT:  unnamed portal parameter $3 = \'undefined\'');
+  lines.push('2026-10-21 12:01:00.003 UTC [42] STATEMENT:  SELECT * FROM "product" WHERE "product"."id" != $3');
+  // Another triple at the very tail.
+  lines.push('2026-10-21 12:02:00.001 UTC [42] ERROR:  invalid input syntax for type integer: "NaN"');
+  lines.push('2026-10-21 12:02:00.002 UTC [42] CONTEXT:  unnamed portal parameter $5 = \'NaN\'');
+  lines.push('2026-10-21 12:02:00.003 UTC [42] STATEMENT:  SELECT * FROM "order_line" WHERE "order_line"."qty" != $5 LIMIT $1');
+
+  // (1) Counts-only log-shape diagnostics per kind.
+  var shape = repairModule.buildLogShape({ postgres: lines, vendure: [], worker: [] }, 'invalid input syntax');
+  var counts = shape.kinds.postgres.severityCounts;
+  assert.strictEqual(counts.error, 2, 'severityCounts.error must count ERROR lines');
+  assert.strictEqual(counts.context, 2, 'severityCounts.context must count CONTEXT lines');
+  assert.strictEqual(counts.statement, 2, 'severityCounts.statement must count STATEMENT lines');
+  assert.strictEqual(counts.detail, 0, 'severityCounts.detail must count DETAIL lines');
+  assert.strictEqual(shape.kinds.postgres.errorLinesWithStatementWithin3, 2,
+    'every ERROR line here has a STATEMENT within the next 3 lines');
+
+  // (2) The log source keeps the TAIL: after truncating to maxLines=12 the
+  //     ERROR/CONTEXT/STATEMENT triple must survive while head LOG drops.
+  var evidenceRoot = createTempDir();
+  var collected = await logSource.collect('postgres', {
+    runCommand: function(cmd, args, opts) { return Promise.resolve({ stdout: lines.join('\n'), stderr: '', exitCode: 0 }); },
+    runId: 'test-sql-null-' + Date.now(),
+    root: evidenceRoot,
+    maxLines: 12
+  });
+  assert.strictEqual(collected.ok, true);
+  assert.strictEqual(collected.truncated, true, 'log larger than maxLines must be truncated');
+  assert.strictEqual(collected.lines.length, 12);
+  var joined = collected.lines.join('\n');
+  assert.ok(joined.indexOf('ERROR:  invalid input syntax') !== -1,
+    'tail-kept log must retain ERROR lines (sql null regression): ' + joined.substring(0, 300));
+  assert.ok(joined.indexOf('CONTEXT:  unnamed portal parameter') !== -1,
+    'tail-kept log must retain CONTEXT lines');
+  assert.ok(joined.indexOf('STATEMENT:  SELECT') !== -1,
+    'tail-kept log must retain STATEMENT lines');
+
+  // (3) The excerpt built from the tail-kept lines stays inside the 20k cap
+  //     and passes through extractFinding with SQL parsed (docker-prefix
+  //     handling covers the checkpoint LOG noise).
+  var logExcerpt = repairModule.buildLogExcerptWithWindow(collected.lines, 'invalid input syntax', 20000);
+  assert.ok(logExcerpt && logExcerpt.length <= 20000, 'excerpt must be capped at 20000 chars');
+  assert.ok(logExcerpt.indexOf('ERROR:') !== -1, 'excerpt must contain an ERROR line');
+  assert.ok(logExcerpt.indexOf('STATEMENT:') !== -1, 'excerpt must contain a STATEMENT line');
+  var finding = signatureExtractor.extractFinding({
+    apiErrors: [{ message: 'invalid input syntax for type integer: "undefined"', path: null, extensions: { code: 'BAD_USER_INPUT' } }],
+    logExcerpt: logExcerpt
+  });
+  assert.strictEqual(finding.sql.operator, '!=', 'operator must be parsed from the tail-kept excerpt');
+  assert.ok(finding.sql.statement && finding.sql.statement.indexOf('SELECT') !== -1,
+    'statement must be parsed from the tail-kept excerpt');
+
+  fs.rmSync(evidenceRoot, { recursive: true, force: true });
+});

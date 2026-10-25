@@ -377,7 +377,11 @@ async function collect(kind, options) {
     allLines.pop();
   }
   if (allLines.length > maxLines) {
-    allLines = allLines.slice(0, maxLines);
+    // Keep the TAIL of the log, not the head: the SQL ERROR/CONTEXT/
+    // STATEMENT/DETAIL triples that extractFinding needs appear at the end,
+    // after a noise head of checkpoint LOG lines. Keeping the head silently
+    // dropped the error and left finding.sql null in production.
+    allLines = allLines.slice(allLines.length - maxLines);
     truncated = true;
   }
 

@@ -1201,3 +1201,92 @@ test('locator: no dependency candidates means no importer candidates', async fun
   fs.rmSync(targetRoot, { recursive: true, force: true });
 });
 
+// ---------------------------------------------------------------------------
+// D: config-building candidates must not displace matched dependency
+//    candidates. Regression: six config files (generated graphql.ts,
+//    migrations, entry files) with score 30 and a total cap displaced the
+//    dependency candidate. Fix: exclude generated/migration/test/.d.ts, cap
+//    at 2 config candidates scored below dependency candidates, reserve >=4
+//    slots for dependency candidates.
+// ---------------------------------------------------------------------------
+test('locator: config candidates capped at 2 and never displace the matched dependency candidate', async function() {
+  var workspaceDir = createTempDir();
+  var targetRoot = createTempDir();
+
+  // The matched dependency package (the actual bug site).
+  fs.writeFileSync(path.join(targetRoot, 'package.json'), JSON.stringify({
+    name: 'test-target', version: '1.0.0',
+    dependencies: { 'fake-products-resolver': '1.0.0' }
+  }, null, 2));
+
+  var srcDir = path.join(targetRoot, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.mkdirSync(path.join(srcDir, 'gql'), { recursive: true });
+  // (1) generated graphql.ts - must be excluded entirely
+  fs.writeFileSync(path.join(srcDir, 'gql', 'graphql.ts'),
+    'import gql from "graphql-tag";\nconst config = { plugins: [PluginA, PluginB, PluginC, PluginD] };\n');
+  // (2) generated api-client.generated.ts - must be excluded entirely
+  fs.writeFileSync(path.join(srcDir, 'gql', 'api-client.generated.ts'),
+    'export const clientConfig = { plugins: [A, B, C, D, E, F] };\n');
+  // (3) a migration file is never a config candidate
+  fs.mkdirSync(path.join(srcDir, 'migrations'), { recursive: true });
+  fs.writeFileSync(path.join(srcDir, 'migrations', '1700000000000-add-column.ts'),
+    'export const up = async (q) => { q.addColumn("product", "slug"); };\nconst config = { name: "migration" };\n');
+  // (4) a test file is never a config candidate
+  fs.writeFileSync(path.join(srcDir, 'vendure-config.spec.ts'),
+    'import { describe, it } from "vitest";\nconst config = { plugins: [A] };\ndescribe("config", () => { it("works", () => {}); });\n');
+  // (5) and (6) two REAL config files (allowed, capped at 2)
+  fs.writeFileSync(path.join(srcDir, 'vendure-config.ts'),
+    'import { VendureConfig } from "@vendure/core";\nconst config: VendureConfig = { plugins: [PluginA, PluginB] };\nexport default config;\n');
+  fs.writeFileSync(path.join(srcDir, 'entry.ts'),
+    'import { createServer } from "vite";\nconst server = createServer({ plugins: [A, B] });\n');
+
+  // The fake dependency (products resolver with the notEq bug).
+  var pkgDir = createTempDir();
+  var resolverDir = path.join(pkgDir, 'dist', 'resolvers');
+  fs.mkdirSync(resolverDir, { recursive: true });
+  fs.writeFileSync(path.join(resolverDir, 'products.resolver.js'),
+    'async function products(ctx, args) {\n' +
+    '  const nppId = await this.nppService.getRootNPPId(ctx);\n' +
+    "  const options = { ...args.options, filter: { id: { notEq: `${nppId}` } } };\n" +
+    '  return options;\n' +
+    '}\n');
+  fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({
+    name: 'fake-products-resolver', version: '1.0.0', main: 'dist/resolvers/products.resolver.js'
+  }, null, 2));
+
+  var fakeFetch = function(name, version, dir) { return Promise.resolve(pkgDir); };
+
+  var result = await locator.locateCandidates({
+    finding: { operator: '!=', column: 'id', path: 'products' },
+    targetRoot: targetRoot,
+    fetchPackage: fakeFetch,
+    maxCandidates: 10,
+    runId: 'test-config-vs-dep-' + Date.now(),
+    workspaceDir: workspaceDir
+  });
+
+  var config = result.candidates.filter(function(c) { return c.source === 'config'; });
+  assert.ok(config.length <= 2,
+    'at most 2 config candidates (got ' + config.length + '): ' + JSON.stringify(config.map(function(c){return c.file;})));
+
+  // Generated/migration/test files are never config candidates.
+  config.forEach(function(c) {
+    assert.ok(!/graphql\.ts$|\.generated\.|migrations?\//.test(c.file),
+      'generated/migration/test files must be excluded from config candidates: ' + c.file);
+    assert.ok(!/\.d\.ts$|\.(test|spec)\.(js|ts|tsx|mjs)$/.test(c.file),
+      'test/.d.ts files must be excluded from config candidates: ' + c.file);
+  });
+
+  // The matched dependency candidate must still be present (never displaced).
+  var dep = result.candidates.filter(function(c) { return c.source === 'dependency'; });
+  assert.ok(dep.length > 0, 'the matched dependency candidate must be kept; got ' + dep.length);
+  assert.ok(dep[0].package.indexOf('fake-products-resolver') !== -1,
+    'highest-scoring dependency candidate is fake-products-resolver');
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+  fs.rmSync(pkgDir, { recursive: true, force: true });
+});
+
+
