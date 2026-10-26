@@ -603,13 +603,25 @@ function validate(editSet, options) {
   }
 
   // When dependency-patch is unavailable, patch files can never be applied, so
-  // NO repair kind may add or edit files under patches/ (they would be inert).
+  // NO repair kind may add or edit files under the TOP-LEVEL patches/ directory
+  // (they would be inert). This gate matches ONLY a top-level patches/
+  // directory: a path such as src/patches/x.ts or any nested folder that
+  // merely contains the word "patches" is an ordinary source path and is never
+  // blocked here.
   if (capabilities.dependencyPatch === false) {
     function checkPatchesPath(pathStr) {
       if (!pathStr) return null;
-      var normalized = pathStr.replace(/\\/g, '/');
-      if (normalized.indexOf('patches/') === 0) {
-        return { code: ERR_CODES.DEPENDENCY_PATCH_UNAVAILABLE, message: 'dependency-patch is not available in this runtime; files under patches/ are not allowed (got: ' + pathStr + ')' };
+      var normalized = String(pathStr).replace(/\\/g, '/');
+      // Reduce an absolute path to a clone-relative form so a modeled absolute
+      // path is judged exactly like its relative equivalent.
+      if (cloneDir && path.isAbsolute(normalized)) {
+        try {
+          normalized = path.relative(cloneDir, normalized).replace(/\\/g, '/');
+        } catch (ee) { /* keep normalized as-is */ }
+      }
+      normalized = normalized.replace(/^\.\//, '');
+      if (normalized === 'patches' || normalized.indexOf('patches/') === 0) {
+        return { code: ERR_CODES.DEPENDENCY_PATCH_UNAVAILABLE, message: 'dependency-patch is not available in this runtime; files under the top-level patches/ directory are not allowed (got: ' + pathStr + ')' };
       }
       return null;
     }

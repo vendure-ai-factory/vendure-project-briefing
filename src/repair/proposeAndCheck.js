@@ -316,9 +316,17 @@ function extractErrorCodes(errors) {
 }
 
 /**
- * Write the compact attempt summary (evidence/<runId>/repair/attempt-<n>.json).
- * Paths and codes only — never file contents, log lines, or secrets.
+ * Write attempt-N.json evidence for a successful (READY) attempt BEFORE the
+ * commit/push stage runs. Status defaults to READY; the stage argument records
+ * which stage the evidence was written from. Never includes file contents or
+ * secrets.
  */
+function writeBeforeCommitEvidence(runId, attemptNumber, data, fsMod, now) {
+  if (!data.proposalSummary) data.proposalSummary = {};
+  if (!data.stage) data.stage = 'before-commit';
+  writeAttemptSummary(runId, attemptNumber, data, fsMod, now);
+}
+
 var CHECK_STDERR_TAIL = 500;
 
 /**
@@ -376,8 +384,71 @@ function writeAttemptSummary(runId, attemptNumber, data, fsMod, now) {
     if (data.checkKilled) {
       summary.checkKilled = data.checkKilled;
     }
+    // A one-line, code-free summary of the proposal (paths + repair kind) and
+    // the stage name, used when recording evidence before commit and when a
+    // crash occurs inside a stage so attempt-N.json carries the stage name.
+    if (data.proposalSummary) {
+      summary.proposalSummary = {
+        repairKind: data.proposalSummary.repairKind || null,
+        editPaths: Array.isArray(data.proposalSummary.editPaths) ? data.proposalSummary.editPaths : [],
+        newFilePaths: Array.isArray(data.proposalSummary.newFilePaths) ? data.proposalSummary.newFilePaths : []
+      };
+    }
+    if (data.stage) {
+      summary.stage = String(data.stage);
+    }
+    if (data.crash && typeof data.crash === 'object') {
+      summary.crash = {
+        stage: data.crash.stage ? String(data.crash.stage) : null,
+        message: typeof data.crash.message === 'string' ? data.crash.message.substring(0, 2000) : null
+      };
+    }
     fsMod.writeFileSync(path.join(dir, 'attempt-' + attemptNumber + '.json'), JSON.stringify(summary, null, 2) + '\n', 'utf8');
   } catch (e) { /* best effort */ }
+}
+
+/**
+ * Build the compact one-line proposal summary for evidence: repair kind, the
+ * edit paths, and the new-file paths. Paths only - never content, old/new
+ * strings, or any value that could carry a secret.
+ */
+function proposalSummaryOf(editSet, requestedPaths) {
+  var editPaths = [];
+  var newFilePaths = [];
+  (editSet && editSet.edits || []).forEach(function(e) { if (e && e.path) editPaths.push(e.path); });
+  (editSet && editSet.newFiles || []).forEach(function(nf) { if (nf && nf.path) newFilePaths.push(nf.path); });
+  if (editPaths.length === 0 && newFilePaths.length === 0 && Array.isArray(requestedPaths)) {
+    // Fall back to whatever paths were collected if the edit set shape differs.
+    requestedPaths.forEach(function(p) { if (p) editPaths.push(p); });
+  }
+  return {
+    repairKind: editSet && editSet.repairKind ? editSet.repairKind : null,
+    editPaths: editPaths,
+    newFilePaths: newFilePaths
+  };
+}
+
+/**
+ * Write attempt-N.json evidence for a successful (READY) attempt BEFORE the
+ * commit/push stage runs. Status defaults to READY; the stage argument records
+ * which stage the evidence was written from. Never includes file contents or
+ * secrets.
+ */
+function writeBeforeCommitEvidence(runId, attemptNumber, data, fsMod, now) {
+  writeAttemptSummary(runId, attemptNumber, Object.assign({
+    status: data.status || 'READY',
+    codes: Array.isArray(data.codes) ? data.codes : [],
+    requestedPaths: Array.isArray(data.requestedPaths) ? data.requestedPaths : [],
+    candidatePaths: Array.isArray(data.candidatePaths) ? data.candidatePaths : [],
+    tokensUsed: typeof data.tokensUsed === 'number' ? data.tokensUsed : null,
+    promptChars: typeof data.promptChars === 'number' ? data.promptChars : null,
+    elapsedMs: typeof data.elapsedMs === 'number' ? data.elapsedMs : null,
+    model: typeof data.model === 'string' ? data.model : null,
+    requestedModel: typeof data.requestedModel === 'string' ? data.requestedModel : null,
+    provider: typeof data.provider === 'string' ? data.provider : null,
+    proposalSummary: data.proposalSummary,
+    stage: data.stage || 'before-commit'
+  }, data), fsMod, now);
 }
 
 /**
@@ -600,13 +671,21 @@ function validateProposalPaths(editSet, candidates, cloneDir, capabilities) {
     if (!nf || !nf.path) continue;
     var relNf = normRelPath(nf.path, cloneDir, false);
     if (relNf === '') continue;
+    // dependencyPatch=false gates ONLY a top-level patches/ directory (path
+    // starts with "patches/"). src/patches/ is an ordinary source folder and
+    // must never be caught by that gate.
     var inPatches = dependencyPatchAvailable && relNf.indexOf('patches/') === 0;
     var inMigration = isUnderMigrationDir(relNf, cloneDir);
-    var localWrapperNew = isLocalWrapper && relNf.indexOf('src/') === 0;
+    // New files under src/ are allowed for the application-source repair kinds
+    // (source-edit, config-edit, local-wrapper). This keeps src/patches/x.ts
+    // accepted without weakening the patches/ gate for dependency-patch.
+    var isAppSourceKind = editSet && (editSet.repairKind === 'source-edit' ||
+      editSet.repairKind === 'config-edit' || editSet.repairKind === 'local-wrapper');
+    var appSourceNewFile = isAppSourceKind && relNf.indexOf('src/') === 0;
     var isBlockedNf = isBlockedLocalWrapperPath(relNf);
     if (isBlockedNf) {
       if (offending.indexOf(nf.path) === -1) offending.push(nf.path);
-    } else if (!inPatches && !inMigration && !localWrapperNew) {
+    } else if (!inPatches && !inMigration && !appSourceNewFile) {
       if (offending.indexOf(nf.path) === -1) offending.push(nf.path);
     }
   }
@@ -858,13 +937,27 @@ async function proposeAndCheck(options) {
   var readFile = deps.readFile || function(p) { return require('fs').readFileSync(p, 'utf8'); };
   var fs = deps.fs || require('fs');
 
+  // gitClient commits/reads the diff via runCommand(...).then(...). The default
+  // runCommand above (and any injected sync runner) returns a plain object, so
+  // wrap it so every git call sees a Promise without changing how the applier
+  // and verifier consume runCommand synchronously.
+  var promiseRunCommand = function(cmd, args, opts) {
+    try {
+      return Promise.resolve(runCommand(cmd, args, opts));
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  };
+
   // scratchCopy for pipeline mode
   var scratchCopy = deps.scratchCopy || function(rootDir, runId, runCommand) {
     // Default: copy to a temp directory
     var os = require('os');
     var tempDir = path.join(os.tmpdir(), 'pipeline-scratch-' + runId);
-    // Simple copy using git clone --depth 1
-    return runCommand('git', ['clone', '--single-branch', '--depth', '1', rootDir, tempDir], { timeout: 60000 })
+    // Simple copy using git clone --depth 1. The default (or injected) runner
+    // may return a plain object, so route through promiseRunCommand for the
+    // .then() contract.
+    return promiseRunCommand('git', ['clone', '--single-branch', '--depth', '1', rootDir, tempDir], { timeout: 60000 })
       .then(function(res) {
         if (res.exitCode === 0) {
           return { ok: true, dir: tempDir };
@@ -1371,8 +1464,30 @@ async function proposeAndCheck(options) {
     }
   }
 
-  // Step 6: apply
-  var applyResult = applier.apply(editSet, { cloneDir: cloneDir, runCommand: runCommand });
+  // Step 6: apply. Wrapped so an unexpected exception still records
+  // attempt-N.json with the stage name (evidence before a bare
+  // attempt-error.json from the orchestrator).
+  var applyResult;
+  try {
+    applyResult = applier.apply(editSet, { cloneDir: cloneDir, runCommand: runCommand });
+  } catch (applyErr) {
+    writeAttemptSummary(runId, attemptNumber, {
+      status: 'CRASH',
+      codes: ['CRASH'],
+      requestedPaths: requestedPaths,
+      candidatePaths: candidateRelPaths(cloneDir, realCandidates),
+      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+      promptChars: promptChars,
+      elapsedMs: elapsedMs,
+      model: modelResult.model,
+      requestedModel: modelResult.requestedModel,
+      provider: modelResult.provider,
+      proposalSummary: proposalSummaryOf(editSet, requestedPaths),
+      stage: 'apply',
+      crash: { stage: 'apply', message: String(applyErr && applyErr.message || applyErr) }
+    }, fs, now);
+    throw applyErr;
+  }
   if (!applyResult.ok) {
     if (applyResult.blocker && applyResult.blocker.code === 'DEP_PATCH_NOT_APPLIED_IN_IMAGE') {
       return {
@@ -1425,7 +1540,27 @@ async function proposeAndCheck(options) {
     };
   }
 
-  var checkResult = await verifier.runChecks(cloneDir, checkOptions);
+  var checkResult;
+  try {
+    checkResult = await verifier.runChecks(cloneDir, checkOptions);
+  } catch (checksErr) {
+    writeAttemptSummary(runId, attemptNumber, {
+      status: 'CRASH',
+      codes: ['CRASH'],
+      requestedPaths: requestedPaths,
+      candidatePaths: (candidates || []).map(function(c) { return c.file; }),
+      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+      promptChars: promptChars,
+      elapsedMs: elapsedMs,
+      model: modelResult.model,
+      requestedModel: modelResult.requestedModel,
+      provider: modelResult.provider,
+      proposalSummary: proposalSummaryOf(editSet, requestedPaths),
+      stage: 'checks',
+      crash: { stage: 'checks', message: String(checksErr && checksErr.message || checksErr) }
+    }, fs, now);
+    throw checksErr;
+  }
 
   // Detect if any script was killed by signal (e.g. SIGKILL on timeout) with no
   // output — this is distinct from a clean exit-with-non-zero-code failure.
@@ -1472,11 +1607,49 @@ async function proposeAndCheck(options) {
     };
   }
 
-  // Step 8: git commit and get diff info
+  // Step 8: git commit and get diff info. Attempt-N.json evidence is written
+  // BEFORE the commit/push stage so a crash during git operations still leaves
+  // a per-attempt record. Each git stage is wrapped so an exception records the
+  // stage name in attempt-N.json and is rethrown for the caller's own
+  // attempt-error handling.
   var sig8 = toText(finding.signature, 8) || 'unknown';
   var commitMsg = 'pipeline fix ' + sig8 + ': ' + editSet.repairKind;
+  var proposalSummary = proposalSummaryOf(editSet, requestedPaths);
+  var evidenceByStage = {};
 
-  var commitResult = await git.commitAll(cloneDir, commitMsg, { runCommand: runCommand });
+  function stageEvidence(stage) {
+    evidenceByStage[stage] = evidenceByStage[stage] || {
+      status: 'READY',
+      codes: [],
+      requestedPaths: requestedPaths,
+      candidatePaths: candidateRelPaths(cloneDir, realCandidates),
+      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+      promptChars: promptChars,
+      elapsedMs: elapsedMs,
+      model: modelResult.model,
+      requestedModel: modelResult.requestedModel,
+      provider: modelResult.provider,
+      proposalSummary: proposalSummary
+    };
+    return evidenceByStage[stage];
+  }
+
+  // 8a: record READY evidence BEFORE commit/push so a crash in the git stage
+  // still leaves a per-attempt record (never only a bare attempt-error.json).
+  writeBeforeCommitEvidence(runId, attemptNumber, Object.assign({ stage: 'before-commit' }, stageEvidence('before-commit')), fs, now);
+
+  var commitResult;
+  try {
+    commitResult = await git.commitAll(cloneDir, commitMsg, { runCommand: promiseRunCommand });
+  } catch (stageErr) {
+    writeAttemptSummary(runId, attemptNumber, Object.assign(stageEvidence('ensure-committed'), {
+      status: 'CRASH',
+      codes: ['CRASH'],
+      stage: 'before-commit',
+      crash: { stage: 'commit', message: String(stageErr && stageErr.message || stageErr) }
+    }), fs, now);
+    throw stageErr;
+  }
   if (!commitResult.ok) {
     return {
       status: 'APPLY_FAILED',
@@ -1485,17 +1658,49 @@ async function proposeAndCheck(options) {
     };
   }
 
-  var headResult = await git.getHeadSha(cloneDir, { runCommand: runCommand });
+  var headResult;
+  try {
+    headResult = await git.getHeadSha(cloneDir, { runCommand: promiseRunCommand });
+  } catch (headErr) {
+    writeAttemptSummary(runId, attemptNumber, Object.assign(stageEvidence('get-head-sha'), {
+      status: 'CRASH',
+      codes: ['CRASH'],
+      stage: 'get-head-sha',
+      crash: { stage: 'get-head-sha', message: String(headErr && headErr.message || headErr) }
+    }), fs, now);
+    throw headErr;
+  }
   var headSha = headResult.ok ? headResult.sha : null;
 
-  var statResult = await git.diffStat(cloneDir, baseSha, { runCommand: runCommand });
+  var statResult;
+  try {
+    statResult = await git.diffStat(cloneDir, baseSha, { runCommand: promiseRunCommand });
+  } catch (statErr) {
+    writeAttemptSummary(runId, attemptNumber, Object.assign(stageEvidence('diff-stat'), {
+      status: 'CRASH',
+      codes: ['CRASH'],
+      stage: 'diff-stat',
+      crash: { stage: 'diff-stat', message: String(statErr && statErr.message || statErr) }
+    }), fs, now);
+    throw statErr;
+  }
   var diffStatText = statResult.ok ? statResult.stat : '';
 
-  var diffResult = await git.diffText(cloneDir, baseSha, 20000, { runCommand: runCommand });
+  var diffResult;
+  try {
+    diffResult = await git.diffText(cloneDir, baseSha, 20000, { runCommand: promiseRunCommand });
+  } catch (diffErr) {
+    writeAttemptSummary(runId, attemptNumber, Object.assign(stageEvidence('diff-text'), {
+      status: 'CRASH',
+      codes: ['CRASH'],
+      stage: 'diff-text',
+      crash: { stage: 'diff-text', message: String(diffErr && diffErr.message || diffErr) }
+    }), fs, now);
+    throw diffErr;
+  }
   var diffTextOutput = diffResult.ok ? diffResult.text : '';
 
   // Write evidence
-  var attemptNumber = 1;
   writeEvidence(runId, attemptNumber, {
     prompt: prompt,
     editSet: editSet,
@@ -1504,18 +1709,7 @@ async function proposeAndCheck(options) {
     diffText: diffTextOutput
   }, { fs: fs, now: now });
 
-  writeAttemptSummary(runId, attemptNumber, {
-    status: 'READY',
-    codes: [],
-    requestedPaths: requestedPaths,
-    candidatePaths: candidateRelPaths(cloneDir, realCandidates),
-    tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
-    promptChars: promptChars,
-    elapsedMs: elapsedMs,
-    model: modelResult.model,
-    requestedModel: modelResult.requestedModel,
-    provider: modelResult.provider
-  }, fs, now);
+  writeAttemptSummary(runId, attemptNumber, Object.assign(stageEvidence('ready'), { status: 'READY', codes: [], stage: 'ready' }), fs, now);
 
 
   // For pipeline mode, we don't push - the orchestrator handles that
@@ -1556,5 +1750,6 @@ module.exports = {
   queryDependencyVersions: queryDependencyVersions,
   candidateRelPaths: candidateRelPaths,
   validateProposalPaths: validateProposalPaths,
-  installedDependencyVersion: installedDependencyVersion
+  installedDependencyVersion: installedDependencyVersion,
+  proposalSummaryOf: proposalSummaryOf
 };

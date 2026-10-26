@@ -698,7 +698,22 @@ function extractFinding(input) {
     if (sqlInfo) {
       confidence = 'WITH_SQL';
     } else {
-      notes.push('logExcerpt present but could not parse SQL context');
+      // The log excerpt may have been truncated (e.g. a long STATEMENT cut at
+      // the excerpt byte cap before the "!= $N" part). Fall back to scanning
+      // the full raw log lines so the operator/column are still extracted
+      // before any truncation loses them.
+      var rawLinesArr = Array.isArray(rawLogLines) ? rawLogLines : [];
+      if (rawLinesArr.length > 0) {
+        var joinedRaw = rawLinesArr.join('\n');
+        var fallbackSql = parseLogExcerpt(joinedRaw);
+        if (fallbackSql) {
+          sqlInfo = fallbackSql;
+          confidence = 'WITH_SQL';
+        }
+      }
+      if (!sqlInfo) {
+        notes.push('logExcerpt present but could not parse SQL context');
+      }
     }
   }
 

@@ -377,6 +377,10 @@ function stripLogPrefix(line) {
   }
   // Docker/compose prefix: "name-1  | " or "name-1|"
   out = out.replace(/^[a-zA-Z0-9_.-]+(\s*)?\|\s*/, '');
+  // Real Postgres logs via docker json-file/json log driver carry a doubled
+  // prefix: "<ISO-ts> stderr|stdout <ISO-ts> UTC ". The first ISO timestamp
+  // may use a numeric offset (+00:00) instead of 'Z', so strip both.
+  out = out.replace(/^\S+\s+(?:stderr|stdout)\s+\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\s+UTC)?\s*/, '');
   // Timestamps: ISO (2026-10-21T12:34:56.789Z), bracket [2026-...], and
   // the YYYY-MM-DD HH:MM:SS[.mmm] UTC-less forms. A year of 9999 is the
   // masked placeholder from maskLogPayload and must never be re-stripped.
@@ -387,10 +391,9 @@ function stripLogPrefix(line) {
   out = out.replace(/\[(\d+)\]\s*/, '');
   out = out.replace(/^PID\s+\d+\s*/, '');
   // Level/log tag
-  out = out.replace(/^(LOG|INFO|WARN|WARNING|NOTICE|ERROR|FATAL|DEBUG|PANIC):\s*/, function(chunk, kw) {
-    // Preserve the keyword (lower risk of breaking CONTEXT/STATEMENT that is
-    // not prefixed by "LOG:"). Keep it only if it is a real severity label.
-    return kw + ': ';
+  out = out.replace(/^(LOG|INFO|WARN|WARNING|NOTICE|ERROR|FATAL|DEBUG|PANIC):(\s*)/, function(chunk, kw, ws) {
+    // Preserve the keyword and whatever whitespace follows it (don't normalize to 1 space)
+    return kw + ':' + ws;
   });
   return out;
 }
@@ -580,7 +583,7 @@ function buildLogShape(logs, findingMessage) {
     // Counts-only SQL diagnostics: a count of lines whose stripped payload
     // carries each Postgres severity keyword, and how many ERROR lines have a
     // STATEMENT within the next 3 lines. Numeric only - never raw log values.
-    info.severityCounts = { error: 0, context: 0, statement: 0, detail: 0 };
+    info.severityCounts = { error: 0, context: 0, statement: 0, detail: 0, log: 0 };
     info.errorLinesWithStatementWithin3 = 0;
     if (lines.length > 0) {
       var strippedLines = [];
@@ -593,6 +596,7 @@ function buildLogShape(logs, findingMessage) {
         else if (/^CONTEXT(?:\b|:| )/.test(pl)) info.severityCounts.context++;
         else if (/^STATEMENT(?:\b|:| )/.test(pl)) info.severityCounts.statement++;
         else if (/^DETAIL(?:\b|:| )/.test(pl)) info.severityCounts.detail++;
+        else if (/^LOG(?:\b|:| )/.test(pl)) info.severityCounts.log++;
       }
       for (var ei = 0; ei < strippedLines.length; ei++) {
         if (!/^ERROR(?:\b|:| )/.test(strippedLines[ei])) continue;
@@ -703,7 +707,26 @@ function buildLogExcerptWithWindow(allLines, findingMessage, maxLength) {
   }
   var excerpt = windowEntries.join('\n');
   if (excerpt.length > maxLength) {
-    excerpt = excerpt.substring(0, maxLength);
+    // Keep the matched error entry (ERROR/CONTEXT/STATEMENT) readable: drop
+    // leading noise entries before the matched entry first, then truncate at a
+    // line boundary, so a long STATEMENT is not cut before the "!= $N" part.
+    if (bestIndex >= 0 && bestIndex < entries.length) {
+      var bestText = entries[bestIndex];
+      var bestRel = excerpt.indexOf(bestText);
+      if (bestRel !== -1 && bestRel > 0) {
+        excerpt = excerpt.substring(bestRel);
+      }
+      // Also include any trailing entries that immediately follow the matched
+      // entry (STATEMENT wraps) when there is room, never cutting a line.
+      if (excerpt.length > maxLength) {
+        var cut = excerpt.substring(0, maxLength);
+        var nl = cut.lastIndexOf('\n');
+        if (nl > 0) excerpt = cut.substring(0, nl);
+        else excerpt = cut;
+      }
+    } else {
+      excerpt = excerpt.substring(0, maxLength);
+    }
   }
   return excerpt;
 }
@@ -1720,7 +1743,8 @@ export {
   buildLogExcerptWithWindow,
   buildLogShape,
   maskSecretsOnly,
-  extractErrorContextLines
+  extractErrorContextLines,
+  stripLogPrefix
 };
 
 

@@ -1,0 +1,31 @@
+2026-10-23T12:01:01+00:00 stderr 2026-10-23 12:01:01 UTC LOG:  checkpoint starting
+2026-10-23T12:01:01+00:00 stderr 2026-10-23 12:01:01 UTC LOG:  checkpoint complete: wrote 0/3 buffers
+2026-10-23T12:01:01+00:00 stderr 2026-10-23 12:01:01 UTC LOG:  preventing wrap
+2026-10-23T12:01:01+00:00 stderr 2026-10-23 12:01:01 UTC ERROR:  invalid input syntax for type integer: "undefined"
+2026-10-23T12:01:02+00:00 stderr 2026-10-23 12:01:02 UTC CONTEXT:  unnamed portal parameter $3 = 'undefined'
+2026-10-23T12:01:03+00:00 stderr 2026-10-23 12:01:03 UTC STATEMENT:  SELECT "product"."id","product"."name","product"."slug" FROM "product" WHERE (("product"."deletedAt" IS NULL)) AND ("product"."enabled" = $2 AND "product"."id" != $3 AND "product"."channel_id" = $4) LIMIT $10 OFFSET $11
+2026-10-23T12:02:01+00:00 stderr 2026-10-23 12:02:01 UTC LOG:  checkpoint starting
+2026-10-23T12:02:01+00:00 stderr 2026-10-23 12:02:01 UTC LOG:  checkpoint complete: wrote 0/3 buffers
+2026-10-23T12:02:01+00:00 stderr 2026-10-23 12:02:01 UTC LOG:  preventing wrap
+2026-10-23T12:02:01+00:00 stderr 2026-10-23 12:02:01 UTC ERROR:  invalid input syntax for type integer: "undefined"
+2026-10-23T12:02:02+00:00 stderr 2026-10-23 12:02:02 UTC CONTEXT:  unnamed portal parameter $3 = 'undefined'
+2026-10-23T12:02:03+00:00 stderr 2026-10-23 12:02:03 UTC STATEMENT:  SELECT "product"."id","product"."name","product"."slug" FROM "product" WHERE (("product"."deletedAt" IS NULL)) AND ("product"."enabled" = $2 AND "product"."id" != $3 AND "product"."channel_id" = $4) LIMIT $10 OFFSET $11
+2026-10-23T12:03:01+00:00 stderr 2026-10-23 12:03:01 UTC LOG:  checkpoint starting
+2026-10-23T12:03:01+00:00 stderr 2026-10-23 12:03:01 UTC LOG:  checkpoint complete: wrote 0/3 buffers
+2026-10-23T12:03:01+00:00 stderr 2026-10-23 12:03:01 UTC LOG:  preventing wrap
+2026-10-23T12:03:01+00:00 stderr 2026-10-23 12:03:01 UTC ERROR:  invalid input syntax for type integer: "undefined"
+2026-10-23T12:03:02+00:00 stderr 2026-10-23 12:03:02 UTC CONTEXT:  unnamed portal parameter $3 = 'undefined'
+2026-10-23T12:03:03+00:00 stderr 2026-10-23 12:03:03 UTC STATEMENT:  SELECT "product"."id","product"."name","product"."slug" FROM "product" WHERE (("product"."deletedAt" IS NULL)) AND ("product"."enabled" = $2 AND "product"."id" != $3 AND "product"."channel_id" = $4) LIMIT $10 OFFSET $11
+2026-10-23T12:04:01+00:00 stderr 2026-10-23 12:04:01 UTC LOG:  checkpoint starting
+2026-10-23T12:04:01+00:00 stderr 2026-10-23 12:04:01 UTC LOG:  checkpoint complete: wrote 0/3 buffers
+2026-10-23T12:04:01+00:00 stderr 2026-10-23 12:04:01 UTC LOG:  preventing wrap
+2026-10-23T12:04:01+00:00 stderr 2026-10-23 12:04:01 UTC ERROR:  invalid input syntax for type integer: "undefined"
+2026-10-23T12:04:02+00:00 stderr 2026-10-23 12:04:02 UTC CONTEXT:  unnamed portal parameter $3 = 'undefined'
+2026-10-23T12:04:03+00:00 stderr 2026-10-23 12:04:03 UTC STATEMENT:  SELECT "product"."id","product"."name","product"."slug" FROM "product" WHERE (("product"."deletedAt" IS NULL)) AND ("product"."enabled" = $2 AND "product"."id" != $3 AND "product"."channel_id" = $4) LIMIT $10 OFFSET $11
+2026-10-23T12:05:01+00:00 stderr 2026-10-23 12:05:01 UTC LOG:  checkpoint starting
+2026-10-23T12:05:01+00:00 stderr 2026-10-23 12:05:01 UTC LOG:  checkpoint complete: wrote 0/3 buffers
+2026-10-23T12:05:01+00:00 stderr 2026-10-23 12:05:01 UTC LOG:  preventing wrap
+2026-10-23T12:05:01+00:00 stderr 2026-10-23 12:05:01 UTC ERROR:  invalid input syntax for type integer: "undefined"
+2026-10-23T12:05:02+00:00 stderr 2026-10-23 12:05:02 UTC CONTEXT:  unnamed portal parameter $3 = 'undefined'
+2026-10-23T12:05:03+00:00 stderr 2026-10-23 12:05:03 UTC STATEMENT:  SELECT "product"."id","product"."name","product"."slug" FROM "product" WHERE (("product"."deletedAt" IS NULL)) AND ("product"."enabled" = $2 AND "product"."id" != $3 AND "product"."channel_id" = $4) LIMIT $10 OFFSET $11
+2026-10-23T12:36:00+00:00 stderr 2026-10-23 12:36:00 UTC LOG:  autovacuum: processing database "vendure"

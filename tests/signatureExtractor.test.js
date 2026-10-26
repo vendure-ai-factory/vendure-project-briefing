@@ -552,3 +552,71 @@ test('signatureExtractor: extractFinding with real Postgres log shape sets full 
   assert.strictEqual(result.path && result.path.length > 0, true, 'path extracted');
   done();
 });
+
+// FIX 4: raw-lines fallback when logExcerpt is truncated before the != $3 part
+test('signatureExtractor: truncated logExcerpt but rawLines has full statement -> WITH_SQL with operator/column from raw', function(t, done) {
+  // A log excerpt that includes ERROR/CONTEXT but is truncated before the end of STATEMENT
+  var truncatedExcerpt = [
+    '2026-10-23T12:20:01+00:00 stderr 2026-10-23 12:20:01 UTC ERROR:  invalid input syntax for type integer: "undefined"',
+    '2026-10-23T12:20:02+00:00 stderr 2026-10-23 12:20:02 UTC CONTEXT:  unnamed portal parameter $3 = \'undefined\'',
+    '2026-10-23T12:20:03+00:00 stderr 2026-10-23 12:20:03 UTC STATEMENT:  SELECT "product"."id","product"."name","product"."slug","product"."enabled","product"."deletedAt","product"."createdAt","product"."updatedAt","product"."category_id","product"."channel_id","product"."variantId","product"."description","product"."summary","product"."metaTitle","product"."metaDescription","product"."featuredImage","product"."width","product"."height","product"."depth","product"."weight" FROM "product" WHERE (("product"."deletedAt" IS NULL)) AND ("product"."enabled" = $2 AND "product"."id" '
+  ].join('\n');
+
+  // Full raw log lines carry the complete (untruncated) STATEMENT that includes
+  // the "!= $3" condition lost by the truncated excerpt. extractFinding reads
+  // these from input.logLines and falls back to them via parseLogExcerpt.
+  var fullRawLines = [
+    '2026-10-23T12:20:01+00:00 stderr 2026-10-23 12:20:01 UTC ERROR:  invalid input syntax for type integer: "undefined"',
+    '2026-10-23T12:20:02+00:00 stderr 2026-10-23 12:20:02 UTC CONTEXT:  unnamed portal parameter $3 = \'undefined\'',
+    '2026-10-23T12:20:03+00:00 stderr 2026-10-23 12:20:03 UTC STATEMENT:  SELECT "product"."id","product"."name","product"."slug" FROM "product" WHERE ("product"."enabled" = $2 AND "product"."id" != $3 AND "product"."channel_id" = $4) LIMIT $10 OFFSET $11',
+    '2026-10-23T12:20:04+00:00 stderr 2026-10-23 12:20:04 UTC LOG:  execute <unnamed>: $1'
+  ];
+
+  var result = signatureExtractor.extractFinding({
+    apiErrors: [{ message: 'invalid input syntax for type integer: "undefined"', path: ['products'], extensions: { code: '22P02' } }],
+    logExcerpt: truncatedExcerpt,
+    logLines: fullRawLines
+  });
+
+  assert.strictEqual(result.confidence, 'WITH_SQL', 'confidence must be WITH_SQL via raw-lines fallback');
+  assert.strictEqual(result.sql.operator, '!=', 'operator != must be extracted from raw lines');
+  assert.strictEqual(result.sql.column, 'id', 'column id must be extracted from raw lines');
+  assert.strictEqual(result.sql.table, 'product', 'table product must be extracted from raw lines');
+  assert.strictEqual(result.sql.paramIndex, 3, 'paramIndex 3 must be extracted from CONTEXT');
+  assert.strictEqual(result.sql.paramValue, 'undefined', 'paramValue undefined from ERROR text');
+  done();
+});
+
+test('signatureExtractor: raw-lines fallback not used when logExcerpt already yields sqlInfo', function(t, done) {
+  var fullLogExcerpt = [
+    '2026-10-23T12:20:01+00:00 stderr 2026-10-23 12:20:01 UTC ERROR:  invalid input syntax for type integer: "42"',
+    '2026-10-23T12:20:02+00:00 stderr 2026-10-23 12:20:02 UTC CONTEXT:  unnamed portal parameter $3 = \'42\'',
+    '2026-10-23T12:20:03+00:00 stderr 2026-10-23 12:20:03 UTC STATEMENT:  SELECT "product"."id" FROM "product" WHERE "product"."id" != $3'
+  ].join('\n');
+
+  var result = signatureExtractor.extractFinding({
+    apiErrors: [{ message: 'invalid input syntax for type integer: "42"', path: ['products'], extensions: {} }],
+    logExcerpt: fullLogExcerpt,
+    logLines: ['extra', 'irrelevant', 'lines']
+  });
+
+  // logExcerpt is complete, so rawLines fallback should NOT be needed
+  assert.strictEqual(result.confidence, 'WITH_SQL');
+  assert.strictEqual(result.sql.operator, '!=', 'operator from logExcerpt, not affected by rawLines');
+  assert.strictEqual(result.sql.column, 'id', 'column from logExcerpt');
+  done();
+});
+
+test('signatureExtractor: raw-lines fallback gracefully handles null/undefined rawLogLines', function(t, done) {
+  var truncatedLog = 'ERROR:  invalid input syntax\nCONTEXT:  unnamed portal parameter $3';
+  var result = signatureExtractor.extractFinding({
+    apiErrors: [{ message: 'invalid input syntax for type integer: "NaN"', path: ['x'], extensions: {} }],
+    logExcerpt: truncatedLog,
+    rawLogLines: null  // null should not throw
+  });
+
+  // Should fall back to notes (no crash), class is SQL_PARAM_TYPE or UNKNOWN
+  assert.strictEqual(typeof result.class, 'string', 'class must be defined');
+  assert.ok(result.notes && result.notes.length > 0, 'should have note about logExcerpt parsing failure');
+  done();
+});
