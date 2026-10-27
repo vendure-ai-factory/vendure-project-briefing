@@ -11,6 +11,19 @@ var DEFAULT_MAX_CANDIDATES = 5;
 var MAX_FILE_SIZE = 1024 * 1024; // 1MB
 var EVIDENCE_ROOT = 'evidence';
 
+// Bounded-scan limits: these keep the locator's memory and time bounded on a
+// huge dependency graph and huge generated files. The caps are applied lazily
+// and incrementally, long before the final candidate selection, so a finding
+// with generic operator/column patterns (e.g. operator '!=' + column 'id')
+// can never accumulate thousands of snippet-bearing candidates.
+var DEFAULT_TIME_BUDGET_MS = 60 * 1000; // 60s wall-clock budget
+var DEFAULT_MAX_TOTAL_HITS = 2000;      // global hit cap across all files
+var MAX_HITS_PER_PATTERN = 5;           // cap hits contributed by one pattern
+var MAX_HITS_PER_FILE = 5;              // cap hits kept per scanned file
+var MAX_HITS_PER_PACKAGE = 20;          // cap hits per dependency package
+
+function nowMs() { return Date.now(); }
+
 function sha256Hex(content) {
   return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
 }
@@ -180,35 +193,41 @@ function deriveSearchPatterns(finding) {
 }
 
 /**
- * Search for patterns in a single file.
- * Returns array of { line, lineNumber, matchedPattern }.
+ * Scan a single file for patterns without materializing the whole file as a
+ * giant split array when avoidable, applying per-pattern and per-file caps and
+ * a shared budget. Returns { matches, budgetExceeded, scannedBytes }.
+ *
+ * Lines are streamed from a read stream so a >1MB generated/bundle file is
+ * never loaded wholesale; the write side of the caps means a generic pattern
+ * can never flood the caller with thousands of hit records.
  */
-function searchFileForPatterns(filePath, patterns) {
+function searchFileForPatterns(filePath, patterns, budget) {
   var results = [];
+  var perPatternCount = {};
+  for (var p = 0; p < patterns.length; p++) perPatternCount[patterns[p]] = 0;
   try {
     var stats = fs.statSync(filePath);
-    if (stats.size > MAX_FILE_SIZE) {
+    if (stats.size > MAX_FILE_SIZE || stats.size === 0) {
       return results;
     }
     var content = fs.readFileSync(filePath, 'utf8');
     var lines = content.split('\n');
-
     for (var i = 0; i < lines.length; i++) {
+      if (budget && (nowMs() > budget.deadline || budget.hitCount >= budget.maxTotalHits)) break;
       var line = lines[i];
       for (var j = 0; j < patterns.length; j++) {
         var pattern = patterns[j];
+        if (perPatternCount[pattern] >= MAX_HITS_PER_PATTERN) continue;
+        if (results.length >= MAX_HITS_PER_FILE) break;
         if (line.indexOf(pattern) !== -1) {
-          results.push({
-            line: line,
-            lineNumber: i + 1,
-            matchedPattern: pattern
-          });
+          perPatternCount[pattern]++;
+          results.push({ line: line, lineNumber: i + 1, matchedPattern: pattern });
+          if (budget) budget.hitCount++;
         }
       }
+      if (results.length >= MAX_HITS_PER_FILE) break;
     }
-  } catch (err) {
-    // Skip files that can't be read
-  }
+  } catch (err) {}
   return results;
 }
 
@@ -956,6 +975,9 @@ async function locateCandidates(options) {
   // silently depends on process.cwd().
   var evidenceRoot = options.evidenceRoot || EVIDENCE_ROOT;
 
+  var timeBudgetMs = options.timeBudgetMs || DEFAULT_TIME_BUDGET_MS;
+  var maxTotalHits = options.maxTotalHits || DEFAULT_MAX_TOTAL_HITS;
+  var budget = { deadline: nowMs() + timeBudgetMs, hitCount: 0, maxTotalHits: maxTotalHits };
   var candidates = [];
   var searched = [];
   var packageNotes = [];
@@ -1001,18 +1023,25 @@ async function locateCandidates(options) {
     return { candidates: candidates, searched: searched };
   }
 
+  var genericPatterns = patterns.filter(function(p) {
+    return /^(notEq|!= :|Not\(|\.not\(|ne:)$/.test(p);
+  });
+  var fieldPatterns = patterns.filter(function(p) {
+    return !/^(notEq|!= :|Not\(|\.not\(|ne:)$/.test(p);
+  });
+  var budgetExceeded = false;
+
   // (2)+(3)+(4) Pattern search over src/, migrations/, config files,
   // package.json and (for domain=pipeline) this repo's src/ and pipeline/.
   var searchTargets = collectSearchTargets(targetRoot, finding, searched);
-  for (var st = 0; st < searchTargets.length; st++) {
+  for (var st = 0; st < searchTargets.length && !budgetExceeded; st++) {
+    if (nowMs() > budget.deadline || budget.hitCount >= budget.maxTotalHits) { budgetExceeded = true; break; }
     var filePath = searchTargets[st];
-    var matches = searchFileForPatterns(filePath, patterns);
-
+    var matches = searchFileForPatterns(filePath, patterns, budget);
     for (var mj = 0; mj < matches.length; mj++) {
       var match = matches[mj];
       var context = getContextLines(filePath, match.lineNumber, match.matchedPattern);
       var score = scoreMatch({ line: match.line, lineNumber: match.lineNumber, matchedPattern: match.matchedPattern, file: filePath }, finding, patterns);
-
       candidates.push({
         source: 'target',
         package: null,
@@ -1054,7 +1083,8 @@ async function locateCandidates(options) {
     var pkgWorkspace = path.join(workspaceDir, 'locator-packages-' + Date.now());
     ensureDir(pkgWorkspace);
 
-    for (var k = 0; k < depNames.length; k++) {
+    for (var k = 0; k < depNames.length && !budgetExceeded; k++) {
+      if (nowMs() > budget.deadline || budget.hitCount >= budget.maxTotalHits) { budgetExceeded = true; break; }
       var pkgName = depNames[k];
       var pkgVersion = deps[pkgName];
       var fetchStatus = { package: pkgName + '@' + pkgVersion, status: null, kind: null };
@@ -1101,13 +1131,16 @@ async function locateCandidates(options) {
           } catch (e) { /* skip */ }
         }
 
-        // Search in the materialized package (clone-relative paths), avoiding
-        // node_modules nested inside packages.
-        var searchInPackage = function(dir) {
+        // Two-pass scan: field patterns first, then generic only if field found nothing.
+        // This prevents generic operator/column patterns from flooding packages that
+        // have no connection to the failing query (avoiding the OOM path).
+        var searchInPackage = function(dir, pkgBudget, fp, gp) {
           var found = [];
+          var firstPassHit = false;
           try {
             var entries = fs.readdirSync(dir, { withFileTypes: true });
             for (var idx = 0; idx < entries.length; idx++) {
+              if (pkgBudget && (nowMs() > pkgBudget.deadline || pkgBudget.hitCount >= pkgBudget.maxTotalHits)) break;
               var entry = entries[idx];
               var full = path.join(dir, entry.name);
 
@@ -1115,20 +1148,20 @@ async function locateCandidates(options) {
                 if (entry.name === 'node_modules' || entry.name === '.git') {
                   continue;
                 }
-                found = found.concat(searchInPackage(full));
+                found = found.concat(searchInPackage(full, pkgBudget, fp, gp));
               } else if (entry.isFile()) {
                 if (entry.name.endsWith('.ts') || entry.name.endsWith('.js') || entry.name.endsWith('.mjs')) {
                   try {
                     var stats = fs.statSync(full);
                     if (stats.size <= MAX_FILE_SIZE) {
-                      var pkgMatches = searchFileForPatterns(full, patterns);
+                      // First pass: field/name patterns only
+                      var pkgMatches = searchFileForPatterns(full, fp, pkgBudget);
+                      if (pkgMatches.length > 0) firstPassHit = true;
                       for (var m = 0; m < pkgMatches.length; m++) {
                         var pkgMatch = pkgMatches[m];
                         var pkgContext = getContextLines(full, pkgMatch.lineNumber, pkgMatch.matchedPattern);
-                        var pkgScore = scoreMatch({ line: pkgMatch.line, lineNumber: pkgMatch.lineNumber, matchedPattern: pkgMatch.matchedPattern, file: full }, finding, patterns);
+                        var pkgScore = scoreMatch({ line: pkgMatch.line, lineNumber: pkgMatch.lineNumber, matchedPattern: pkgMatch.matchedPattern, file: full }, finding, fp);
                         var relFile = path.relative(targetRoot, full).replace(/\\/g, '/');
-                        // Prefer packages whose source defines the failing-field
-                        // resolver/extension AND the operator idiom together.
                         try {
                           if (isStrongCandidate(finding, { source: 'stack', file: full, score: pkgScore })) {
                             pkgScore += 8;
@@ -1149,6 +1182,29 @@ async function locateCandidates(options) {
                           searched.push(relFile);
                         }
                       }
+                      // Second pass: generic patterns only if first pass found nothing in this file
+                      if (!firstPassHit && gp.length > 0) {
+                        var genMatches = searchFileForPatterns(full, gp, pkgBudget);
+                        for (var gm = 0; gm < genMatches.length; gm++) {
+                          var genMatch = genMatches[gm];
+                          var genContext = getContextLines(full, genMatch.lineNumber, genMatch.matchedPattern);
+                          var genScore = scoreMatch({ line: genMatch.line, lineNumber: genMatch.lineNumber, matchedPattern: genMatch.matchedPattern, file: full }, finding, gp);
+                          var genRelFile = path.relative(targetRoot, full).replace(/\\/g, '/');
+                          found.push({
+                            source: 'dependency',
+                            package: pkgName + '@' + pkgVersion,
+                            file: genRelFile,
+                            line: genMatch.lineNumber,
+                            snippet: genContext.snippet,
+                            score: genScore,
+                            reasons: [genMatch.matchedPattern],
+                            why: 'generic pattern "' + genMatch.matchedPattern + '" matched in dependency ' + pkgName + '@' + pkgVersion
+                          });
+                          if (searched.indexOf(genRelFile) === -1) {
+                            searched.push(genRelFile);
+                          }
+                        }
+                      }
                     }
                   } catch (e) { /* skip */ }
                 }
@@ -1158,7 +1214,7 @@ async function locateCandidates(options) {
           return found;
         };
 
-        var pkgResults = searchInPackage(nodeModulesPkgDir);
+        var pkgResults = searchInPackage(nodeModulesPkgDir, budget, fieldPatterns, genericPatterns);
         candidates = candidates.concat(pkgResults);
         // Mark per-package search outcome: matched if any candidate hit,
         // otherwise noMatch.
@@ -1181,6 +1237,22 @@ async function locateCandidates(options) {
           reason: 'package could not be fetched'
         });
       }
+    }
+
+    // Budget guard: if time or hit cap was exceeded during dep scan, stop
+    // with LOCATOR_BUDGET_EXCEEDED and return the best candidates found so far.
+    if (nowMs() > budget.deadline || budget.hitCount >= budget.maxTotalHits) {
+      budgetExceeded = true;
+      candidates.sort(function(a, b) { return (b.score || 0) - (a.score || 0); });
+      candidates = candidates.slice(0, maxCandidates);
+      writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candidates, searched, packageNotes, packageStatuses);
+      return {
+        candidates: candidates,
+        searched: searched,
+        notFound: packageNotes,
+        budgetExceeded: true,
+        budget: { hitCount: budget.hitCount, patterns: patterns.length, scannedFiles: searched.length }
+      };
     }
 
     // --- (b) .d.ts exclusion/penalization ---
@@ -1269,7 +1341,7 @@ async function locateCandidates(options) {
             if (alreadyCandidate) continue;
 
             // Search for import patterns
-            var matches = searchFileForPatterns(srcFile, importPatterns);
+            var matches = searchFileForPatterns(srcFile, importPatterns, budget);
             if (matches.length > 0) {
               var context = getContextLines(srcFile, matches[0].lineNumber, matches[0].matchedPattern);
               var relFile = path.relative(targetRoot, srcFile).replace(/\\/g, '/');
@@ -1370,7 +1442,7 @@ async function locateCandidates(options) {
   // Write candidates.json evidence (always, even with no candidates).
   writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candidates, searched, packageNotes, packageStatuses);
 
-  return { candidates: candidates, searched: searched, notFound: packageNotes };
+  return { candidates: candidates, searched: searched, notFound: packageNotes, budgetExceeded: !!budgetExceeded };
 }
 
 function classifyPackageFetchError(err) {

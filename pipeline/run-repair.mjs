@@ -24,6 +24,9 @@ export const OUTCOME_FIXED = 'FIXED';
 export const OUTCOME_NOT_FIXED = 'NOT_FIXED';
 export const OUTCOME_BLOCKED = 'BLOCKED';
 
+// Blocker codes used by the repair orchestrator.
+export const BLOC_LOCATOR_BUDGET_EXCEEDED = 'LOCATOR_BUDGET_EXCEEDED';
+
 // The authorized staging task set. "rerun the same tasks plus CAN-B2-16" is
 // exactly this set because the normal staging run already executes them.
 export const REPAIR_TASK_IDS = ['CAN-B1-03', 'CAN-B1-04', 'CAN-B2-16'];
@@ -35,6 +38,21 @@ const MANIFEST_PATH = 'manifest/acceptance-manifest.v0.4.json';
 const DEFAULT_ARCHIVE_ROOT = '/opt/pipeline-archive';
 const REPORTS_DIR = 'reports';
 const EVIDENCE_DIR = 'evidence';
+
+/**
+ * Write a progress.json marker to evidence/<runId>/repair/progress.json.
+ * Records stage, event (start|end), timestamp, and peak heapUsed. An
+ * uncaught crash leaves a trace of the last stage reached.
+ */
+function writeStageProgress(cwd, runId, stage, event, heapUsed) {
+  if (!runId || !cwd) return;
+  try {
+    var dir = path.join(cwd, EVIDENCE_DIR, runId, 'repair');
+    fs.mkdirSync(dir, { recursive: true });
+    var marker = { runId: runId, stage: stage, event: event, timestamp: new Date().toISOString(), heapUsed: heapUsed || 0 };
+    fs.writeFileSync(path.join(dir, 'progress.json'), JSON.stringify(marker, null, 2) + '\n', 'utf8');
+  } catch (e) { /* best effort */ }
+}
 
 var _manifest = null;
 function getManifest(cwd) {
@@ -1053,6 +1071,22 @@ async function defaultCloneAndLocate(cfg, adapters, finding) {
     evidenceRoot: path.join(cfg.cwd, EVIDENCE_DIR),
     maxCandidates: 10
   });
+  try {
+    evidenceCollector.writeProgress(cfg.runId, { stage: 'locate', event: 'end', heapUsed: process.memoryUsage().heapUsed });
+  } catch (e) { /* best effort */ }
+  // Budget exceeded in the locator: record the counts as evidence (no content)
+  // and surface as a BLOCKED run so the compliance report captures the limit hit.
+  if (located && located.budgetExceeded) {
+    var bInfo = located.budget || {};
+    return {
+      ok: false,
+      blocker: normalizeBlocker(BLOC_LOCATOR_BUDGET_EXCEEDED,
+        'Locator hit time/hit budget before completing the scan. Counts: ' +
+        JSON.stringify({ hitCount: bInfo.hitCount || 0, patterns: bInfo.patterns || 0, scannedFiles: bInfo.scannedFiles || 0 }),
+        { hitCount: bInfo.hitCount || 0, patterns: bInfo.patterns || 0, scannedFiles: bInfo.scannedFiles || 0 }),
+      branch: branch
+    };
+  }
   return { ok: true, dir: dir, branch: branch, candidates: (located && located.candidates) || [], searched: (located && located.searched) || [] };
 }
 
@@ -1551,10 +1585,10 @@ async function runRepair(deps) {
   }
 
   // Credential preflight: validate VENDURE_STAGING_REPO_TOKEN before any
-  // git clone/push/dispatch. This runs before adapters are touched. A token
-  // defect is a CLIENT_INPUT_SCOPE blocker and is recorded in the compliance
-  // report repair.blockers (pending client input, not a Pipeline defect).
+  // git clone/push/dispatch.
+  writeStageProgress(cfg.cwd, cfg.runId, 'preflight', 'start', process.memoryUsage().heapUsed);
   var tokenCheck = await credentialPreflightCheck(cfg);
+  writeStageProgress(cfg.cwd, cfg.runId, 'preflight', 'end', process.memoryUsage().heapUsed);
   if (tokenCheck && tokenCheck.ok === false) {
     var blockedState = {
       outcome: OUTCOME_BLOCKED,
@@ -1633,7 +1667,9 @@ async function runRepair(deps) {
 
   // 3. Clone the target and locate candidates.
   var gitSetup = adapters.gitSetup || defaultCloneAndLocate;
+  writeStageProgress(cfg.cwd, cfg.runId, 'clone', 'start', process.memoryUsage().heapUsed);
   var located = await gitSetup(cfg, adapters, state.finding);
+  writeStageProgress(cfg.cwd, cfg.runId, 'locate', 'end', process.memoryUsage().heapUsed);
   if (!located || !located.ok) {
     var gblk = located && located.blocker ? located.blocker : normalizeBlocker('GIT_BLOCKED', 'git setup failed', {});
     state.blockers.push(gblk);
@@ -1657,6 +1693,7 @@ async function runRepair(deps) {
          attemptNumber < budget.global &&
          attemptNumber < budget.perSignature) {
     attemptNumber += 1;
+    writeStageProgress(cfg.cwd, cfg.runId, 'locate-' + attemptNumber, 'start', process.memoryUsage().heapUsed);
     var result;
     try {
       result = await proposeAttempt(cfg, adapters, state, located, attemptNumber, budget);
@@ -1707,6 +1744,8 @@ async function main() {
     result = await runRepair({});
   } catch (e) {
     console.error('run-repair failed: ' + ((e && e.message) || String(e)));
+    var crashRunId = 'crash-' + Date.now();
+    writeStageProgress(process.cwd(), crashRunId, 'crash', 'crash', process.memoryUsage().heapUsed);
     process.exitCode = EXIT_BLOCKED;
     return;
   }
