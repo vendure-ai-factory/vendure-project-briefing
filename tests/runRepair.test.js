@@ -914,3 +914,75 @@ test('run-repair: git clone "could not read Username" -> REPO_TOKEN_MISSING, no 
   assert.ok(!hasLog(log, 'push:'), 'no push after git username failure');
 });
 
+
+
+// ---------------------------------------------------------------------------
+// LOCATOR_BUDGET_EXCEEDED with candidates: ok:true + truncated, no blocker.
+// The locator correctly returns ok:true with truncated:true and warnings when
+// candidates were found before the budget hit. The orchestrator must not
+// convert a truncated-but-populated result into a blocker — it must continue
+// to the proposal loop and record the warning in the repair block.
+// ---------------------------------------------------------------------------
+test('run-repair: locator budget exceeded with candidates -> ok:true, proposal loop runs, no blocker', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var ctrl = {};
+  ctrl.verifyCalls = 0;
+  ctrl.verifyVerdicts = [{ status: 'not-fixed' }];
+  var adapters = fakeAdapters(ctrl, log);
+  // Override locator to return the exact shape the real locator produces when
+  // budget is hit AFTER candidates were found: ok + truncated + warnings +
+  // candidates + budgetExceeded flag.
+  adapters.locator = {
+    locateCandidates: async function(opts) {
+      log.push('locate');
+      return {
+        ok: true,
+        truncated: true,
+        warnings: [{
+          code: 'LOCATOR_BUDGET_REACHED',
+          counts: { hitCount: 0, patterns: 11, scannedFiles: 313 }
+        }],
+        candidates: [
+          { source: 'target', file: 'src/orders/service.ts', line: 42, snippet: 'if (order.id != id)', score: 8, reasons: ['!=', 'id'] },
+          { source: 'stack', package: null, file: 'src/orders/resolver.ts', line: 88, snippet: 'order.id Not(id)', score: 7, reasons: ['finding.stack frame'] }
+        ],
+        searched: ['src/orders/service.ts', 'src/orders/resolver.ts'],
+        budgetExceeded: true,
+        budget: { hitCount: 0, patterns: 11, scannedFiles: 313 }
+      };
+    }
+  };
+
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-trunc-warn',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-secret-trunc', OPENROUTER_API_KEY: 'key-secret-trunc' },
+    fetch: validFetch(),
+    adapters: adapters,
+    rerunTasks: async function() { return [{ taskId: 'CAN-B1-03', result: 'BLOCK' }]; },
+    extractAfter: function() { return [FINDING_SIG]; },
+    perSignatureBudget: 1
+  });
+
+  // The fix: budget exceeded with candidates must NOT produce a blocker.
+  // Before the fix, this test FAILS because run-repair.mjs line 1079 creates
+  // a BLOCKED result whenever budgetExceeded is true, ignoring candidates.
+  assert.strictEqual(res.outcome, 'NOT_FIXED', 'outcome must be NOT_FIXED (not BLOCKED)');
+  assert.strictEqual(res.exitCode, 3, 'exit code must be 3 NOT_FIXED (not 4 BLOCKED)');
+  assert.ok(!res.blockers || res.blockers.length === 0, 'no blockers when candidates exist despite budget warning');
+
+  // The proposal loop must have run (locate was called, then propose).
+  assert.ok(hasLog(log, 'locate'), 'locateCandidates was called');
+  assert.ok(hasLog(log, 'propose:'), 'proposeAndCheck was called (proposal loop ran)');
+
+  // The compliance report must record the attempt.
+  var repFile = path.join(cwd, 'reports', 'run-trunc-warn', 'compliance-report.json');
+  assert.strictEqual(fs.existsSync(repFile), true, 'compliance-report.json written');
+  var rep = JSON.parse(fs.readFileSync(repFile, 'utf8'));
+  assert.strictEqual(rep.repair.attempts.length, 1, 'one attempt recorded in repair block');
+  assert.strictEqual(rep.repair.attempts[0].verifyStatus, 'not-fixed', 'attempt verifyStatus is not-fixed');
+
+});

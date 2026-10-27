@@ -1076,7 +1076,7 @@ async function defaultCloneAndLocate(cfg, adapters, finding) {
   } catch (e) { /* best effort */ }
   // Budget exceeded in the locator: record the counts as evidence (no content)
   // and surface as a BLOCKED run so the compliance report captures the limit hit.
-  if (located && located.budgetExceeded) {
+  if (located && located.budgetExceeded && (!located.candidates || located.candidates.length === 0)) {
     var bInfo = located.budget || {};
     return {
       ok: false,
@@ -1087,7 +1087,7 @@ async function defaultCloneAndLocate(cfg, adapters, finding) {
       branch: branch
     };
   }
-  return { ok: true, dir: dir, branch: branch, candidates: (located && located.candidates) || [], searched: (located && located.searched) || [] };
+  return { ok: true, dir: dir, branch: branch, candidates: (located && located.candidates) || [], searched: (located && located.searched) || [], warnings: (located && located.warnings) || [], truncated: !!(located && located.truncated) };
 }
 
 /**
@@ -1151,6 +1151,7 @@ function buildRepairData(state) {
     blockers: (state.blockers || []).map(function(b) {
       return { code: b.code, message: b.message, evidence: b.evidence };
     }),
+    warnings: (state.warnings || []).slice(),
     deploy: state.deploy || null,
     rollback: state.rollback || null,
     manualTargetEdits: 0
@@ -1632,7 +1633,8 @@ async function runRepair(deps) {
     reportError: null,
     runStartedAt: Date.now(),
     deadline: defaultDeadline(Date.now),
-    baseSha: null
+    baseSha: null,
+    warnings: []
   };
 
   // 1. Collect logs. A wrapper refusal is recorded and does not stop the
@@ -1683,6 +1685,9 @@ async function runRepair(deps) {
   state.cloneDir = located.dir;
   var head = await adapters.gitClient.getHeadSha(located.dir, { runCommand: cfg.runCommand });
   state.baseSha = head && head.ok ? head.sha : null;
+  if (located.warnings && located.warnings.length > 0) {
+  state.warnings = state.warnings.concat(located.warnings);
+  }
 
   // 4. Repair loop while budgets allow. The orchestrator enforces the
   //    per-signature and global caps itself (model.consume applies a second,
