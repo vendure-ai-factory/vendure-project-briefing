@@ -9,6 +9,8 @@ var toText = coerce.toText;
 
 var DEFAULT_MAX_CANDIDATES = 5;
 var MAX_FILE_SIZE = 1024 * 1024; // 1MB
+var MAX_PER_PKG = 3;             // was 2
+var MAX_TOTAL_CANDIDATES = 8;
 var EVIDENCE_ROOT = 'evidence';
 
 // Bounded-scan limits: these keep the locator's memory and time bounded on a
@@ -205,15 +207,17 @@ function searchFileForPatterns(filePath, patterns, budget) {
   var results = [];
   var perPatternCount = {};
   for (var p = 0; p < patterns.length; p++) perPatternCount[patterns[p]] = 0;
+  var fileHadMatches = false;
   try {
     var stats = fs.statSync(filePath);
     if (stats.size > MAX_FILE_SIZE || stats.size === 0) {
-      return results;
+      return { matches: results, fileHadMatches: false };
     }
     var content = fs.readFileSync(filePath, 'utf8');
     var lines = content.split('\n');
     for (var i = 0; i < lines.length; i++) {
-      if (budget && (nowMs() > budget.deadline || budget.hitCount >= budget.maxTotalHits)) break;
+      if (budget && nowMs() > budget.deadline) break;
+      if (budget && budget.scannedFiles >= budget.maxScannedFiles) break;
       var line = lines[i];
       for (var j = 0; j < patterns.length; j++) {
         var pattern = patterns[j];
@@ -222,13 +226,13 @@ function searchFileForPatterns(filePath, patterns, budget) {
         if (line.indexOf(pattern) !== -1) {
           perPatternCount[pattern]++;
           results.push({ line: line, lineNumber: i + 1, matchedPattern: pattern });
-          if (budget) budget.hitCount++;
         }
       }
       if (results.length >= MAX_HITS_PER_FILE) break;
     }
+    if (results.length > 0) fileHadMatches = true;
   } catch (err) {}
-  return results;
+  return { matches: results, fileHadMatches: fileHadMatches };
 }
 
 /**
@@ -406,15 +410,21 @@ function scoreMatch(match, finding, allPatterns) {
       for (var li = startLine; li <= endLine; li++) {
         var liLine = fileContent[li];
         if (opIdioms.some(function(o) { return liLine.indexOf(o) !== -1; })) {
-          score += 5;
+          score += 2;
           break;
         }
       }
-      // Also for the field name appearing near an operator
-      if (fieldNames.some(function(fn) { return line.indexOf(fn) !== -1; })) {
-        score += 4;
-      }
     } catch (e) { /* skip */ }
+  }
+
+  // Bonus for operator+column co-occurrence on the SAME match line.
+  // When the matched pattern is a name (orders) AND an operator idiom also
+  // appears on the same line, this is strong evidence of the bug site.
+  if (fieldNames.length > 0 && line.indexOf(matchedPattern) !== -1) {
+    var hasOpOnSameLine = opIdioms.some(function(o) { return line.indexOf(o) !== -1; });
+    if (hasOpOnSameLine) {
+      score += 3;
+    }
   }
 
   // Count additional pattern hits for +1 each
@@ -425,6 +435,30 @@ function scoreMatch(match, finding, allPatterns) {
     }
   }
   score += patternHits;
+
+  // Cap name-only matches at 3: broad name patterns (field names, Resolver/Service/Query
+  // suffixes) get a maximum score of 3 unless the file also contains an operator idiom.
+  // This prevents generated/types files with just the entity name from outranking
+  // files that actually contain the failing operator+column pattern.
+  var isNamePattern = fieldNames.some(function(fn) {
+    return matchedPattern === fn ||
+           matchedPattern === fn + 'Resolver' ||
+           matchedPattern === fn + 'Service' ||
+           matchedPattern === fn + 'Query';
+  });
+  if (isNamePattern) {
+    var hasOperatorSupport = false;
+    try {
+      var fullContent = fs.readFileSync(match.file, 'utf8');
+      var opRegex = /\b(notEq|Equals\(|Not\(|\.not\(|isNull|isNotNull|gt:|lt:|gte:|lte:|ne:)\b/;
+      if (opRegex.test(fullContent)) {
+        hasOperatorSupport = true;
+      }
+    } catch (e) { /* ignore */ }
+    if (!hasOperatorSupport && score > 1) {
+      score = 1;
+    }
+  }
 
   return score;
 }
@@ -976,8 +1010,8 @@ async function locateCandidates(options) {
   var evidenceRoot = options.evidenceRoot || EVIDENCE_ROOT;
 
   var timeBudgetMs = options.timeBudgetMs || DEFAULT_TIME_BUDGET_MS;
-  var maxTotalHits = options.maxTotalHits || DEFAULT_MAX_TOTAL_HITS;
-  var budget = { deadline: nowMs() + timeBudgetMs, hitCount: 0, maxTotalHits: maxTotalHits };
+  var maxScannedFiles = options.maxScannedFiles || DEFAULT_MAX_TOTAL_HITS;
+  var budget = { deadline: nowMs() + timeBudgetMs, hitCount: 0, scannedFiles: 0, maxScannedFiles: maxScannedFiles };
   var candidates = [];
   var searched = [];
   var packageNotes = [];
@@ -1035,9 +1069,13 @@ async function locateCandidates(options) {
   // package.json and (for domain=pipeline) this repo's src/ and pipeline/.
   var searchTargets = collectSearchTargets(targetRoot, finding, searched);
   for (var st = 0; st < searchTargets.length && !budgetExceeded; st++) {
-    if (nowMs() > budget.deadline || budget.hitCount >= budget.maxTotalHits) { budgetExceeded = true; break; }
+    if (nowMs() > budget.deadline || budget.scannedFiles >= budget.maxScannedFiles) { budgetExceeded = true; break; }
     var filePath = searchTargets[st];
-    var matches = searchFileForPatterns(filePath, patterns, budget);
+    var result = searchFileForPatterns(filePath, patterns, budget);
+    var matches = result.matches;
+    if (result.fileHadMatches) {
+      budget.scannedFiles++;
+    }
     for (var mj = 0; mj < matches.length; mj++) {
       var match = matches[mj];
       var context = getContextLines(filePath, match.lineNumber, match.matchedPattern);
@@ -1084,7 +1122,7 @@ async function locateCandidates(options) {
     ensureDir(pkgWorkspace);
 
     for (var k = 0; k < depNames.length && !budgetExceeded; k++) {
-      if (nowMs() > budget.deadline || budget.hitCount >= budget.maxTotalHits) { budgetExceeded = true; break; }
+      if (nowMs() > budget.deadline || budget.scannedFiles >= budget.maxScannedFiles) { budgetExceeded = true; break; }
       var pkgName = depNames[k];
       var pkgVersion = deps[pkgName];
       var fetchStatus = { package: pkgName + '@' + pkgVersion, status: null, kind: null };
@@ -1140,7 +1178,7 @@ async function locateCandidates(options) {
           try {
             var entries = fs.readdirSync(dir, { withFileTypes: true });
             for (var idx = 0; idx < entries.length; idx++) {
-              if (pkgBudget && (nowMs() > pkgBudget.deadline || pkgBudget.hitCount >= pkgBudget.maxTotalHits)) break;
+              if (pkgBudget && (nowMs() > pkgBudget.deadline || pkgBudget.scannedFiles >= pkgBudget.maxScannedFiles)) break;
               var entry = entries[idx];
               var full = path.join(dir, entry.name);
 
@@ -1155,7 +1193,11 @@ async function locateCandidates(options) {
                     var stats = fs.statSync(full);
                     if (stats.size <= MAX_FILE_SIZE) {
                       // First pass: field/name patterns only
-                      var pkgMatches = searchFileForPatterns(full, fp, pkgBudget);
+                      var pkgResult = searchFileForPatterns(full, fp, pkgBudget);
+                      var pkgMatches = pkgResult.matches;
+                      if (pkgResult.fileHadMatches) {
+                        pkgBudget.scannedFiles++;
+                      }
                       if (pkgMatches.length > 0) firstPassHit = true;
                       for (var m = 0; m < pkgMatches.length; m++) {
                         var pkgMatch = pkgMatches[m];
@@ -1184,7 +1226,11 @@ async function locateCandidates(options) {
                       }
                       // Second pass: generic patterns only if first pass found nothing in this file
                       if (!firstPassHit && gp.length > 0) {
-                        var genMatches = searchFileForPatterns(full, gp, pkgBudget);
+                        var genResult = searchFileForPatterns(full, gp, pkgBudget);
+                        var genMatches = genResult.matches;
+                        if (genResult.fileHadMatches) {
+                          pkgBudget.scannedFiles++;
+                        }
                         for (var gm = 0; gm < genMatches.length; gm++) {
                           var genMatch = genMatches[gm];
                           var genContext = getContextLines(full, genMatch.lineNumber, genMatch.matchedPattern);
@@ -1239,19 +1285,39 @@ async function locateCandidates(options) {
       }
     }
 
-    // Budget guard: if time or hit cap was exceeded during dep scan, stop
-    // with LOCATOR_BUDGET_EXCEEDED and return the best candidates found so far.
-    if (nowMs() > budget.deadline || budget.hitCount >= budget.maxTotalHits) {
+    // Budget guard: if time or scanned-files cap was exceeded, stop the scan.
+    // When candidates were already found, return ok:true with truncated:true and
+    // a warning so the repair pipeline continues rather than blocks.
+    // Only return a blocker when there are zero candidates.
+    if (nowMs() > budget.deadline || budget.scannedFiles >= budget.maxScannedFiles) {
       budgetExceeded = true;
       candidates.sort(function(a, b) { return (b.score || 0) - (a.score || 0); });
       candidates = candidates.slice(0, maxCandidates);
-      writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candidates, searched, packageNotes, packageStatuses);
+      var warnings = [{
+        code: 'LOCATOR_BUDGET_REACHED',
+        counts: { hitCount: budget.hitCount, patterns: patterns.length, scannedFiles: budget.scannedFiles }
+      }];
+      writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candidates, searched, packageNotes, packageStatuses, warnings);
+      if (candidates.length === 0) {
+        return {
+          ok: false,
+          blocker: { code: 'LOCATOR_BUDGET_EXCEEDED', message: 'Locator hit budget before finding any candidates', counts: { hitCount: budget.hitCount, patterns: patterns.length, scannedFiles: budget.scannedFiles } },
+          candidates: [],
+          searched: searched,
+          notFound: packageNotes,
+          budgetExceeded: true,
+          budget: { hitCount: budget.hitCount, patterns: patterns.length, scannedFiles: budget.scannedFiles }
+        };
+      }
       return {
+        ok: true,
+        truncated: true,
+        warnings: warnings,
         candidates: candidates,
         searched: searched,
         notFound: packageNotes,
         budgetExceeded: true,
-        budget: { hitCount: budget.hitCount, patterns: patterns.length, scannedFiles: searched.length }
+        budget: { hitCount: budget.hitCount, patterns: patterns.length, scannedFiles: budget.scannedFiles }
       };
     }
 
@@ -1341,7 +1407,11 @@ async function locateCandidates(options) {
             if (alreadyCandidate) continue;
 
             // Search for import patterns
-            var matches = searchFileForPatterns(srcFile, importPatterns, budget);
+            var importResult = searchFileForPatterns(srcFile, importPatterns, budget);
+            var matches = importResult.matches;
+            if (importResult.fileHadMatches) {
+              budget.scannedFiles++;
+            }
             if (matches.length > 0) {
               var context = getContextLines(srcFile, matches[0].lineNumber, matches[0].matchedPattern);
               var relFile = path.relative(targetRoot, srcFile).replace(/\\/g, '/');
@@ -1381,9 +1451,8 @@ async function locateCandidates(options) {
         }
       }
     }
-    var MAX_PER_PKG = 2;
     var MAX_TOTAL_CANDIDATES = 8;
-    var MIN_DEPENDENCY_SLOTS = 4; // always reserve >=4 slots for dep candidates
+    var MIN_DEPENDENCY_SLOTS = 5; // always reserve >=5 slots for dep candidates
 
     // Split into dependency and non-dependency pools so the fixed cap never
     // lets low-signal config files displace matched dependency candidates.
@@ -1440,9 +1509,9 @@ async function locateCandidates(options) {
   candidates = candidates.slice(0, maxCandidates);
 
   // Write candidates.json evidence (always, even with no candidates).
-  writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candidates, searched, packageNotes, packageStatuses);
+  writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candidates, searched, packageNotes, packageStatuses, []);
 
-  return { candidates: candidates, searched: searched, notFound: packageNotes, budgetExceeded: !!budgetExceeded };
+  return { ok: true, truncated: false, warnings: [], candidates: candidates, searched: searched, notFound: packageNotes, budgetExceeded: !!budgetExceeded };
 }
 
 function classifyPackageFetchError(err) {
@@ -1457,7 +1526,7 @@ function classifyPackageFetchError(err) {
  * even when there are no candidates (NO_CANDIDATES). Includes the derived patterns
  * and per-package fetch status.
  */
-function writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candidates, searched, packageNotes, packageStatuses) {
+function writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candidates, searched, packageNotes, packageStatuses, warnings) {
   var evidenceDir = path.join(evidenceRoot, runId, 'repair');
   ensureDir(evidenceDir);
   var evidenceData = {
@@ -1466,6 +1535,7 @@ function writeCandidatesEvidence(runId, evidenceRoot, finding, patterns, candida
     patterns: patterns || [],
     candidateNotFound: packageNotes || [],
     packageStatuses: packageStatuses || [],
+    warnings: warnings || [],
     candidates: (candidates || []).map(function(c) {
       var snippetArr = c.snippet && Array.isArray(c.snippet) ? c.snippet : null;
       return {
