@@ -527,6 +527,130 @@ test('crash in diff-text stage: attempt-1.json has CRASH, stage=diff-text, crash
 }));
 
 // =============================================================================
+// Git/infra commit failure: proposal-N.json written before commit, and the
+// attempt evidence records GIT_COMMIT_FAILED with gitError (no model re-ask).
+// =============================================================================
+
+test('commit failure: proposal-N.json is written before commit and attempt evidence records GIT_COMMIT_FAILED', async function() {
+  var dir = createTempProject({
+    'src/x.js': 'old\n',
+    'src/reg.js': '// reg\n',
+    'package.json': '{"name":"test"}'
+  });
+
+  var runId = 'test-commitfail-' + Date.now();
+  fs.mkdirSync(path.join('evidence', runId, 'repair'), { recursive: true });
+
+  var deps = createFakeDeps();
+  deps._modelResponse = JSON.stringify({
+    repairKind: 'source-edit',
+    rationale: 'fix',
+    edits: [{ path: 'src/x.js', oldString: 'old', newString: 'new' }],
+    newFiles: [{ path: 'src/newfile.js', content: '// new\n' }]
+  });
+  // Commit returns a git/infra failure, exactly like a clean CI clone with no
+  // git identity errors out.
+  var commitCallCount = 0;
+  deps.git.commitAll = function(cd, msg, opts) {
+    commitCallCount++;
+    return Promise.resolve({
+      ok: false,
+      blocker: {
+        code: 'GIT_COMMIT_FAILED',
+        message: "git commit failed: exit code 128",
+        evidence: { exitCode: 128, stderr: 'fatal: unable to auto-detect email', gitError: 'fatal: unable to auto-detect email' }
+      }
+    });
+  };
+
+  var result = await proposeAndCheck({
+    finding: {
+      class: 'TypeError', message: 'boom', domain: 'target-code',
+      signature: 'sig-commitfail-' + Date.now()
+    },
+    candidates: [{ file: path.join(dir, 'src/x.js'), line: 1, snippet: [{ line: 'old' }] }],
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    env: {},
+    deps: deps
+  });
+
+  assert.strictEqual(commitCallCount, 1, 'commitAll invoked once');
+  assert.strictEqual(result.status, 'APPLY_FAILED');
+  assert.strictEqual(result.blocker.code, 'GIT_COMMIT_FAILED', 'blocker code must be GIT_COMMIT_FAILED');
+  assert.ok(result.gitError, 'result carries gitError');
+  assert.strictEqual(result.gitError.indexOf('auto-detect email') !== -1, true, 'gitError present in result');
+
+  // proposal-N.json must exist (written before the commit ran)
+  var proposalPath = path.join('evidence', runId, 'repair', 'proposal-1.json');
+  assert.ok(fs.existsSync(proposalPath), 'proposal-1.json must exist: ' + proposalPath);
+  var proposal = JSON.parse(fs.readFileSync(proposalPath, 'utf8'));
+  assert.strictEqual(proposal.attempt, 1);
+  assert.strictEqual(proposal.repairKind, 'source-edit');
+  assert.strictEqual(proposal.editSet.edits.length, 1);
+  assert.strictEqual(proposal.editSet.edits[0].path, 'src/x.js');
+  assert.strictEqual(proposal.editSet.newFiles.length, 1);
+  assert.strictEqual(proposal.editSet.newFiles[0].content, '// new\n');
+
+  // attempt-N.json records GIT_COMMIT_FAILED and gitError
+  var attemptPath = path.join('evidence', runId, 'repair', 'attempt-1.json');
+  assert.ok(fs.existsSync(attemptPath), 'attempt-1.json must exist');
+  var attempt = JSON.parse(fs.readFileSync(attemptPath, 'utf8'));
+  assert.strictEqual(attempt.status, 'APPLY_FAILED');
+  assert.ok(Array.isArray(attempt.codes) && attempt.codes.indexOf('GIT_COMMIT_FAILED') !== -1, 'codes includes GIT_COMMIT_FAILED');
+  assert.strictEqual(attempt.gitError, 'fatal: unable to auto-detect email', 'gitError captured in attempt evidence');
+});
+
+test('commit failure: proposal-N.json redacts secret-shaped text in edits/new files', async function() {
+  var dir = createTempProject({
+    'src/x.js': 'old\n',
+    'src/reg.js': '// reg\n',
+    'package.json': '{"name":"test"}'
+  });
+
+  var runId = 'test-commitfail-redact-' + Date.now();
+  fs.mkdirSync(path.join('evidence', runId, 'repair'), { recursive: true });
+
+  var deps = createFakeDeps();
+  deps._modelResponse = JSON.stringify({
+    repairKind: 'source-edit',
+    rationale: 'fix',
+    edits: [{ path: 'src/x.js', oldString: 'old', newString: 'apiKey = "sk-test-abcdefghijklmnop123456"; email=owner@example.com' }],
+    newFiles: [{ path: 'src/newfile.js', content: 'Bearer tok123456789012345678\n' }]
+  });
+  deps.git.commitAll = function() {
+    return Promise.resolve({ ok: false, blocker: { code: 'GIT_COMMIT_FAILED', message: 'git commit failed: exit code 128', evidence: { exitCode: 128, gitError: 'x' } } });
+  };
+
+  await proposeAndCheck({
+    finding: { class: 'TypeError', message: 'boom', domain: 'target-code', signature: 'sig-cfr-' + Date.now() },
+    candidates: [{ file: path.join(dir, 'src/x.js'), line: 1, snippet: [{ line: 'old' }] }],
+    previousAttempts: [],
+    budget: { perSignature: 3, global: 15, total: 0, bySignature: {} },
+    runId: runId,
+    cloneDir: dir,
+    branch: 'codex/pipeline-fix-test',
+    baseSha: 'abc123',
+    env: {},
+    deps: deps
+  });
+
+  var proposalPath = path.join('evidence', runId, 'repair', 'proposal-1.json');
+  assert.ok(fs.existsSync(proposalPath), 'proposal-1.json must exist');
+  var proposal = JSON.parse(fs.readFileSync(proposalPath, 'utf8'));
+  var newString = proposal.editSet.edits[0].newString;
+  assert.strictEqual(newString.indexOf('sk-test-abcdefghijklmnop123456'), -1, 'sk- token redacted');
+  assert.strictEqual(newString.indexOf('owner@example.com'), -1, 'email redacted');
+  assert.ok(newString.indexOf('[REDACTED]') !== -1, 'redaction marker present in newString');
+  var nfContent = proposal.editSet.newFiles[0].content;
+  assert.strictEqual(nfContent.indexOf('tok123456789012345678'), -1, 'bearer token redacted in new file content');
+});
+
+// =============================================================================
 // FIX 1 (partial): validateProposalPaths - src/patches/ newFile accepted
 // =============================================================================
 

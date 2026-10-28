@@ -1314,6 +1314,15 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
     writeFindingEvidence(cfg, state);
     return { next: 'stop-blocked', blocker: propose.blocker || normalizeBlocker('MODEL_UNAVAILABLE', 'model call failed', {}) };
   }
+  // A git/infra failure (commit/push/branch) is a PIPELINE_DEFECT that is of
+  // no use to the model: re-asking cannot fix a missing git identity or a
+  // repo trust error. Stop immediately with a blocker instead of consuming a
+  // model attempt. The accepted proposal diff is preserved in the evidence.
+  if (propose.status === 'APPLY_FAILED' && propose.blocker && propose.blocker.code === 'GIT_COMMIT_FAILED') {
+    writeFindingEvidence(cfg, state);
+    return { next: 'stop-blocked', blocker: propose.blocker };
+  }
+
   if (propose.status !== 'READY') {
     // REJECTED / APPLY_FAILED / CHECKS_FAILED: retryable, but each consumes
     // budget and is recorded so the next proposal sees it.

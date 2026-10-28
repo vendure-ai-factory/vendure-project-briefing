@@ -397,6 +397,39 @@ test('run-repair: budget cap ends loop with NOT_FIXED when every attempt is refu
   assert.ok(rep.repair.attempts.length <= 3, 'attempts bounded by per-signature budget');
 });
 
+test('run-repair: GIT_COMMIT_FAILED proposal blocks immediately, no model re-ask (single propose call)', async function() {
+  var cwd = tempCwd();
+  var log = [];
+  var ctrl = {};
+  var proposeCalls = 0;
+  ctrl.propose = function(opts) {
+    proposeCalls += 1;
+    // A git/infra commit failure: not a model-level retryable status.
+    return {
+      status: 'APPLY_FAILED',
+      blocker: { code: 'GIT_COMMIT_FAILED', message: 'git commit failed: exit code 128', evidence: { exitCode: 128, gitError: 'fatal: not a git repository' } },
+      errors: ['commit failed'],
+      gitError: 'fatal: not a git repository'
+    };
+  };
+  var res = await runOnce({
+    repairMode: true,
+    runId: 'run-gitcommit',
+    cwd: cwd,
+    normalRun: normalDefectTasks(),
+    env: { VENDURE_STAGING_REPO_TOKEN: 'tok-test', OPENROUTER_API_KEY: 'key-test' },
+    fetch: validFetch(),
+    adapters: fakeAdapters(ctrl, log),
+    rerunTasks: async function() { return [{ taskId: 'CAN-B1-03', result: 'BLOCK' }]; },
+    extractAfter: function() { return [FINDING_SIG]; }
+  });
+  assert.strictEqual(proposeCalls, 1, 'only one propose: a git commit failure must NOT consume more than this single attempt, no re-ask');
+  assert.strictEqual(res.outcome, 'BLOCKED');
+  assert.strictEqual(res.exitCode, 4);
+  assert.ok(res.blockers.some(function(b) { return b.code === 'GIT_COMMIT_FAILED'; }), 'exact GIT_COMMIT_FAILED blocker recorded');
+  assert.ok(!hasLog(log, 'push'), 'no push attempted after a commit failure');
+});
+
 test('run-repair: BLOCKED when log wrapper refuses (finding still extracted)', async function() {
   var cwd = tempCwd();
   var log = [];

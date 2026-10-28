@@ -327,6 +327,73 @@ function writeBeforeCommitEvidence(runId, attemptNumber, data, fsMod, now) {
   writeAttemptSummary(runId, attemptNumber, data, fsMod, now);
 }
 
+/**
+ * Redact known secret-shaped strings from free-form evidence (proposal text).
+ * Best effort, no throw: only string values in a JSON object are scanned.
+ */
+function redactProposalText(text) {
+  if (typeof text !== 'string') return text;
+  var out = text;
+  out = out.replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[REDACTED]');
+  out = out.replace(/(Bearer[:\s]+)[A-Za-z0-9_.-]{10,}/g, '$1[REDACTED]');
+  out = out.replace(/\b(?:sk|rk|gh[pous]_)[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]');
+  out = out.replace(/\b(?:secret|token|password|api[_-]?key)[A-Za-z0-9_.-]{3,}\b/gi, '[REDACTED_KEY]');
+  out = out.replace(/github_pat_[A-Za-z0-9_]{20,}/g, '[REDACTED]');
+  return out;
+}
+
+function redactEditSet(editSet) {
+  var out = {};
+  if (editSet && typeof editSet === 'object') {
+    for (var k in editSet) {
+      if (k === '_proposalHash') continue;
+      var v = editSet[k];
+      if (k === 'edits' && Array.isArray(v)) {
+        out.edits = v.map(function(e) {
+          var ev = {};
+          ['path', 'oldString', 'newString'].forEach(function(f) {
+            ev[f] = f in e ? redactProposalText(e[f]) : undefined;
+          });
+          return ev;
+        });
+      } else if (k === 'newFiles' && Array.isArray(v)) {
+        out.newFiles = v.map(function(nf) {
+          var nv = {};
+          ['path', 'content'].forEach(function(f) {
+            nv[f] = f in nf ? redactProposalText(nf[f]) : undefined;
+          });
+          return nv;
+        });
+      } else if (k === 'repairKind' || k === 'rationale' || ['string'].indexOf(typeof v) !== -1) {
+        out[k] = redactProposalText(v);
+      } else {
+        out[k] = v;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Always save the accepted proposal (edits and new file contents, redacted) to
+ * evidence/<runId>/repair/proposal-N.json BEFORE the commit, so a git failure
+ * or crash still leaves a diagnosable proposal artifact behind.
+ */
+function writeProposalBeforeCommit(runId, attemptNumber, editSet, fsMod, now) {
+  try {
+    var dir = path.join('evidence', runId, 'repair');
+    ensureDir(fsMod, dir);
+    var data = {
+      attempt: attemptNumber,
+      repairKind: editSet && editSet.repairKind ? editSet.repairKind : null,
+      rationale: editSet && editSet.rationale ? editSet.rationale : null,
+      editSet: redactEditSet(editSet),
+      timestamp: (typeof now === 'function' ? now() : new Date().toISOString())
+    };
+    fsMod.writeFileSync(path.join(dir, 'proposal-' + attemptNumber + '.json'), JSON.stringify(data, null, 2) + '\n', 'utf8');
+  } catch (e) { /* best effort */ }
+}
+
 var CHECK_STDERR_TAIL = 500;
 
 /**
@@ -402,6 +469,9 @@ function writeAttemptSummary(runId, attemptNumber, data, fsMod, now) {
         stage: data.crash.stage ? String(data.crash.stage) : null,
         message: typeof data.crash.message === 'string' ? data.crash.message.substring(0, 2000) : null
       };
+    }
+    if (data.gitError) {
+      summary.gitError = typeof data.gitError === 'string' ? data.gitError.substring(0, 2048) : null;
     }
     fsMod.writeFileSync(path.join(dir, 'attempt-' + attemptNumber + '.json'), JSON.stringify(summary, null, 2) + '\n', 'utf8');
   } catch (e) { /* best effort */ }
@@ -1637,6 +1707,9 @@ async function proposeAndCheck(options) {
   // 8a: record READY evidence BEFORE commit/push so a crash in the git stage
   // still leaves a per-attempt record (never only a bare attempt-error.json).
   writeBeforeCommitEvidence(runId, attemptNumber, Object.assign({ stage: 'before-commit' }, stageEvidence('before-commit')), fs, now);
+  // 8a2: always save the accepted proposal (redacted edits + new file contents)
+  // before the commit, so a git failure still leaves a diagnosable artifact.
+  writeProposalBeforeCommit(runId, attemptNumber, editSet, fs, now);
 
   var commitResult;
   try {
@@ -1651,10 +1724,25 @@ async function proposeAndCheck(options) {
     throw stageErr;
   }
   if (!commitResult.ok) {
+    // Git/infra commit failure: surface the redacted, truncated git output in
+    // both the blocker message and the attempt-N.json evidence so the artifact
+    // is diagnosable from the evidence dir alone.
+    var blk = commitResult.blocker || {};
+    var gitErr = (blk.evidence && blk.evidence.gitError) || '';
+    var msg = (blk.message || 'git commit failed') + (gitErr ? ' | ' + gitErr : '');
+    var attemptData = Object.assign(stageEvidence('commit-failed'), {
+      status: 'APPLY_FAILED',
+      codes: ['GIT_COMMIT_FAILED'],
+      stage: 'commit-failed',
+      blocker: { code: blk.code || 'GIT_COMMIT_FAILED', message: msg },
+      gitError: gitErr
+    });
+    writeAttemptSummary(runId, attemptNumber, attemptData, fs, now);
     return {
       status: 'APPLY_FAILED',
-      blocker: commitResult.blocker,
-      errors: ['commit failed']
+      blocker: { code: blk.code || 'GIT_COMMIT_FAILED', message: msg, evidence: blk.evidence || {} },
+      errors: ['commit failed'],
+      gitError: gitErr
     };
   }
 

@@ -1414,3 +1414,46 @@ test('locator: .d.ts file is excluded from candidates', async function() {
   fs.rmSync(workspaceDir, { recursive: true, force: true });
   fs.rmSync(targetRoot, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// dedupeAndRank: no duplicate file+line entries, .d.ts ranks below source
+// ---------------------------------------------------------------------------
+
+test('dedupeAndRank: removes same file+line duplicates keeping the highest score', function() {
+  var dedupeAndRank = locator.dedupeAndRank;
+  var out = dedupeAndRank([
+    { file: 'src/a.js', line: 10, score: 3, reasons: ['low'] },
+    { file: 'src/a.js', line: 10, score: 9, reasons: ['high'] },
+    { file: 'src/a.js', line: 11, score: 4, reasons: ['other line'] },
+    { file: 'src\\b.js', line: 5, score: 7, reasons: ['backslash path'] }
+  ]);
+  assert.strictEqual(out.length, 3, 'one duplicate removed');
+  var a10 = out.filter(function(c) { return c.file.replace(/\\/g, '/') === 'src/a.js' && c.line === 10; });
+  assert.strictEqual(a10.length, 1, 'single entry for src/a.js:10');
+  assert.strictEqual(a10[0].score, 9, 'highest score entry survives');
+  // a backslash path is treated as the same file as its forward-slash form
+  assert.ok(out.some(function(c) { return c.file.replace(/\\/g, '/') === 'src/b.js' && c.line === 5; }), 'backslash path normalized for dedupe');
+});
+
+test('dedupeAndRank: ranks .d.ts below real source at equal score', function() {
+  var dedupeAndRank = locator.dedupeAndRank;
+  var out = dedupeAndRank([
+    { file: 'node_modules/pkg/index.d.ts', line: 3, score: 5, reasons: ['dts'] },
+    { file: 'src/real.js', line: 3, score: 5, reasons: ['src'] },
+    { file: 'src/zero.ts', line: 9, score: 5, reasons: ['ts'] }
+  ]);
+  assert.strictEqual(out.length, 3);
+  assert.strictEqual(out[0].file, 'src/real.js', 'real source first at equal score');
+  assert.strictEqual(out[1].file, 'src/zero.ts', 'ts file before d.ts');
+  assert.strictEqual(out[2].file, 'node_modules/pkg/index.d.ts', '.d.ts last at equal score');
+});
+
+test('dedupeAndRank: higher absolute score always wins over the .d.ts tiebreak', function() {
+  var dedupeAndRank = locator.dedupeAndRank;
+  var out = dedupeAndRank([
+    { file: 'node_modules/pkg/index.d.ts', line: 3, score: 10, reasons: ['dts high'] },
+    { file: 'src/real.js', line: 3, score: 5, reasons: ['src low'] }
+  ]);
+  assert.strictEqual(out[0].file, 'node_modules/pkg/index.d.ts', 'higher score comes first even if .d.ts');
+  assert.strictEqual(out[1].file, 'src/real.js');
+});

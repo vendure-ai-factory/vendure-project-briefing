@@ -11,8 +11,8 @@ var FORBIDDEN_REF_NAMES = {
   'codex/staging-vendure-3.7.3': true
 };
 
-var COMMIT_AUTHOR_NAME = 'Pipeline';
-var COMMIT_AUTHOR_EMAIL = 'pipeline@users.noreply.github.com';
+var COMMIT_AUTHOR_NAME = process.env.REPAIR_GIT_USER_NAME || 'Pipeline';
+var COMMIT_AUTHOR_EMAIL = process.env.REPAIR_GIT_USER_EMAIL || 'pipeline@users.noreply.github.com';
 
 /**
  * Build the git credential env block. The token is only ever placed inside a
@@ -35,6 +35,19 @@ function commitAuthorEnv() {
     GIT_COMMITTER_NAME: COMMIT_AUTHOR_NAME,
     GIT_COMMITTER_EMAIL: COMMIT_AUTHOR_EMAIL
   };
+}
+
+function identityFlags() {
+  return [
+    '-c', 'user.name=' + COMMIT_AUTHOR_NAME,
+    '-c', 'user.email=' + COMMIT_AUTHOR_EMAIL,
+    '-c', 'commit.gpgsign=false'
+  ];
+}
+
+function truncateTo2KB(text) {
+  if (!text || typeof text !== 'string') return '';
+  return text.length <= 2048 ? text : text.substring(0, 2048);
 }
 
 function isAllowedRepoUrl(repoUrl) {
@@ -230,6 +243,8 @@ function createBranch(dir, name, opts) {
 
 /**
  * Stage every change and commit with the fixed pipeline author identity.
+ * Uses -c flags per command to work in a clean CI clone with no pre-configured
+ * git identity. Also configures safe.directory to avoid trust warnings.
  */
 function commitAll(dir, message, opts) {
   opts = opts || {};
@@ -240,30 +255,48 @@ function commitAll(dir, message, opts) {
   if (typeof message !== 'string' || message.trim().length === 0) {
     return Promise.resolve(blockerFor('MISSING_COMMIT_MESSAGE', 'A commit message is required', {}));
   }
-  var env = commitAuthorEnv();
-  return runCommand('git', ['add', '-A'], {
+  var timeout = opts.timeout || DEFAULT_TIMEOUT_MS;
+  var flags = identityFlags();
+
+  // Configure safe.directory first (once per clone dir)
+  return runCommand('git', ['config', '--global', '--add', 'safe.directory', dir], {
     cwd: dir,
-    env: env,
-    timeout: opts.timeout || DEFAULT_TIMEOUT_MS
+    timeout: timeout
+  }).catch(function() {
+    // Non-fatal: continue even if safe.directory config fails
+    return { success: true, stdout: '', stderr: '', exitCode: 0 };
+  }).then(function() {
+    // git add -A
+    return runCommand('git', flags.concat(['add', '-A']), {
+      cwd: dir,
+      timeout: timeout
+    });
   }).then(function(addRes) {
     var addResult = normalizeExecResult(addRes);
     if (!addResult.success) {
-      return blockerFor('COMMIT_FAILED', 'git add -A failed: ' + (addResult.error || ('exit code ' + addResult.exitCode)), {
+      var gitErr = truncateTo2KB(redactAll(addResult.stderr, []));
+      return { __blocker: blockerFor('GIT_COMMIT_FAILED', 'git add -A failed: ' + (addResult.error || ('exit code ' + addResult.exitCode)), {
         exitCode: addResult.exitCode,
-        stderr: redactOutput(addResult.stderr, [])
-      });
+        stderr: redactOutput(addResult.stderr, []),
+        gitError: gitErr
+      }) };
     }
-    return runCommand('git', ['commit', '-m', message], {
+    // git commit -m message
+    return runCommand('git', flags.concat(['commit', '-m', message]), {
       cwd: dir,
-      env: env,
-      timeout: opts.timeout || DEFAULT_TIMEOUT_MS
+      timeout: timeout
     });
   }).then(function(commitRes) {
+    if (commitRes && commitRes.__blocker) {
+      return commitRes.__blocker;
+    }
     var r = normalizeExecResult(commitRes);
     if (!r.success) {
-      return blockerFor('COMMIT_FAILED', 'git commit failed: ' + (r.error || ('exit code ' + r.exitCode)), {
+      var gitErr = truncateTo2KB(redactAll(r.stderr, []));
+      return blockerFor('GIT_COMMIT_FAILED', 'git commit failed: ' + (r.error || ('exit code ' + r.exitCode)), {
         exitCode: r.exitCode,
-        stderr: redactOutput(r.stderr, [])
+        stderr: redactOutput(r.stderr, []),
+        gitError: gitErr
       });
     }
     return { ok: true, dir: dir };

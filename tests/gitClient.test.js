@@ -273,7 +273,70 @@ test('commitAll: success case', function() {
   };
   return gitClient.commitAll('/tmp/repo', 'fix: correct thing', { runCommand: fakeRunner }).then(function(r) {
     assert.strictEqual(r.ok, true);
-    assert.strictEqual(count, 2, 'add then commit');
+    assert.strictEqual(count, 3, 'safe.directory config, add, then commit');
+  });
+});
+
+test('commitAll: uses -c identity flags on every add/commit (clean CI clone, no git identity)', function() {
+  var calls = [];
+  var fakeRunner = function(cmd, args, opts) {
+    calls.push(args.slice());
+    return Promise.resolve({ success: true, stdout: '', stderr: '', exitCode: 0 });
+  };
+  return gitClient.commitAll('/tmp/repo', 'fix: test', { runCommand: fakeRunner }).then(function() {
+    assert.ok(calls.length >= 2, 'at least add and commit run');
+    // Every add/commit command (index >= 1, skipping safe.directory config)
+    // carries the -c identity flags. The config command itself has no flags.
+    for (var i = 1; i < calls.length; i++) {
+      assert.ok(calls[i].indexOf('-c') !== -1, 'add/commit uses -c: ' + JSON.stringify(calls[i]));
+      assert.ok(calls[i].indexOf('user.name=Pipeline') !== -1, 'has user.name: ' + JSON.stringify(calls[i]));
+      assert.ok(calls[i].indexOf('user.email=pipeline@users.noreply.github.com') !== -1, 'has user.email');
+      assert.ok(calls[i].indexOf('commit.gpgsign=false') !== -1, 'has commit.gpgsign=false');
+    }
+  });
+});
+
+test('commitAll: first command configures safe.directory for the clone dir', function() {
+  var firstArgs = null;
+  var fakeRunner = function(cmd, args, opts) {
+    if (!firstArgs) firstArgs = args.slice();
+    return Promise.resolve({ success: true, stdout: '', stderr: '', exitCode: 0 });
+  };
+  return gitClient.commitAll('/opt/ci/clone', 'fix: test', { runCommand: fakeRunner }).then(function() {
+    assert.ok(firstArgs, 'a command ran');
+    assert.deepStrictEqual(firstArgs.slice(0, 5), ['config', '--global', '--add', 'safe.directory', '/opt/ci/clone']);
+  });
+});
+
+test('commitAll: commit failure -> GIT_COMMIT_FAILED blocker with gitError evidence (token-redacted)', function() {
+  var fakeRunner = function(cmd, args, opts) {
+    if (args.indexOf('add') !== -1) return Promise.resolve({ success: true, stdout: '', stderr: '', exitCode: 0 });
+    return Promise.resolve({
+      success: false,
+      stdout: '',
+      stderr: 'fatal: secret-token-12345; unable to auto-detect email address (got \'x@y.example\')',
+      exitCode: 128
+    });
+  };
+  return gitClient.commitAll('/tmp/repo', 'fix: test', { runCommand: fakeRunner }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'GIT_COMMIT_FAILED');
+    assert.ok(r.blocker.evidence.gitError, 'gitError present in evidence');
+    assert.ok(r.blocker.evidence.gitError.indexOf('secret-token-12345') === -1, 'secret redacted from gitError');
+    assert.ok(r.blocker.evidence.gitError.indexOf('x@y.example') === -1, 'email redacted from gitError');
+    assert.ok(r.blocker.message.indexOf('git commit failed') !== -1, 'message mentions commit');
+  });
+});
+
+test('commitAll: add failure -> GIT_COMMIT_FAILED', function() {
+  var fakeRunner = function(cmd, args, opts) {
+    if (args.indexOf('add') !== -1) return Promise.resolve({ success: false, stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 });
+    return Promise.resolve({ success: true, stdout: '', stderr: '', exitCode: 0 });
+  };
+  return gitClient.commitAll('/tmp/repo', 'fix: test', { runCommand: fakeRunner }).then(function(r) {
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.blocker.code, 'GIT_COMMIT_FAILED');
+    assert.ok(r.blocker.evidence.gitError, 'gitError present for add failure');
   });
 });
 
@@ -567,17 +630,24 @@ test('push: argv uses -- protection (branch as explicit ref)', function() {
   });
 });
 
-test('commitAll: uses Pipeline author identity', function() {
+test('commitAll: uses -c flags, not env vars, for identity (no GIT_AUTHOR env sets)', function() {
   var capturedEnv = null;
+  var capturedArgs = [];
   var fakeRunner = function(cmd, args, opts) {
     capturedEnv = opts && opts.env;
+    capturedArgs.push(args.slice());
     return Promise.resolve({ success: true, stdout: '', stderr: '', exitCode: 0 });
   };
   return gitClient.commitAll('/tmp/repo', 'fix: test', { runCommand: fakeRunner }).then(function() {
-    assert.strictEqual(capturedEnv.GIT_AUTHOR_NAME, 'Pipeline');
-    assert.strictEqual(capturedEnv.GIT_AUTHOR_EMAIL, 'pipeline@users.noreply.github.com');
-    assert.strictEqual(capturedEnv.GIT_COMMITTER_NAME, 'Pipeline');
-    assert.strictEqual(capturedEnv.GIT_COMMITTER_EMAIL, 'pipeline@users.noreply.github.com');
+    // Identity is carried by -c flags in argv, so no identity env vars are set.
+    var hasAuthorEnv = (capturedEnv && Object.keys(capturedEnv).some(function(k) {
+      return k.indexOf('GIT_AUTHOR') === 0 || k.indexOf('GIT_COMMITTER') === 0;
+    })) === true;
+    assert.strictEqual(hasAuthorEnv, false, 'no GIT_AUTHOR/GIT_COMMITTER env vars passed');
+    // The commit command carries the identity via -c flags.
+    var commitArgs = capturedArgs.filter(function(a) { return a.indexOf('commit') !== -1; });
+    assert.ok(commitArgs.length > 0, 'commit ran');
+    assert.ok(commitArgs[0].indexOf('user.name=Pipeline') !== -1, 'user.name via -c');
   });
 });
 

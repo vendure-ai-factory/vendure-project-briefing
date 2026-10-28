@@ -1505,6 +1505,11 @@ async function locateCandidates(options) {
     } catch (e) { /* ignore */ }
   }
 
+  // (c4)+(c5) Deduplicate candidates that reference the same file+line, keep
+  // the highest-scoring, and rank *.d.ts below real source files. Also used
+  // when writing candidates.json evidence below.
+  candidates = dedupeAndRank(candidates);
+
   // Filter to top maxCandidates
   candidates = candidates.slice(0, maxCandidates);
 
@@ -1570,4 +1575,45 @@ function writeCapabilities(runId, evidenceRoot, dependencyPatch, reason) {
   } catch (e) { /* best effort */ }
 }
 
-module.exports = { locateCandidates: locateCandidates, writeCapabilities: writeCapabilities, deriveSearchPatterns: deriveSearchPatterns, writeCandidatesEvidence: writeCandidatesEvidence };
+/**
+ * Deduplicate candidate entries that reference the same file+line (keeping the
+ * highest-scoring first occurrence) and rank *.d.ts type declarations below
+ * real source files when scores are equal. Used before candidates.json is
+ * written so the evidence never lists the same file+line twice.
+ */
+function dedupeAndRank(candidates) {
+  var byFileLine = {};
+  var deduped = [];
+  for (var dl = 0; dl < (candidates || []).length; dl++) {
+    var dc = candidates[dl];
+    if (!dc || !dc.file) continue;
+    var normFile = String(dc.file).replace(/\\/g, '/');
+    var key = normFile + ':' + (dc.line != null ? dc.line : '');
+    var existing = byFileLine[key];
+    if (existing) {
+      // Keep the highest-scoring entry for the same file+line.
+      var existingScore = (existing && typeof existing.score === 'number') ? existing.score : 0;
+      var newScore = (dc && typeof dc.score === 'number') ? dc.score : 0;
+      if (newScore > existingScore) {
+        existing.score = newScore;
+        if (dc.reasons) existing.reasons = dc.reasons;
+        if (dc.why) existing.why = dc.why;
+      }
+      continue;
+    }
+    byFileLine[key] = dc;
+    deduped.push(dc);
+  }
+  deduped.sort(function(a, b) {
+    var aScore = (a && typeof a.score === 'number') ? a.score : 0;
+    var bScore = (b && typeof b.score === 'number') ? b.score : 0;
+    if (bScore !== aScore) return bScore - aScore;
+    var aIsDts = a && a.file ? /\.d\.ts$/.test(a.file) : false;
+    var bIsDts = b && b.file ? /\.d\.ts$/.test(b.file) : false;
+    if (aIsDts === bIsDts) return 0;
+    return aIsDts ? 1 : -1; // source first, .d.ts last
+  });
+  return deduped;
+}
+
+module.exports = { locateCandidates: locateCandidates, writeCapabilities: writeCapabilities, deriveSearchPatterns: deriveSearchPatterns, writeCandidatesEvidence: writeCandidatesEvidence, dedupeAndRank: dedupeAndRank };
