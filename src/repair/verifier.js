@@ -353,8 +353,11 @@ async function runChecks(cloneDir, options) {
     redactedErr = redactEmails(redactedErr);
 
     // A spawn that never ran (command not found / ENOENT) surfaces as a
-    // child 'error' event with no exit code and no output. Treat it as the
-    // same non-fatal "toolchain unavailable" skip instead of a failed check.
+    // child 'error' event with no exit code and no output. CHECKS_SKIPPED_NO_TOOLCHAIN
+    // means the binary is absent after resolution (node_modules/.bin then PATH).
+    // This is a skip regardless of whether node_modules exists — the toolchain may be
+    // partially installed. If the binary is found but exits non-zero (compile errors),
+    // it is a real FAIL so the repair loop can re-ask the model with the output.
     var spawnFailed = execResult.exitCode === null && !(execResult.stdout || '') && !(execResult.stderr || '') && !!execResult.error;
     var isSkipped = spawnFailed;
 
@@ -373,6 +376,41 @@ async function runChecks(cloneDir, options) {
       cwd: cloneDir,
       hasNodeModules: hasNodeModules,
       signal: execResult.signal || null
+    });
+  }
+
+  // Run tsc --noEmit as an additional direct check when TypeScript is available.
+  // Unlike the package.json script loop above which runs user-defined build/test
+  // scripts, this directly checks for TypeScript compilation errors that would
+  // cause IMAGE_BUILD_FAILED even if the build script succeeds.
+  var tscBin = path.join(cloneDir, 'node_modules', '.bin', 'tsc');
+  if (hasNodeModules && fs.existsSync(tscBin)) {
+    var tscResult = await execCommand(tscBin, ['--noEmit'], {
+      cwd: cloneDir,
+      timeout: timeout
+    });
+    var tscSecrets = collectOutputSecrets(tscResult.stdout || '') || [];
+    var tscAllSecrets = collectEnvSecrets().concat(tscSecrets);
+    var tscRedactedOut = redactSecrets(tscResult.stdout || '', tscAllSecrets);
+    var tscRedactedErr = redactSecrets(tscResult.stderr || '', tscAllSecrets);
+    var tscSpawnFailed = tscResult.exitCode === null && !(tscResult.stdout || '') && !(tscResult.stderr || '') && !!tscResult.error;
+    var tscSkipped = tscSpawnFailed;
+
+    results.push({
+      script: 'tsc --noEmit',
+      command: tscBin + ' --noEmit',
+      resolvedCommand: tscBin,
+      success: !tscSkipped && tscResult.success,
+      exitCode: tscResult.exitCode,
+      timedOut: tscResult.timedOut,
+      skipped: tscSkipped,
+      code: tscSkipped ? 'CHECKS_SKIPPED_NO_TOOLCHAIN' : undefined,
+      stdout: tscRedactedOut,
+      stderr: tscSpawnFailed ? 'tsc not found' : tscRedactedErr,
+      error: tscResult.error ? redactSecrets(tscResult.error, collectEnvSecrets()) : null,
+      cwd: cloneDir,
+      hasNodeModules: hasNodeModules,
+      signal: tscResult.signal || null
     });
   }
 

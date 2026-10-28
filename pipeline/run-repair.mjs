@@ -38,6 +38,7 @@ const MANIFEST_PATH = 'manifest/acceptance-manifest.v0.4.json';
 const DEFAULT_ARCHIVE_ROOT = '/opt/pipeline-archive';
 const REPORTS_DIR = 'reports';
 const EVIDENCE_DIR = 'evidence';
+const TARGET_OWNER_REPO = 'vendure-ai-factory/vendure-staging-baseline';
 
 /**
  * Write a progress.json marker to evidence/<runId>/repair/progress.json.
@@ -80,6 +81,23 @@ function sanitizeToken(v) {
 
 function generateRunId() {
   return 'run-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+}
+
+/**
+ * Extract changed file paths from a git diff. Parses `diff --git a/X b/X` lines
+ * and returns unique file paths. Used when a pushed commit's build fails so the
+ * model can see which files were changed without re-running git diff.
+ */
+function extractDiffFiles(diffText) {
+  if (!diffText || typeof diffText !== 'string') return [];
+  var files = [];
+  var diffFileRe = /^diff --git a\/(.+?) b\/(.+?)$/gm;
+  var match;
+  while ((match = diffFileRe.exec(diffText)) !== null) {
+    var f = match[2] || match[1];
+    if (files.indexOf(f) === -1) files.push(f);
+  }
+  return files;
 }
 
 function collectSecretValues(cfg) {
@@ -1369,7 +1387,135 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
   });
   if (!buildResult || !buildResult.ok) {
     writeFindingEvidence(cfg, state);
-    return { next: 'stop-blocked', blocker: buildResult && buildResult.blocker ? buildResult.blocker : normalizeBlocker('IMAGE_BUILD_DISPATCH_FAILED', 'image build/publish failed', {}) };
+    var buildBlocker = buildResult && buildResult.blocker ? buildResult.blocker : normalizeBlocker('IMAGE_BUILD_DISPATCH_FAILED', 'image build/publish failed', {});
+
+    // IMAGE_BUILD_FAILED is retryable: fetch the build job log, save it as
+    // evidence, and re-ask the model with the compiler output until the per-
+    // signature budget is used. Other blockers (dispatch error, timeout) are
+    // terminal BLOCKED.
+    if (buildBlocker.code === 'IMAGE_BUILD_FAILED') {
+      var runUrl = (buildBlocker.evidence && buildBlocker.evidence.runUrl) || null;
+      var buildErrorContent = null;
+      if (runUrl && cfg.token && cfg.fetch) {
+        try {
+          // Extract runId from the runUrl (e.g. https://github.com/.../actions/runs/12345)
+          var runIdMatch = String(runUrl).match(/\/actions\/runs\/(\d+)/);
+          var buildRunId = runIdMatch ? runIdMatch[1] : null;
+          if (buildRunId) {
+            // Get the jobs for this run to find the log URL
+            var jobsApiUrl = 'https://api.github.com/repos/' + TARGET_OWNER_REPO + '/actions/runs/' + buildRunId + '/jobs';
+            var jobsResponse = await cfg.fetch(jobsApiUrl, {
+              method: 'GET',
+              headers: {
+                'Authorization': 'Bearer ' + cfg.token,
+                'Accept': 'application/vnd.github+json',
+                'X-GitHub-Api-Version': '2022-11-28'
+              }
+            });
+            if (jobsResponse.status === 200) {
+              try {
+                var jobsData = await jobsResponse.json();
+                var jobs = jobsData.jobs || [];
+                // Try to get logs from the first failed job
+                for (var ji = 0; ji < jobs.length; ji++) {
+                  var job = jobs[ji];
+                  if (job.conclusion !== 'success' && job.log_url) {
+                    // Fetch the logs for this job (follow redirect to raw text)
+                    var jobLogsResponse = await cfg.fetch(job.log_url, {
+                      method: 'GET',
+                      headers: {
+                        'Authorization': 'Bearer ' + cfg.token,
+                        'Accept': 'text/plain'
+                      }
+                    });
+                    if (jobLogsResponse.status === 200 || jobLogsResponse.status === 302) {
+                      if (jobLogsResponse.status === 302) {
+                        // Follow redirect for raw logs
+                        var redirectLoc = jobLogsResponse.headers && typeof jobLogsResponse.headers.get === 'function'
+                          ? jobLogsResponse.headers.get('location')
+                          : null;
+                        if (redirectLoc) {
+                          var rawLogsResponse = await cfg.fetch(redirectLoc, { method: 'GET' });
+                          if (rawLogsResponse.ok) {
+                            var textFn = rawLogsResponse.text || rawLogsResponse.buffer;
+                            var text = typeof textFn === 'function' ? await textFn() : '';
+                            buildErrorContent = String(text).substring(0, 4096);
+                          }
+                        }
+                      } else {
+                        var textFn2 = jobLogsResponse.text || jobLogsResponse.buffer;
+                        var text2 = typeof textFn2 === 'function' ? await textFn2() : '';
+                        buildErrorContent = String(text2).substring(0, 4096);
+                      }
+                      if (buildErrorContent) break;
+                    }
+                  }
+                }
+              } catch (e2) { /* jobs parse failed, continue without logs */ }
+            }
+          }
+        } catch (err) {
+          // Best-effort log fetch; continue without buildErrorContent
+        }
+      }
+
+      // Save build failure evidence
+      var buildFailureFile = 'build-failure-' + attemptNumber + '.txt';
+      if (buildErrorContent) {
+        try {
+          var evDir = path.join(cfg.cwd, EVIDENCE_DIR, cfg.runId, 'repair');
+          cfg.fs.mkdirSync(evDir, { recursive: true });
+          var values = collectSecretValues(cfg);
+          var redacted = redactOutput(buildErrorContent, values);
+          cfg.fs.writeFileSync(path.join(evDir, buildFailureFile), redacted, 'utf8');
+        } catch (e) { /* best-effort */ }
+      }
+
+      // Add pushed-but-not-deployed to sectionB.targetChanges
+      var changedFiles = propose.diffText ? extractDiffFiles(propose.diffText) : [];
+      state.targetChanges.push({
+        branch: located.branch,
+        commit: propose.headSha || '',
+        repairKind: propose.repairKind || '',
+        filesChanged: changedFiles,
+        diffStat: '',
+        deployed: false,
+        notDeployedReason: 'IMAGE_BUILD_FAILED'
+      });
+
+      var buildAttempt = {
+        n: attemptNumber,
+        signature: state.finding.signature || '',
+        domain: state.finding.domain || '',
+        repairKind: propose.repairKind || '',
+        status: 'IMAGE_BUILD_FAILED',
+        checks: summarizeChecks(propose.checks),
+        branch: located.branch,
+        headSha: propose.headSha || '',
+        buildRunUrl: runUrl || '',
+        imageDigest: '',
+        deployed: false,
+        retestVerdicts: [],
+        verifyStatus: null,
+        message: buildBlocker.message || 'image build failed',
+        locatedFrom: (located.candidates || []).map(function(c) { return c.file; }),
+        editedFiles: changedFiles
+      };
+
+      return {
+        next: 'continue',
+        attempt: buildAttempt,
+        previousEvidence: {
+          diff: propose.diffText || null,
+          checks: propose.checks || null,
+          errors: [buildBlocker.message || 'IMAGE_BUILD_FAILED'],
+          buildError: buildErrorContent || (buildBlocker.message || 'IMAGE_BUILD_FAILED'),
+          verifyStatus: null
+        }
+      };
+    }
+
+    return { next: 'stop-blocked', blocker: buildBlocker };
   }
 
   var deployResult = await adapters.deploy.deploy(buildResult.deployRef, {
@@ -1405,7 +1551,9 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
     deployed: true,
     retestVerdicts: rerunTasks.map(function(t) { return (t && t.result) || ''; }),
     verifyStatus: verdict.status,
-    message: 'deploy retest: ' + verdict.status
+    message: 'deploy retest: ' + verdict.status,
+    locatedFrom: (located.candidates || []).map(function(c) { return c.file; }),
+    editedFiles: propose.diffText ? extractDiffFiles(propose.diffText) : []
   };
 
   if (verdict.status === 'fixed') {

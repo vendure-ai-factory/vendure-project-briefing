@@ -453,6 +453,9 @@ function generateReport(runId, options) {
         buildRunUrl: safeRedact(String(a.buildRunUrl || ''), secretValues),
         imageDigest: a.imageDigest || '',
         deployed: a.deployed ? true : false,
+        notDeployedReason: a.notDeployedReason || '',
+        locatedFrom: Array.isArray(a.locatedFrom) ? a.locatedFrom.slice() : [],
+        editedFiles: Array.isArray(a.editedFiles) ? a.editedFiles.slice() : [],
         retestVerdicts: Array.isArray(a.retestVerdicts) ? a.retestVerdicts.slice() : [],
         verifyStatus: a.verifyStatus || ''
       };
@@ -470,7 +473,9 @@ function generateReport(runId, options) {
         commit: tc.commit || '',
         repairKind: tc.repairKind || '',
         filesChanged: Array.isArray(tc.filesChanged) ? tc.filesChanged.slice() : [],
-        diffStat: tc.diffStat || ''
+        diffStat: tc.diffStat || '',
+        deployed: tc.deployed === false ? false : true,
+        notDeployedReason: tc.notDeployedReason || ''
       };
       if (tc.diffExcerpt) {
         var redacted = safeRedact(String(tc.diffExcerpt), secretValues);

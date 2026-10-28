@@ -75,6 +75,7 @@ var PROMPT_TEMPLATE = 'You are a bug fixer. Your task is to propose a JSON edit-
 '- Do not make unrelated edits\n' +
 '- Answer with JSON only (no markdown, no explanation)\n' +
 '{{allowedPathsPerKind}}\n' +
+'{{editGuidance}}\n' +
 '{{previousAttempts}}\n\n' +
 '## Output\n' +
 'Return a JSON object matching the Edit-Set Contract above.';
@@ -159,10 +160,28 @@ function formatPreviousAttempts(previousAttempts) {
       var failed = attempt.checks.results.filter(function(r) { return !r.success; });
       if (failed.length > 0) {
         lines.push('  check failures: ' + failed.map(function(f) { return f.script; }).join(', '));
+        // Show stderr tail of each failed check (helps model fix compile/TypeScript errors)
+        for (var fi = 0; fi < failed.length; fi++) {
+          var f = failed[fi];
+          var stderrTail = f.stderrTail || (f.stderr ? f.stderr.substring(0, 1000) : '');
+          if (stderrTail) {
+            var tail = stderrTail.substring(0, 800);
+            lines.push('    ' + f.script + ' stderr: ' + tail.replace(/\n/g, ' ').substring(0, 200));
+          }
+        }
       }
     }
     if (attempt.errors) {
       lines.push('  errors: ' + attempt.errors);
+    }
+    // Build error content for IMAGE_BUILD_FAILED (set by run-repair.mjs)
+    if (attempt.buildError) {
+      var buildErr = String(attempt.buildError).substring(0, 4000);
+      lines.push('  build error log:');
+      var buildLines = buildErr.split('\n');
+      for (var bl = 0; bl < buildLines.length && bl < 60; bl++) {
+        lines.push('    ' + buildLines[bl].substring(0, 300));
+      }
     }
     // Include closest match context for OLDSTRING_NOT_FOUND rejections
     if (attempt.rejectionCodes && attempt.rejectionCodes.indexOf('OLDSTRING_NOT_FOUND') !== -1 && attempt.closestMatch) {
@@ -270,6 +289,63 @@ function formatCandidates(candidates) {
 }
 
 /**
+ * Build the edit guidance section shown to the model before it proposes edits.
+ * Contains:
+ *  (a) An explicit instruction to always include import statements when an edit
+ *      references a new symbol that is not yet imported in the target file.
+ *  (b) The first ~30 lines of each candidate file so the model can see the
+ *      existing import style and structure before writing oldString/newString.
+ */
+function buildEditGuidance(opts) {
+  opts = opts || {};
+  var cloneDir = opts.cloneDir || '';
+  var candidates = opts.candidates || [];
+  var lines = [];
+
+  lines.push('');
+  lines.push('## Important Edit Guidance');
+  lines.push('');
+  lines.push('### Always Include Imports for New Symbols');
+  lines.push('When your edit (in an existing file) uses or introduces a symbol that is not');
+  lines.push('already imported in that file, you MUST include the import statement in the');
+  lines.push('same edit set. Example: adding MyPlugin to the plugins array in vendure-config.ts');
+  lines.push('requires also adding: import { MyPlugin } from "./plugins/my-plugin";');
+  lines.push('');
+
+  // Candidate file heads: show the first 30 lines so the model sees existing imports.
+  // Cap at 8 candidate files and 800 chars per file to keep the prompt bounded.
+  var MAX_FILES = 8;
+  var MAX_FILE_PREVIEW = 800;
+  var count = 0;
+  for (var ci = 0; ci < candidates.length && count < MAX_FILES; ci++) {
+    var cand = candidates[ci];
+    if (!cand || !cand.file) continue;
+    var fpath = cand.file;
+    if (cloneDir && path.isAbsolute(fpath)) {
+      try { fpath = path.relative(cloneDir, fpath); } catch (e) { /* keep absolute */ }
+    }
+    fpath = fpath.replace(/\\/g, '/');
+    var absPath = path.join(cloneDir, cand.file);
+    try {
+      if (!fs.existsSync(absPath)) continue;
+      var content = fs.readFileSync(absPath, 'utf8');
+      var firstLines = content.split('\n').slice(0, 30).join('\n');
+      if (firstLines.length > MAX_FILE_PREVIEW) firstLines = firstLines.substring(0, MAX_FILE_PREVIEW) + '\n...';
+      lines.push('### File Head: ' + fpath);
+      lines.push('```');
+      lines.push(firstLines);
+      lines.push('```');
+      lines.push('');
+      count++;
+    } catch (e) {
+      // Best-effort: skip files that cannot be read
+    }
+  }
+
+  return lines.join('\n');
+}
+
+/**
  * Build the prompt from template.
  */
 function buildPrompt(finding, candidates, previousAttempts, opts) {
@@ -292,6 +368,7 @@ function buildPrompt(finding, candidates, previousAttempts, opts) {
     .replace('{{dependencyInfo}}', dependencyInfo)
     .replace('{{capabilityNote}}', capabilityNote)
     .replace('{{allowedPathsPerKind}}', allowedPathsPerKind)
+    .replace('{{editGuidance}}', buildEditGuidance(opts))
     .replace('{{previousAttempts}}', formatPreviousAttempts(previousAttempts));
   return prompt;
 }

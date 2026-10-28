@@ -399,6 +399,9 @@ test('runChecks: command not found (ENOENT spawn) is CHECKS_SKIPPED_NO_TOOLCHAIN
     root: TEST_EVIDENCE_ROOT
   });
 
+  // ENOENT is always CHECKS_SKIPPED_NO_TOOLCHAIN regardless of node_modules presence.
+  // The binary is absent after node_modules/.bin + PATH lookup — a toolchain gap,
+  // not a failed build. The repair loop can still proceed.
   assert.strictEqual(result.ok, true, 'spawn-not-found must not be reported as a failure');
   assert.strictEqual(result.skipped, true);
   assert.strictEqual(result.code, 'CHECKS_SKIPPED_NO_TOOLCHAIN');
@@ -569,6 +572,8 @@ test('runChecks: real child spawn error is captured as CHECKS_SKIPPED_NO_TOOLCHA
     timeout: 10000
   });
 
+  // ENOENT is always CHECKS_SKIPPED_NO_TOOLCHAIN — binary absent after
+  // node_modules/.bin + PATH lookup, regardless of node_modules presence.
   assert.strictEqual(result.ok, true, 'spawn-not-found must not be a hard failure');
   assert.strictEqual(result.skipped, true);
   assert.strictEqual(result.code, 'CHECKS_SKIPPED_NO_TOOLCHAIN');
