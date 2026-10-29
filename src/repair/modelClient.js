@@ -160,6 +160,17 @@ function callModel(opts) {
   }
   var usedModel = opts.model !== undefined ? opts.model : configuredModel;
 
+  // Resolve provider preferences for the request body. REPAIR_PROVIDER_ORDER is
+  // a comma-separated list mapped to provider.order; provider.ignore (managed by
+  // proposeAndCheck when a provider loses context) maps to provider.ignore.
+  var providerOrder = null;
+  if (env && typeof env.REPAIR_PROVIDER_ORDER === 'string' && env.REPAIR_PROVIDER_ORDER !== '') {
+    providerOrder = env.REPAIR_PROVIDER_ORDER.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+  } else if (typeof process !== 'undefined' && process.env && typeof process.env.REPAIR_PROVIDER_ORDER === 'string' && process.env.REPAIR_PROVIDER_ORDER !== '') {
+    providerOrder = process.env.REPAIR_PROVIDER_ORDER.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+  }
+  var providerIgnore = (env && env.provider && Array.isArray(env.provider.ignore)) ? env.provider.ignore.slice() : [];
+
   var apiKey;
   if (typeof env === 'object' && env !== null && env.OPENROUTER_API_KEY) {
     apiKey = env.OPENROUTER_API_KEY;
@@ -236,6 +247,12 @@ function callModel(opts) {
         require_parameters: true
       }
     };
+    // Provider preference carve-outs: REPAIR_PROVIDER_ORDER (comma list) maps to
+    // provider.order; provider.ignore (set by proposeAndCheck on context loss)
+    // maps to provider.ignore. Both default to unset.
+    var order = providerOrder === null ? null : providerOrder.slice();
+    if (order && order.length > 0) b.provider.order = order;
+    if (providerIgnore && providerIgnore.length > 0) b.provider.ignore = providerIgnore.slice();
     if (!dropped.max_tokens) b.max_tokens = (reqMaxTokens != null) ? reqMaxTokens : resolvedMaxTokens;
     if (!dropped.reasoning) b.reasoning = reqReasoning || resolvedReasoning;
     if (!dropped.response_format) b.response_format = { type: 'json_object' };

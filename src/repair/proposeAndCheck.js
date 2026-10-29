@@ -452,6 +452,128 @@ function redactEditSet(editSet) {
 }
 
 /**
+ * Detect if an EMPTY_PROPOSAL rationale indicates the provider lost context
+ * (did not receive the prompt content, bug description, or edit context).
+ * Returns true when the rationale mentions missing context/files/code.
+ */
+function isContextLossRationale(rationale) {
+  if (!rationale || typeof rationale !== 'string') return false;
+  var lower = rationale.toLowerCase();
+  var patterns = [
+    'no target file',
+    'bug description',
+    'prior edit context',
+    'context was not',
+    'context not',
+    'files was not',
+    'files were not',
+    'not provided',
+    'not included',
+    'missing context',
+    'did not receive',
+    'prompt not',
+    'no context',
+    'no candidates',
+    'no snippet',
+    'no code'
+  ];
+  for (var i = 0; i < patterns.length; i++) {
+    if (lower.indexOf(patterns[i]) !== -1) return true;
+  }
+  return false;
+}
+
+/**
+ * Save a rejected proposal (redacted) as proposal-N-rejected.json including
+ * each edit's oldString and the first 60 lines of the target file, so
+ * mismatches are diagnosable.
+ */
+function writeRejectedProposal(runId, attemptNumber, editSet, cloneDir, fsMod, now) {
+  try {
+    var dir = path.join('evidence', runId, 'repair');
+    ensureDir(fsMod, dir);
+    var data = {
+      attempt: attemptNumber,
+      repairKind: editSet && editSet.repairKind ? editSet.repairKind : null,
+      rationale: editSet && editSet.rationale ? editSet.rationale : null,
+      editSet: redactEditSet(editSet),
+      targetFilePreviews: [],
+      timestamp: (typeof now === 'function' ? now() : new Date().toISOString())
+    };
+
+    // Collect first 60 lines from each target file referenced in edits
+    var pathsSeen = {};
+    (editSet.edits || []).forEach(function(edit) {
+      if (edit && edit.path && !pathsSeen[edit.path]) {
+        pathsSeen[edit.path] = true;
+        var filePath = path.join(cloneDir, edit.path);
+        try {
+          if (fsMod.existsSync(filePath)) {
+            var content = fsMod.readFileSync(filePath, 'utf8');
+            var lines = content.split('\n').slice(0, 60);
+            data.targetFilePreviews.push({
+              path: edit.path,
+              oldString: edit.oldString,
+              preview: lines.join('\n')
+            });
+          }
+        } catch (e) { /* best effort */ }
+      }
+    });
+
+    fsMod.writeFileSync(path.join(dir, 'proposal-' + attemptNumber + '-rejected.json'), JSON.stringify(data, null, 2) + '\n', 'utf8');
+  } catch (e) { /* best effort */ }
+}
+
+/**
+ * Build a re-ask prompt for OLDSTRING_NOT_FOUND that includes the exact file
+ * content so the model can copy oldString verbatim. `files` is an array of
+ * { path, oldString, lines, closestMatch } - one entry per failing file. For
+ * each file the full text is shown when <= 300 lines, otherwise the region
+ * around the closest match.
+ */
+function buildOldStringReAskPrompt(files) {
+  var schema = '{\n  "repairKind": "source-edit|config-edit|migration|dependency-bump|dependency-patch|local-wrapper",\n  "rationale": "string",\n  "edits": [{"path": "string", "oldString": "string", "newString": "string"}],\n  "newFiles": "[optional] array of {path: string, content: string}"\n}';
+
+  var prompt = 'Your previous edit was rejected because one or more oldStrings were not found in the target files. The exact current file text is below - copy each oldString VERBATIM from these contents.\n\n';
+
+  (files || []).forEach(function(f) {
+    var fileLines = f.lines || [];
+    var showFull = fileLines.length <= 300;
+    var linesToShow = showFull ? fileLines : fileLines.slice(0, 300);
+    prompt += '============================================================\n';
+    prompt += 'File: ' + f.path + '\n';
+    prompt += 'Exact file content' + (showFull ? '' : ' (show first 300 lines; region around closest match below)') + ':\n';
+    linesToShow.forEach(function(line, i) {
+      prompt += (i + 1) + ': ' + line + '\n';
+    });
+    if (!showFull && f.closestMatch) {
+      prompt += 'Region around the closest match (line ' + f.closestMatch.lineNumber + '):\n';
+      if (f.closestMatch.beforeLines) {
+        f.closestMatch.beforeLines.forEach(function(l) {
+          if (l && typeof l.line === 'string') prompt += l.lineNumber + ': ' + l.line + '\n';
+        });
+      }
+      if (f.closestMatch.line) {
+        prompt += f.closestMatch.lineNumber + ': ' + f.closestMatch.line + ' <-- CLOSEST MATCH\n';
+      }
+      if (f.closestMatch.afterLines) {
+        f.closestMatch.afterLines.forEach(function(l) {
+          if (l && typeof l.line === 'string') prompt += l.lineNumber + ': ' + l.line + '\n';
+        });
+      }
+    }
+    prompt += '\nYour previous oldString for this file that was NOT found:\n' + f.oldString + '\n\n';
+  });
+
+  prompt += 'IMPORTANT: Copy each oldString EXACTLY from the file content above - do not modify indentation, spaces, or text.\n';
+  prompt += 'Required JSON structure:\n' + schema + '\n\n';
+  prompt += 'Output ONLY valid JSON. Do not include any explanation or prose, only the JSON object.';
+
+  return prompt;
+}
+
+/**
  * Always save the accepted proposal (edits and new file contents, redacted) to
  * evidence/<runId>/repair/proposal-N.json BEFORE the commit, so a git failure
  * or crash still leaves a diagnosable proposal artifact behind.
@@ -549,6 +671,15 @@ function writeAttemptSummary(runId, attemptNumber, data, fsMod, now) {
     }
     if (data.gitError) {
       summary.gitError = typeof data.gitError === 'string' ? data.gitError.substring(0, 2048) : null;
+    }
+    if (data.providerSwitches != null) {
+      summary.providerSwitches = data.providerSwitches;
+    }
+    if (data.contextLossProvider) {
+      summary.contextLossProvider = String(data.contextLossProvider);
+    }
+    if (data.contextLossReason) {
+      summary.contextLossReason = String(data.contextLossReason).substring(0, 2000);
     }
     fsMod.writeFileSync(path.join(dir, 'attempt-' + attemptNumber + '.json'), JSON.stringify(summary, null, 2) + '\n', 'utf8');
   } catch (e) { /* best effort */ }
@@ -1370,27 +1501,125 @@ async function proposeAndCheck(options) {
     var emptyMsg = 'proposal contained zero edits and zero new files' +
       (emptyReason ? '; model rationale: ' + emptyReason : '') +
       ' - propose concrete edits (each with oldString and newString) or name the new file you need, otherwise the finding cannot be fixed';
-    writeAttemptSummary(runId, attemptNumber, {
-      status: 'REJECTED',
-      codes: ['EMPTY_PROPOSAL'],
-      requestedPaths: [],
-      candidatePaths: candidateRelPaths(cloneDir, realCandidates),
-      tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
-      promptChars: promptChars,
-      elapsedMs: elapsedMs,
-      model: modelResult.model,
-      requestedModel: modelResult.requestedModel,
-      provider: modelResult.provider
-    }, fs, now);
-    return {
-      status: 'REJECTED',
-      rejectionCodes: ['EMPTY_PROPOSAL'],
-      requestedPaths: [],
-      validCandidatePaths: candidateRelPaths(cloneDir, realCandidates),
-      errors: ['[EMPTY_PROPOSAL] ' + emptyMsg],
-      modelReason: emptyReason,
-      blocker: { code: 'EMPTY_PROPOSAL', message: emptyMsg }
-    };
+
+    // Check if this is a PROVIDER_CONTEXT_LOSS: empty proposal with rationale
+    // indicating the provider lost context (did not receive prompt content/files).
+    // Retry on another provider without consuming budget, up to 3 switches.
+    var providerSwitches = 0;
+    var contextLossProvider = null;
+    var contextLossReason = null;
+    if (isContextLossRationale(emptyReason)) {
+      // Initialize provider tracking in env
+      env.provider = env.provider || { ignore: [], order: null };
+      var MAX_PROVIDER_SWITCHES = 3;
+
+      while (providerSwitches < MAX_PROVIDER_SWITCHES) {
+        var currentProvider = modelResult.provider || null;
+        contextLossProvider = currentProvider;
+        contextLossReason = emptyReason;
+
+        // Add current provider to ignore list
+        if (currentProvider) {
+          if (env.provider.ignore.indexOf(currentProvider) === -1) {
+            env.provider.ignore.push(currentProvider);
+          }
+        }
+        providerSwitches++;
+
+        // Retry the model call with same prompt, no budget consume
+        var retryStartMs = (typeof modelNow === 'function' ? modelNow() : Date.now());
+        var retryResult = await model.callModel({
+          prompt: prompt,
+          system: 'You are a bug fixer. Output only JSON.',
+          env: env,
+          budget: budget,
+          fetch: fetch
+        });
+        var retryElapsed = (typeof modelNow === 'function' ? modelNow() : Date.now()) - retryStartMs;
+        elapsedMs = (typeof elapsedMs === 'number' ? elapsedMs : 0) + retryElapsed;
+
+        if (retryResult.ok) {
+          var retryParse = model.parseEditSet(retryResult.text);
+          if (retryParse.ok && retryParse.editSet) {
+            var retryEditSet = retryParse.editSet;
+            var retryEmptyEdits = (retryEditSet.edits && retryEditSet.edits.length) || 0;
+            var retryEmptyNewFiles = (retryEditSet.newFiles && retryEditSet.newFiles.length) || 0;
+
+            if (retryEmptyEdits > 0 || retryEmptyNewFiles > 0) {
+              // Retry succeeded with non-empty proposal
+              modelResult = retryResult;
+              parseResult = retryParse;
+              editSet = retryEditSet;
+              contextLossProvider = retryResult.provider || currentProvider;
+              break;
+            }
+            // Still empty - check if it's also context loss
+            var retryReason = (retryEditSet && typeof retryEditSet.rationale === 'string' && retryEditSet.rationale !== '')
+              ? retryEditSet.rationale : null;
+            if (!isContextLossRationale(retryReason)) {
+              // Not context loss - treat as regular empty, fall through
+              modelResult = retryResult;
+              parseResult = retryParse;
+              editSet = retryEditSet;
+              emptyReason = retryReason;
+              break;
+            }
+            // Still context loss - continue switching
+            modelResult = retryResult;
+            parseResult = retryParse;
+            editSet = retryEditSet;
+          } else {
+            // Parse failed on retry - continue switching
+            modelResult = retryResult;
+          }
+        } else {
+          // Model call failed on retry - continue switching
+          modelResult = retryResult;
+        }
+      }
+
+      // If we did context loss retries and got a non-empty result, continue
+      // processing straight to the repeat-proposal check below.
+      var finalEmptyEdits = (editSet.edits && editSet.edits.length) || 0;
+      var finalEmptyNewFiles = (editSet.newFiles && editSet.newFiles.length) || 0;
+      if (finalEmptyEdits > 0 || finalEmptyNewFiles > 0) {
+        emptyEdits = finalEmptyEdits;
+        emptyNewFiles = finalEmptyNewFiles;
+      }
+    }
+
+    // If still empty after retries, reject with PROVIDER_CONTEXT_LOSS or EMPTY_PROPOSAL
+    if (emptyEdits === 0 && emptyNewFiles === 0) {
+      var rejectionCode = isContextLossRationale(emptyReason) ? 'PROVIDER_CONTEXT_LOSS' : 'EMPTY_PROPOSAL';
+      writeAttemptSummary(runId, attemptNumber, {
+        status: 'REJECTED',
+        codes: [rejectionCode],
+        providerSwitches: providerSwitches > 0 ? providerSwitches : null,
+        contextLossProvider: contextLossProvider,
+        contextLossReason: contextLossReason,
+        requestedPaths: [],
+        candidatePaths: candidateRelPaths(cloneDir, realCandidates),
+        tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+        promptChars: promptChars,
+        elapsedMs: elapsedMs,
+        model: modelResult.model,
+        requestedModel: modelResult.requestedModel,
+        provider: modelResult.provider
+      }, fs, now);
+
+      // Save rejected proposal for diagnostics
+      writeRejectedProposal(runId, attemptNumber, editSet, cloneDir, fs, now);
+
+      return {
+        status: 'REJECTED',
+        rejectionCodes: [rejectionCode],
+        requestedPaths: [],
+        validCandidatePaths: candidateRelPaths(cloneDir, realCandidates),
+        errors: ['[' + rejectionCode + '] ' + emptyMsg],
+        modelReason: emptyReason,
+        blocker: { code: rejectionCode, message: emptyMsg }
+      };
+    }
   }
 
   // Check for identical repeat proposal: if the same repairKind+edits+newFiles
@@ -1479,7 +1708,135 @@ async function proposeAndCheck(options) {
     // for deletions. Only the seriously-malformed edit set (INVALID_EDIT code
     // present) triggers the re-ask, not generic validation failures.
     var isInvalidEdit = vCodes.indexOf('INVALID_EDIT') !== -1;
-    if (isInvalidEdit) {
+    var isOldStringNotFound = vCodes.indexOf('OLDSTRING_NOT_FOUND') !== -1;
+
+    // OLDSTRING_NOT_FOUND: re-ask with the exact current text of the file so the
+    // model can copy oldString verbatim. Full file when <= 300 lines, otherwise
+    // the region around the closest match.
+    if (isOldStringNotFound) {
+      var osnfFiles = [];
+      (editSet.edits || []).forEach(function(e) {
+        if (!e || !e.path) return;
+        var absPath = path.join(cloneDir, e.path);
+        try {
+          if (fs.existsSync(absPath)) {
+            var osContent = fs.readFileSync(absPath, 'utf8');
+            var osLines = osContent.split('\n');
+            var osEntry = { path: e.path, oldString: e.oldString, lines: osLines, closestMatch: null };
+            if (osLines.length > 300 && typeof validator.findClosestMatch === 'function') {
+              osEntry.closestMatch = validator.findClosestMatch(osLines, e.oldString);
+            }
+            osnfFiles.push(osEntry);
+          }
+        } catch (err) { /* best effort */ }
+      });
+
+      var osnfPrompt = buildOldStringReAskPrompt(osnfFiles);
+      var reAskOSStart = (typeof modelNow === 'function' ? modelNow() : Date.now());
+      var reAskOSResult = await model.callModel({
+        prompt: osnfPrompt,
+        system: 'You are a bug fixer. Output only JSON.',
+        env: env,
+        budget: budget,
+        fetch: fetch
+      });
+      var reAskOSElapsed = (typeof modelNow === 'function' ? modelNow() : Date.now()) - reAskOSStart;
+
+      if (reAskOSResult.ok) {
+        var reAskOSParse = model.parseEditSet(reAskOSResult.text);
+        if (reAskOSParse.ok && reAskOSParse.editSet) {
+          var osReAskSet = reAskOSParse.editSet;
+          var osReAskValidation = validator.validate(osReAskSet, {
+            cloneDir: cloneDir,
+            requestedPaths: (osReAskSet.edits || []).map(function(e) { return e && e.path; }).concat((osReAskSet.newFiles || []).map(function(nf) { return nf && nf.path; })),
+            protectedPaths: protectedPaths,
+            mode: mode,
+            capabilities: { dependencyPatch: capabilities.dependencyPatch }
+          });
+          if (osReAskValidation.ok) {
+            // Re-ask fixed the oldString(s) - use it.
+            editSet = osReAskSet;
+            validationResult = osReAskValidation;
+            requestedPaths = [];
+            (editSet.edits || []).forEach(function(e) { if (e && e.path) requestedPaths.push(e.path); });
+            (editSet.newFiles || []).forEach(function(nf) { if (nf && nf.path) requestedPaths.push(nf.path); });
+            elapsedMs = (typeof elapsedMs === 'number' ? elapsedMs : 0) + reAskOSElapsed;
+            modelResult = reAskOSResult;
+          } else {
+            // Re-ask still had missing oldStrings - record REJECTED.
+            var osCombinedErrors = validationResult.errors.concat(osReAskValidation.errors || []);
+            var osCombinedCodes = extractErrorCodes(osCombinedErrors);
+            writeAttemptSummary(runId, attemptNumber, {
+              status: 'REJECTED',
+              codes: osCombinedCodes.length > 0 ? osCombinedCodes : ['OLDSTRING_NOT_FOUND'],
+              requestedPaths: requestedPaths,
+              candidatePaths: vValid,
+              tokensUsed: reAskOSResult.usage ? reAskOSResult.usage.total_tokens : null,
+              promptChars: osnfPrompt.length,
+              elapsedMs: reAskOSElapsed,
+              model: reAskOSResult.model,
+              requestedModel: reAskOSResult.requestedModel,
+              provider: reAskOSResult.provider
+            }, fs, now);
+            writeRejectedProposal(runId, attemptNumber, editSet, cloneDir, fs, now);
+            return {
+              status: 'REJECTED',
+              rejectionCodes: osCombinedCodes.length > 0 ? osCombinedCodes : ['OLDSTRING_NOT_FOUND'],
+              validCandidatePaths: vValid,
+              requestedPaths: requestedPaths,
+              errors: osCombinedErrors,
+              blocker: { code: 'VALIDATION_FAILED', message: osCombinedErrors.join('; ') }
+            };
+          }
+        } else {
+          // Re-ask parse failed - record REJECTED with the original codes.
+          writeAttemptSummary(runId, attemptNumber, {
+            status: 'REJECTED',
+            codes: vCodes,
+            requestedPaths: requestedPaths,
+            candidatePaths: vValid,
+            tokensUsed: reAskOSResult.usage ? reAskOSResult.usage.total_tokens : null,
+            promptChars: osnfPrompt.length,
+            elapsedMs: reAskOSElapsed,
+            model: reAskOSResult.model,
+            requestedModel: reAskOSResult.requestedModel,
+            provider: reAskOSResult.provider
+          }, fs, now);
+          writeRejectedProposal(runId, attemptNumber, editSet, cloneDir, fs, now);
+          return {
+            status: 'REJECTED',
+            rejectionCodes: vCodes,
+            validCandidatePaths: vValid,
+            requestedPaths: requestedPaths,
+            errors: validationResult.errors,
+            blocker: { code: 'VALIDATION_FAILED', message: validationResult.errors.join('; ') }
+          };
+        }
+      } else {
+        // Model blocked on the re-ask - record REJECTED with the original codes.
+        writeAttemptSummary(runId, attemptNumber, {
+          status: 'REJECTED',
+          codes: vCodes,
+          requestedPaths: requestedPaths,
+          candidatePaths: vValid,
+          tokensUsed: null,
+          promptChars: osnfPrompt.length,
+          elapsedMs: reAskOSElapsed,
+          model: reAskOSResult.model,
+          requestedModel: reAskOSResult.requestedModel,
+          provider: reAskOSResult.provider
+        }, fs, now);
+        writeRejectedProposal(runId, attemptNumber, editSet, cloneDir, fs, now);
+        return {
+          status: 'REJECTED',
+          rejectionCodes: vCodes,
+          validCandidatePaths: vValid,
+          requestedPaths: requestedPaths,
+          errors: validationResult.errors,
+          blocker: reAskOSResult.blocker || { code: 'VALIDATION_FAILED', message: validationResult.errors.join('; ') }
+        };
+      }
+    } else if (isInvalidEdit) {
       var invalidEditPrompt = 'Your previous edit set was rejected because at least one edit is missing "newString".\n\n' +
         'Every edit MUST have both "oldString" and "newString". For a deletion, set "newString" to an empty string "" (that is still a required field). Example:\n' +
         '{ "path": "src/x.js", "oldString": "delete me", "newString": "" }\n\n' +
@@ -1600,6 +1957,8 @@ async function proposeAndCheck(options) {
         requestedModel: modelResult.requestedModel,
         provider: modelResult.provider
       }, fs, now);
+      // Save the rejected proposal so oldString mismatches are diagnosable.
+      writeRejectedProposal(runId, attemptNumber, editSet, cloneDir, fs, now);
       return {
         status: 'REJECTED',
         rejectionCodes: vCodes,

@@ -93,12 +93,37 @@ function applyEdit(filePath, oldString, newString) {
   }
 
   var idx = oldContent.indexOf(oldString);
-  if (idx === -1) {
-    return { success: false, error: 'oldString not found in file: ' + filePath };
+  if (idx !== -1) {
+    // Preserve existing OLDSTRING_AMBIGUOUS semantics on exact matches.
+    var nextIdx = oldContent.indexOf(oldString, idx + 1);
+    if (nextIdx !== -1) {
+      return { success: false, error: 'oldString is ambiguous in file: ' + filePath };
+    }
+    return applyEditAt(oldContent, idx, oldString.length, newString, filePath);
   }
 
+  // No exact match: accept a UNIQUE match after normalising whitespace
+  // (indentation, trailing spaces, line endings). If the normalised match is
+  // not unique, reject as before.
+  var normMatches = findNormalisedMatchPositions(oldContent, oldString);
+  if (normMatches.length === 1) {
+    var m = normMatches[0];
+    var oldBlock = oldContent.substring(m.start, m.end);
+    var oldStart = oldContent.indexOf(oldBlock);
+    if (oldStart !== -1) {
+      return applyEditAt(oldContent, oldStart, oldBlock.length, newString, filePath);
+    }
+  }
+  if (normMatches.length > 1) {
+    return { success: false, error: 'oldString is ambiguous after normalising whitespace in file: ' + filePath };
+  }
+
+  return { success: false, error: 'oldString not found in file: ' + filePath };
+}
+
+function applyEditAt(oldContent, idx, oldStringLength, newString, filePath) {
   var before = oldContent.substring(0, idx);
-  var after = oldContent.substring(idx + oldString.length);
+  var after = oldContent.substring(idx + oldStringLength);
   var newContent = before + newString + after;
 
   if (oldContent === newContent) {
@@ -128,6 +153,47 @@ function applyEdit(filePath, oldString, newString) {
     oldContent: oldContent,
     newContent: newContent
   };
+}
+
+function normaliseLineForMatch(line) {
+  return String(line).replace(/\s+$/g, '').replace(/^\s+/, '');
+}
+
+/**
+ * Find every position in oldContent where oldString matches after normalising
+ * whitespace per line (leading indentation, trailing spaces, line endings).
+ * Returns an array of { start, end } character offsets in oldContent; empty
+ * when no match, >1 when the normalised match is not unique.
+ */
+function findNormalisedMatchPositions(oldContent, oldString) {
+  if (typeof oldString !== 'string' || oldString === '') return [];
+  var contentLines = String(oldContent).split(/\r\n|\r|\n/);
+  var targetLines = String(oldString).split(/\r\n|\r|\n/).map(normaliseLineForMatch);
+  if (targetLines.length === 0 || targetLines.length > contentLines.length) return [];
+
+  var lineStarts = [0];
+  for (var i = 0; i < String(oldContent).length - 1; i++) {
+    if (String(oldContent).charAt(i) === '\n') lineStarts.push(i + 1);
+  }
+
+  var matches = [];
+  for (var si = 0; si + targetLines.length <= contentLines.length; si++) {
+    var ok = true;
+    for (var j = 0; j < targetLines.length; j++) {
+      if (normaliseLineForMatch(contentLines[si + j]) !== targetLines[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      var startOffset = lineStarts[si];
+      var endOffset = si + targetLines.length < lineStarts.length
+        ? lineStarts[si + targetLines.length]
+        : String(oldContent).length;
+      matches.push({ start: startOffset, end: endOffset });
+    }
+  }
+  return matches;
 }
 
 function applySourceEdit(editSet, cloneDir) {
