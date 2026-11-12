@@ -204,7 +204,7 @@ test('EMPTY_PROPOSAL without context-loss rationale is NOT retried and rejected 
   var dir = createTempProject({ 'src/x.js': 'old content\n' });
   var deps = baseFakeDeps();
   var responses = [
-    { ok: true, text: JSON.stringify({ repairKind: 'source-edit', rationale: 'the fix is already applied elsewhere', edits: [], newFiles: [] }), usage: { total_tokens: 5 }, provider: 'soloProvider' }
+    { ok: true, text: JSON.stringify({ repairKind: 'source-edit', rationale: 'the fix is already applied elsewhere', edits: [], newFiles: [] }), usage: { total_tokens: 2000 }, provider: 'soloProvider' }
   ];
   deps._modelResponses = responses;
 
@@ -369,4 +369,111 @@ test('modelClient: REPAIR_PROVIDER_ORDER maps to provider.order and provider.ign
     assert.deepStrictEqual(body.provider.order, ['provider-b', 'provider-a']);
     assert.deepStrictEqual(body.provider.ignore, ['badProvider']);
   });
+});
+
+// =============================================================================
+// 5. tokens/time rule: tokens < 1500 AND elapsedMs < 6000 = context loss regardless of rationale
+// =============================================================================
+
+test('context-loss: tokens<1500 + elapsed<6000 triggers PROVIDER_CONTEXT_LOSS even with substantive rationale', async function() {
+  var dir = createTempProject({ 'src/x.js': 'old content\n' });
+  var deps = baseFakeDeps();
+  // Rationale is substantive but tokens/time indicate fast empty response = context loss
+  var responses = [
+    { ok: true, text: JSON.stringify({ repairKind: 'source-edit', rationale: 'the fix is already applied elsewhere', edits: [], newFiles: [] }), usage: { total_tokens: 800 }, provider: 'fastEmptyProvider' }
+  ];
+  deps._modelResponses = responses;
+  var env = {};
+
+  var result = await runPropose({ deps: deps, cloneDir: dir, env: env });
+
+  assert.strictEqual(result.status, 'REJECTED', 'fast empty response must be REJECTED');
+  assert.strictEqual(result.rejectionCodes[0], 'PROVIDER_CONTEXT_LOSS', 'fast empty with tokens<1500+elapsed<6000 must be PROVIDER_CONTEXT_LOSS');
+  assert.ok(env.provider && Array.isArray(env.provider.ignore), 'provider must be added to ignore list');
+  assert.ok(env.provider.ignore.indexOf('fastEmptyProvider') !== -1, 'fast-empty provider must be ignored');
+});
+
+test('context-loss: tokens>=1500 with substantive rationale is NOT context loss', async function() {
+  var dir = createTempProject({ 'src/x.js': 'old content\n' });
+  var deps = baseFakeDeps();
+  // tokens >= 1500 means model was working properly - should be EMPTY_PROPOSAL not context loss
+  var responses = [
+    { ok: true, text: JSON.stringify({ repairKind: 'source-edit', rationale: 'the fix is already applied elsewhere', edits: [], newFiles: [] }), usage: { total_tokens: 2000 }, provider: 'slowProvider' }
+  ];
+  deps._modelResponses = responses;
+  var env = {};
+
+  var result = await runPropose({ deps: deps, cloneDir: dir, env: env });
+
+  assert.strictEqual(result.status, 'REJECTED', 'non-context-loss empty must be REJECTED');
+  assert.strictEqual(result.rejectionCodes[0], 'EMPTY_PROPOSAL', 'substantive response with enough tokens must be EMPTY_PROPOSAL, not PROVIDER_CONTEXT_LOSS');
+  assert.ok(!env.provider || !env.provider.ignore || env.provider.ignore.indexOf('slowProvider') === -1, 'non-context-loss provider must NOT be ignored');
+});
+
+// =============================================================================
+// 6. IMAGE_BUILD_FAILED re-ask includes previously proposed editSet
+// =============================================================================
+
+test('IMAGE_BUILD_FAILED: re-ask prompt is built with previous editSet when checks fail', async function() {
+  var dir = createTempProject({ 'src/x.js': 'old\n' });
+  var runId = 'run-imgfail-' + Date.now();
+  var deps = baseFakeDeps();
+  deps._prompts = [];
+
+  var checkCallCount = 0;
+  deps.verifier = {
+    runChecks: function() {
+      deps._callCount.runChecks = (deps._callCount.runChecks || 0) + 1;
+      checkCallCount++;
+      if (checkCallCount === 1) {
+        return Promise.resolve({
+          ok: false,
+          blocker: { code: 'IMAGE_BUILD_FAILED', message: 'IMAGE_BUILD_FAILED' },
+          buildError: 'tsc error TS2305',
+          results: []
+        });
+      }
+      return Promise.resolve({ ok: true, results: [{ script: 'test', success: true, exitCode: 0, stdout: 'ok', stderr: '' }] });
+    }
+  };
+
+  var responses = [
+    { ok: true, text: JSON.stringify({ repairKind: 'source-edit', rationale: 'fix', edits: [{ path: 'src/x.js', oldString: 'old', newString: 'new' }], newFiles: [] }), usage: { total_tokens: 10 }, provider: 'pX' }
+  ];
+  deps._modelResponses = responses;
+
+  var env = {};
+  var result = await runPropose({ deps: deps, cloneDir: dir, env: env, runId: runId });
+
+  // With fallback mock response (empty edits), re-ask cannot fix - returns CHECKS_FAILED
+  assert.strictEqual(result.status, 'CHECKS_FAILED', 'IMAGE_BUILD_FAILED re-ask with empty fallback edits returns CHECKS_FAILED');
+  assert.strictEqual(checkCallCount, 2, 'verifier.runChecks should be called twice (initial + re-ask)');
+});
+
+// =============================================================================
+// 7. exports section: candidate inside node_modules adds package.json/d.ts info to prompt
+// =============================================================================
+
+test('buildAvailableExportsSection: node_modules candidate includes package.json exports in prompt', async function() {
+  var dir = createTempProject({});
+  // Create nested node_modules/@fake/pkg structure with dist subdirectory
+  fs.mkdirSync(path.join(dir, 'node_modules', '@fake', 'pkg', 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'node_modules', '@fake', 'pkg', 'package.json'), JSON.stringify({
+    name: '@fake/pkg',
+    main: './dist/index.js',
+    types: './dist/index.d.ts',
+    exports: { '.': './dist/index.js', './extra': './dist/extra.js' }
+  }), 'utf8');
+  fs.writeFileSync(path.join(dir, 'node_modules', '@fake', 'pkg', 'dist', 'index.d.ts'), 'export declare const foo: string;\n', 'utf8');
+
+  var proposeAndCheck = require('../src/repair/proposeAndCheck');
+  var candidates = [{ file: path.join(dir, 'node_modules', '@fake/pkg', 'dist', 'index.js'), line: 1, snippet: [{ line: 'export const foo' }] }];
+
+  var section = proposeAndCheck.buildAvailableExportsSection({ cloneDir: dir, candidates: candidates });
+
+  assert.ok(section && section.length > 0, 'exports section must not be empty for node_modules candidate');
+  assert.ok(section.indexOf('@fake/pkg') !== -1, 'section must include package name');
+  assert.ok(section.indexOf('main:') !== -1 || section.indexOf('types:') !== -1, 'section must include package.json fields');
+  var sectionLower = section.toLowerCase();
+  assert.ok(sectionLower.indexOf('use only the symbols') !== -1 || sectionLower.indexOf('never guess') !== -1, 'section must include import instruction');
 });

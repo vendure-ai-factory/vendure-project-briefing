@@ -1510,7 +1510,8 @@ async function proposeAttempt(cfg, adapters, state, located, attemptNumber, budg
           checks: propose.checks || null,
           errors: [buildBlocker.message || 'IMAGE_BUILD_FAILED'],
           buildError: buildErrorContent || (buildBlocker.message || 'IMAGE_BUILD_FAILED'),
-          verifyStatus: null
+          verifyStatus: null,
+          editSet: propose.editSet || null
         }
       };
     }

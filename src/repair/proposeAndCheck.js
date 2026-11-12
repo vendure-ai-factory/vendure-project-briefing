@@ -182,6 +182,15 @@ function formatPreviousAttempts(previousAttempts) {
       for (var bl = 0; bl < buildLines.length && bl < 60; bl++) {
         lines.push('    ' + buildLines[bl].substring(0, 300));
       }
+      // Include the previously proposed edit set so the model can fix its own edits
+      if (attempt.editSet) {
+        var editSetJson = JSON.stringify(attempt.editSet, null, 2);
+        lines.push('  previously proposed edit set (fix these edits):');
+        var editSetLines = editSetJson.split('\n');
+        for (var el = 0; el < editSetLines.length && el < 100; el++) {
+          lines.push('    ' + editSetLines[el].substring(0, 300));
+        }
+      }
     }
     // Include closest match context for OLDSTRING_NOT_FOUND rejections
     if (attempt.rejectionCodes && attempt.rejectionCodes.indexOf('OLDSTRING_NOT_FOUND') !== -1 && attempt.closestMatch) {
@@ -342,6 +351,114 @@ function buildEditGuidance(opts) {
     }
   }
 
+  // Add available exports section for node_modules dependencies
+  var exportsSection = buildAvailableExportsSection({ cloneDir: cloneDir, candidates: candidates });
+  if (exportsSection) {
+    lines.push(exportsSection);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Build the "available exports" section for candidates that live inside
+ * node_modules/<pkg>/. This tells the model what symbols are actually
+ * exported so it imports only listed symbols or uses existing deep import paths,
+ * never guessing export names.
+ *
+ * For each unique package found in candidates, reads package.json to get
+ * main/types/exports and the entry .d.ts (max 4 KB).
+ */
+function buildAvailableExportsSection(opts) {
+  opts = opts || {};
+  var cloneDir = opts.cloneDir || '';
+  var candidates = opts.candidates || [];
+
+  // Find unique packages from node_modules candidates
+  var pkgSet = {};
+  for (var i = 0; i < candidates.length; i++) {
+    var c = candidates[i];
+    if (!c || !c.file) continue;
+    var rel = normRelPath(c.file, cloneDir, true);
+    // node_modules/<pkg>/... pattern
+    var match = /^node_modules\/((?:@[^/]+\/)?[^/]+)\//.exec(rel);
+    if (match) {
+      pkgSet[match[1]] = rel;
+    }
+  }
+  var pkgs = Object.keys(pkgSet);
+  if (pkgs.length === 0) return '';
+
+  var lines = [];
+  lines.push('');
+  lines.push('### Available Exports from Dependencies');
+  lines.push('When importing from a package in node_modules, use only the symbols');
+  lines.push('listed below or an existing deep import path. Never guess export names.');
+  lines.push('');
+
+  for (var pi = 0; pi < pkgs.length; pi++) {
+    var pkgName = pkgs[pi];
+    var sampleRel = pkgSet[pkgName];
+    // Get package.json path
+    var pkgJsonPath = path.join(cloneDir, 'node_modules', pkgName, 'package.json');
+    var pkgJsonContent = null;
+    try {
+      if (fs.existsSync(pkgJsonPath)) {
+        pkgJsonContent = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+      }
+    } catch (e) { /* ignore */ }
+
+    lines.push('#### Package: ' + pkgName);
+    lines.push('');
+
+    // Expose main/types/exports from package.json
+    var main = pkgJsonContent && pkgJsonContent.main ? pkgJsonContent.main : null;
+    var types = pkgJsonContent && pkgJsonContent.types ? pkgJsonContent.types : null;
+    var exports = pkgJsonContent && pkgJsonContent.exports ? pkgJsonContent.exports : null;
+    if (main || types || exports) {
+      lines.push('package.json fields:');
+      if (main) lines.push('  main: ' + main);
+      if (types) lines.push('  types: ' + types);
+      if (exports) {
+        lines.push('  exports:');
+        var exportsStr = JSON.stringify(exports, null, 2);
+        var exportLines = exportsStr.split('\n');
+        for (var eli = 0; eli < exportLines.length && eli < 30; eli++) {
+          lines.push('    ' + exportLines[eli]);
+        }
+      }
+      lines.push('');
+    }
+
+    // Read entry .d.ts file (max 4 KB)
+    var dtsPath = null;
+    if (types) {
+      dtsPath = path.join(cloneDir, 'node_modules', pkgName, types);
+    } else if (main) {
+      // Try to infer .d.ts from .js main file
+      var dtsGuess = main.replace(/\.js$/, '.d.ts');
+      var guessPath = path.join(cloneDir, 'node_modules', pkgName, dtsGuess);
+      if (fs.existsSync(guessPath)) dtsPath = guessPath;
+    }
+    if (dtsPath && fs.existsSync(dtsPath)) {
+      try {
+        var stat = fs.statSync(dtsPath);
+        if (stat.size > 0) {
+          var MAX_DTS = 4096;
+          var dtsContent = fs.readFileSync(dtsPath, 'utf8');
+          if (dtsContent.length > MAX_DTS) {
+            dtsContent = dtsContent.substring(0, MAX_DTS) + '\n... (truncated)';
+          }
+          lines.push('Entry .d.ts: ' + dtsPath.replace(/\\/g, '/'));
+          lines.push('```');
+          lines.push(dtsContent);
+          lines.push('```');
+          lines.push('');
+        }
+      } catch (e) { /* best-effort */ }
+    }
+  }
+
   return lines.join('\n');
 }
 
@@ -456,7 +573,7 @@ function redactEditSet(editSet) {
  * (did not receive the prompt content, bug description, or edit context).
  * Returns true when the rationale mentions missing context/files/code.
  */
-function isContextLossRationale(rationale) {
+function isContextLossRationale(rationale, opts) {
   if (!rationale || typeof rationale !== 'string') return false;
   var lower = rationale.toLowerCase();
   var patterns = [
@@ -475,10 +592,27 @@ function isContextLossRationale(rationale) {
     'no context',
     'no candidates',
     'no snippet',
-    'no code'
+    'no code',
+    // Additional trigger words for run-26 issue: rationale contained
+    // "No specific bug context or file contents were provided"
+    'file contents',
+    'context missing',
+    'bug context',
+    'context or file',
+    // Broader trigger words from issue: "context, provided, missing, file contents, bug"
+    'context',
+    'file contents were'
   ];
   for (var i = 0; i < patterns.length; i++) {
     if (lower.indexOf(patterns[i]) !== -1) return true;
+  }
+  // Fast empty response (tokens < 1500, elapsed < 6000ms) indicates provider context loss
+  // regardless of rationale wording. This handles cases where the model had insufficient
+  // context to formulate a proper response.
+  if (opts && typeof opts.tokens === 'number' && typeof opts.elapsedMs === 'number') {
+    if (opts.tokens < 1500 && opts.elapsedMs < 6000) {
+      return true;
+    }
   }
   return false;
 }
@@ -1508,7 +1642,7 @@ async function proposeAndCheck(options) {
     var providerSwitches = 0;
     var contextLossProvider = null;
     var contextLossReason = null;
-    if (isContextLossRationale(emptyReason)) {
+    if (isContextLossRationale(emptyReason, { tokens: modelResult.usage ? modelResult.usage.total_tokens : null, elapsedMs: elapsedMs })) {
       // Initialize provider tracking in env
       env.provider = env.provider || { ignore: [], order: null };
       var MAX_PROVIDER_SWITCHES = 3;
@@ -1551,12 +1685,17 @@ async function proposeAndCheck(options) {
               parseResult = retryParse;
               editSet = retryEditSet;
               contextLossProvider = retryResult.provider || currentProvider;
+              // Prefer the provider that last produced a valid proposal for future attempts
+              var validProvider = retryResult.provider || currentProvider;
+              if (validProvider) {
+                env.provider.order = [validProvider];
+              }
               break;
             }
             // Still empty - check if it's also context loss
             var retryReason = (retryEditSet && typeof retryEditSet.rationale === 'string' && retryEditSet.rationale !== '')
               ? retryEditSet.rationale : null;
-            if (!isContextLossRationale(retryReason)) {
+            if (!isContextLossRationale(retryReason, { tokens: retryResult.usage ? retryResult.usage.total_tokens : null, elapsedMs: retryElapsed })) {
               // Not context loss - treat as regular empty, fall through
               modelResult = retryResult;
               parseResult = retryParse;
@@ -1590,7 +1729,7 @@ async function proposeAndCheck(options) {
 
     // If still empty after retries, reject with PROVIDER_CONTEXT_LOSS or EMPTY_PROPOSAL
     if (emptyEdits === 0 && emptyNewFiles === 0) {
-      var rejectionCode = isContextLossRationale(emptyReason) ? 'PROVIDER_CONTEXT_LOSS' : 'EMPTY_PROPOSAL';
+      var rejectionCode = isContextLossRationale(emptyReason, { tokens: modelResult.usage ? modelResult.usage.total_tokens : null, elapsedMs: elapsedMs }) ? 'PROVIDER_CONTEXT_LOSS' : 'EMPTY_PROPOSAL';
       writeAttemptSummary(runId, attemptNumber, {
         status: 'REJECTED',
         codes: [rejectionCode],
@@ -2085,6 +2224,114 @@ async function proposeAndCheck(options) {
   if (!checkResult.ok) {
     var checkStatus = killedWithNoOutput ? 'CHECKS_ERROR' : 'CHECKS_FAILED';
     var checkCodes = killedWithNoOutput ? ['CHECKS_ERROR'] : ['CHECKS_FAILED'];
+
+    // IMAGE_BUILD_FAILED re-ask: include previous editSet so model can fix its own edits
+    if (checkResult.blocker && checkResult.blocker.code === 'IMAGE_BUILD_FAILED') {
+      var imgReAskAttempts = [{
+        buildError: checkResult.blocker.message || checkResult.buildError || 'IMAGE_BUILD_FAILED',
+        editSet: editSet
+      }];
+      var imgReAskPrompt = buildPrompt(finding, candidates, imgReAskAttempts, {
+        domain: finding.domain,
+        capabilities: { dependencyPatch: capabilities.dependencyPatch, reason: capabilities.reason },
+        dependencyInfo: dependencyInfo,
+        cloneDir: cloneDir,
+        candidates: realCandidates
+      });
+
+      var imgReAskStart = (typeof modelNow === 'function' ? modelNow() : Date.now());
+      var imgReAskResult = await model.callModel({
+        prompt: imgReAskPrompt,
+        system: 'You are a bug fixer. Output only JSON.',
+        env: env,
+        budget: budget,
+        fetch: fetch
+      });
+      var imgReAskElapsed = (typeof modelNow === 'function' ? modelNow() : Date.now()) - imgReAskStart;
+      elapsedMs = (typeof elapsedMs === 'number' ? elapsedMs : 0) + imgReAskElapsed;
+
+      if (imgReAskResult.ok) {
+        var imgReAskParse = model.parseEditSet(imgReAskResult.text);
+        if (imgReAskParse.ok && imgReAskParse.editSet) {
+          var imgReAskEditSet = imgReAskParse.editSet;
+          var imgReAskValidation = validator.validate(imgReAskEditSet, {
+            cloneDir: cloneDir,
+            requestedPaths: (imgReAskEditSet.edits || []).map(function(e) { return e && e.path; }).concat((imgReAskEditSet.newFiles || []).map(function(nf) { return nf && nf.path; })),
+            protectedPaths: protectedPaths,
+            mode: mode,
+            capabilities: { dependencyPatch: capabilities.dependencyPatch }
+          });
+          if (imgReAskValidation.ok) {
+            // Re-ask produced valid corrected edits - use them
+            editSet = imgReAskEditSet;
+            validationResult = imgReAskValidation;
+            requestedPaths = [];
+            (editSet.edits || []).forEach(function(e) { if (e && e.path) requestedPaths.push(e.path); });
+            (editSet.newFiles || []).forEach(function(nf) { if (nf && nf.path) requestedPaths.push(nf.path); });
+            modelResult = imgReAskResult;
+            promptChars = imgReAskPrompt.length;
+
+            // Apply corrected edits and re-check
+            var imgReApplyResult = applier.apply(editSet, {
+              cloneDir: cloneDir,
+              requestedPaths: requestedPaths,
+              dryRun: false
+            });
+            if (imgReApplyResult.ok) {
+              // Re-run checks with corrected edits
+              var imgReCheckResult = await verifier.runChecks(cloneDir, checkOptions);
+              if (imgReCheckResult.ok) {
+                // Checks pass on re-ask - proceed to commit
+                checkResult = imgReCheckResult;
+              } else {
+                // Checks still fail after re-ask - record CHECKS_FAILED
+                writeAttemptSummary(runId, attemptNumber, {
+                  status: 'CHECKS_FAILED',
+                  codes: ['CHECKS_FAILED'],
+                  requestedPaths: requestedPaths,
+                  candidatePaths: (candidates || []).map(function(c) { return c.file; }),
+                  tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+                  promptChars: promptChars,
+                  elapsedMs: elapsedMs,
+                  checks: { results: imgReCheckResult.results },
+                  stage: 'checks-re-ask'
+                }, fs, now);
+                if (mode === 'target') {
+                  applier.restoreClone(cloneDir, runCommand);
+                }
+                return {
+                  status: 'CHECKS_FAILED',
+                  checks: { results: imgReCheckResult.results },
+                  errors: ['checks failed after re-ask']
+                };
+              }
+            } else {
+              // Apply failed
+              writeAttemptSummary(runId, attemptNumber, {
+                status: 'CHECKS_FAILED',
+                codes: ['CHECKS_FAILED'],
+                requestedPaths: requestedPaths,
+                candidatePaths: (candidates || []).map(function(c) { return c.file; }),
+                tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
+                promptChars: promptChars,
+                elapsedMs: elapsedMs,
+                checks: { results: checkResult.results },
+                stage: 'checks-re-ask-apply-failed'
+              }, fs, now);
+              if (mode === 'target') {
+                applier.restoreClone(cloneDir, runCommand);
+              }
+              return {
+                status: 'CHECKS_FAILED',
+                checks: { results: checkResult.results },
+                errors: ['apply failed after re-ask: ' + (imgReApplyResult.blocker && imgReApplyResult.blocker.message || 'unknown')]
+              };
+            }
+          }
+        }
+      }
+    }
+
     writeAttemptSummary(runId, attemptNumber, {
       status: checkStatus,
       codes: checkCodes,
@@ -2270,6 +2517,7 @@ module.exports = {
   proposeAndCheck: proposeAndCheck,
   stackToString: stackToString,
   buildPrompt: buildPrompt,
+  buildAvailableExportsSection: buildAvailableExportsSection,
   detectDependencyPatchCapability: detectDependencyPatchCapability,
   queryDependencyVersions: queryDependencyVersions,
   candidateRelPaths: candidateRelPaths,

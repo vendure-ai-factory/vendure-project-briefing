@@ -383,8 +383,53 @@ async function runChecks(cloneDir, options) {
   // Unlike the package.json script loop above which runs user-defined build/test
   // scripts, this directly checks for TypeScript compilation errors that would
   // cause IMAGE_BUILD_FAILED even if the build script succeeds.
+  //
+  // If tsc cannot be resolved from node_modules/.bin/tsc or node_modules/typescript/bin/tsc,
+  // attempt to install typescript first (from package.json dep or latest 5.x), then retry.
+  // Skip npm install if node_modules/.bin is empty (test fixture, not real install).
   var tscBin = path.join(cloneDir, 'node_modules', '.bin', 'tsc');
-  if (hasNodeModules && fs.existsSync(tscBin)) {
+  var tscInstallLog = '';
+  // If tsc cannot be resolved from node_modules/.bin/tsc or
+  // node_modules/typescript/bin/tsc and node_modules is a real populated install,
+  // attempt to install typescript (version from package.json or latest 5.x).
+  var tscAvailable = hasNodeModules && fs.existsSync(tscBin);
+  if (!tscAvailable && hasNodeModules) {
+    var tscAltBin = path.join(cloneDir, 'node_modules', 'typescript', 'bin', 'tsc');
+    if (fs.existsSync(tscAltBin)) {
+      tscBin = tscAltBin;
+      tscAvailable = true;
+    } else {
+      // Only install when node_modules/.bin looks like a real install (non-empty);
+      // an empty node_modules (test fixture) should not trigger a network install.
+      var nodeModulesBin = path.join(cloneDir, 'node_modules', '.bin');
+      var binHasContent = fs.existsSync(nodeModulesBin) && fs.readdirSync(nodeModulesBin).length > 0;
+      if (binHasContent) {
+        var tscVersion = null;
+        try {
+          var pkg = JSON.parse(fs.readFileSync(path.join(cloneDir, 'package.json'), 'utf8'));
+          tscVersion = (pkg.devDependencies && pkg.devDependencies.typescript)
+            ? String(pkg.devDependencies.typescript).replace(/^[\^~>=<]+/, '')
+            : (pkg.dependencies && pkg.dependencies.typescript)
+              ? String(pkg.dependencies.typescript).replace(/^[\^~>=<]+/, '')
+              : null;
+        } catch (e) { /* no package.json */ }
+        var installVersion = tscVersion || 'latest';
+        var npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+        tscInstallLog = 'tsc not found at ' + tscBin + ', installing typescript@' + installVersion + '...';
+        var npmResult = await execCommand(npmCmd, ['install', '--no-save', '--ignore-scripts', 'typescript@' + installVersion], {
+          cwd: cloneDir,
+          timeout: 120000
+        });
+        if (npmResult.exitCode === 0 && fs.existsSync(tscBin)) {
+          tscInstallLog += ' success';
+          tscAvailable = true;
+        } else {
+          tscInstallLog += ' failed (exit ' + npmResult.exitCode + '): ' + (npmResult.stderr || '').substring(0, 200);
+        }
+      }
+    }
+  }
+  if (tscAvailable) {
     var tscResult = await execCommand(tscBin, ['--noEmit'], {
       cwd: cloneDir,
       timeout: timeout
@@ -410,7 +455,8 @@ async function runChecks(cloneDir, options) {
       error: tscResult.error ? redactSecrets(tscResult.error, collectEnvSecrets()) : null,
       cwd: cloneDir,
       hasNodeModules: hasNodeModules,
-      signal: tscResult.signal || null
+      signal: tscResult.signal || null,
+      installLog: tscInstallLog || null
     });
   }
 
