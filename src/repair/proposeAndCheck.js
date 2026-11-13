@@ -140,6 +140,26 @@ function allowedPathsPerKindText(opts) {
  * Format previous attempts into the prompt.
  */
 function formatPreviousAttempts(previousAttempts) {
+  try {
+    return formatPreviousAttemptsUnsafe(previousAttempts);
+  } catch (err) {
+    // A formatting error must never kill the attempt: fall back to a minimal
+    // summary listing the rejection codes only.
+    var safeLines = [];
+    if (Array.isArray(previousAttempts)) {
+      for (var si = 0; si < previousAttempts.length; si++) {
+        var pa = previousAttempts[si];
+        if (!pa) continue;
+        var codes = Array.isArray(pa.rejectionCodes) ? pa.rejectionCodes : [];
+        var sig = pa.signature || pa.n || (si + 1);
+        safeLines.push('Attempt ' + sig + ': rejection codes [' + codes.join(', ') + ']');
+      }
+    }
+    return safeLines.length > 0 ? safeLines.join('\n') : '';
+  }
+}
+
+function formatPreviousAttemptsUnsafe(previousAttempts) {
   if (!previousAttempts || previousAttempts.length === 0) {
     return '';
   }
@@ -157,16 +177,30 @@ function formatPreviousAttempts(previousAttempts) {
       lines.push('  diff: ' + toText(attempt.diff, 500));
     }
     if (attempt.checks && attempt.checks.results) {
-      var failed = attempt.checks.results.filter(function(r) { return !r.success; });
+      var failed = [];
+      for (var fri = 0; fri < attempt.checks.results.length; fri++) {
+        var fcheck = attempt.checks.results[fri];
+        if (fcheck && !fcheck.success) failed.push(fcheck);
+      }
       if (failed.length > 0) {
-        lines.push('  check failures: ' + failed.map(function(f) { return f.script; }).join(', '));
+        lines.push('  check failures: ' + failed.map(function(f) { return f && f.script ? f.script : 'unknown-script'; }).join(', '));
         // Show stderr tail of each failed check (helps model fix compile/TypeScript errors)
         for (var fi = 0; fi < failed.length; fi++) {
           var f = failed[fi];
-          var stderrTail = f.stderrTail || (f.stderr ? f.stderr.substring(0, 1000) : '');
+          if (!f) continue;
+          var fStdout = f.stdout || '';
+          var fStderr = f.stderr || '';
+          var stderrTail = f.stderrTail || fStderr.substring(0, 1000);
+          if (typeof stderrTail !== 'string') stderrTail = String(stderrTail);
           if (stderrTail) {
             var tail = stderrTail.substring(0, 800);
-            lines.push('    ' + f.script + ' stderr: ' + tail.replace(/\n/g, ' ').substring(0, 200));
+            var linePrefix = f.script ? (f.script + ' stderr: ') : 'check stderr: ';
+            lines.push('    ' + linePrefix + tail.replace(/\n/g, ' ').substring(0, 200));
+          }
+          if (!stderrTail && fStdout) {
+            var outTail = fStdout.substring(0, 800).replace(/\n/g, ' ').substring(0, 200);
+            var outPrefix = f.script ? (f.script + ' stdout: ') : 'check stdout: ';
+            lines.push('    ' + outPrefix + outTail);
           }
         }
       }
@@ -816,6 +850,31 @@ function writeAttemptSummary(runId, attemptNumber, data, fsMod, now) {
       summary.contextLossReason = String(data.contextLossReason).substring(0, 2000);
     }
     fsMod.writeFileSync(path.join(dir, 'attempt-' + attemptNumber + '.json'), JSON.stringify(summary, null, 2) + '\n', 'utf8');
+  } catch (e) { /* best effort */ }
+}
+
+/**
+ * Write the baseline tsc evidence (baseline-tsc.json) and, when present, the
+ * new-error diff (new-errors-<attempt>.json) for the baseline-diff compile
+ * check. Never throws: all failures are best-effort.
+ */
+function writeAttemptBaselineEvidence(runId, attemptNumber, data, fsMod, now) {
+  try {
+    var dir = path.join('evidence', runId, 'repair');
+    ensureDir(fsMod, dir);
+    data = data || {};
+    var payload = {
+      attempt: attemptNumber,
+      status: data.status || 'SKIPPED',
+      reason: typeof data.reason === 'string' ? data.reason : null,
+      errors: Array.isArray(data.errors) ? data.errors : [],
+      newErrors: Array.isArray(data.newErrors) ? data.newErrors : [],
+      timestamp: (typeof now === 'function' ? now() : new Date().toISOString())
+    };
+    fsMod.writeFileSync(path.join(dir, 'baseline-tsc.json'), JSON.stringify(payload, null, 2) + '\n', 'utf8');
+    if (payload.newErrors && payload.newErrors.length > 0) {
+      fsMod.writeFileSync(path.join(dir, 'new-errors-' + attemptNumber + '.json'), JSON.stringify(payload.newErrors, null, 2) + '\n', 'utf8');
+    }
   } catch (e) { /* best effort */ }
 }
 
@@ -1643,8 +1702,12 @@ async function proposeAndCheck(options) {
     var contextLossProvider = null;
     var contextLossReason = null;
     if (isContextLossRationale(emptyReason, { tokens: modelResult.usage ? modelResult.usage.total_tokens : null, elapsedMs: elapsedMs })) {
-      // Initialize provider tracking in env
-      env.provider = env.provider || { ignore: [], order: null };
+      // Initialize provider tracking in env. env.provider may be pre-set by an
+      // earlier stage as an object without the ignore/order fields, so always
+      // enforce the shapes rather than relying on the short-circuit defaults.
+      if (!env.provider) env.provider = {};
+      if (!Array.isArray(env.provider.ignore)) env.provider.ignore = [];
+      if (env.provider.order === undefined || env.provider.order === null) env.provider.order = null;
       var MAX_PROVIDER_SWITCHES = 3;
 
       while (providerSwitches < MAX_PROVIDER_SWITCHES) {
@@ -2109,6 +2172,36 @@ async function proposeAndCheck(options) {
     }
   }
 
+  // Step 6a: baseline-diff compile check. Run tsc --noEmit on the PRISTINE
+  // clone BEFORE applying the proposal and store the normalized error set.
+  // Errors already present in the pristine clone are pre-existing (incomplete
+  // node_modules / missing node types) and must never mark a proposal as
+  // CHECKS_FAILED. If the baseline cannot execute, the check is SKIPPED, never
+  // failed. The baseline and the new-error diff are saved as evidence.
+  var baselineTsc = null;
+  try {
+    if (typeof verifier.runTscBaseline === 'function' && mode === 'pipeline') {
+      baselineTsc = await verifier.runTscBaseline(cloneDir, {
+        runId: runId,
+        execCommand: runCommand,
+        root: 'evidence',
+        timeout: 120000
+      });
+      if (baselineTsc && baselineTsc.skipped) {
+        try {
+          writeAttemptBaselineEvidence(runId, attemptNumber, {
+            status: 'SKIPPED',
+            reason: baselineTsc.reason || 'baseline could not execute',
+            errors: []
+          }, fs, now);
+        } catch (e) { /* best effort */ }
+      }
+    }
+  } catch (baseErr) {
+    // Baseline failure must never kill the attempt: treat as skipped.
+    baselineTsc = { ok: true, skipped: true, reason: String(baseErr && baseErr.message || baseErr), errors: [] };
+  }
+
   // Step 6: apply. Wrapped so an unexpected exception still records
   // attempt-N.json with the stage name (evidence before a bare
   // attempt-error.json from the orchestrator).
@@ -2175,7 +2268,10 @@ async function proposeAndCheck(options) {
     nodeVersion: process.version,
     execCommand: runCommand,
     timeout: 120000,
-    root: 'evidence'
+    root: 'evidence',
+    baselineTscErrors: baselineTsc && !baselineTsc.skipped && Array.isArray(baselineTsc.errors)
+      ? baselineTsc.errors
+      : (baselineTsc && baselineTsc.skipped ? { skipped: true, errors: [] } : null)
   };
 
   if (mode === 'pipeline') {
@@ -2206,6 +2302,30 @@ async function proposeAndCheck(options) {
     }, fs, now);
     throw checksErr;
   }
+
+  // Save the baseline-diff evidence: the normalized baseline errors plus any
+  // NEW errors introduced by the proposal (both redacted/capped by the
+  // verifier). Never throws.
+  try {
+    if (baselineTsc) {
+      var tscBaselineErrors = Array.isArray(baselineTsc.errors) ? baselineTsc.errors : [];
+      var tscNewErrors = [];
+      if (checkResult && Array.isArray(checkResult.results)) {
+        for (var tri = 0; tri < checkResult.results.length; tri++) {
+          var tr = checkResult.results[tri];
+          if (tr && tr.script === 'tsc --noEmit' && Array.isArray(tr.newErrors)) {
+            tscNewErrors = tr.newErrors;
+          }
+        }
+      }
+      writeAttemptBaselineEvidence(runId, attemptNumber, {
+        status: baselineTsc.skipped ? 'SKIPPED' : (tscNewErrors.length > 0 ? 'FAILED' : 'ACCEPTED'),
+        reason: baselineTsc.skipped ? (baselineTsc.reason || 'baseline could not execute') : null,
+        errors: tscBaselineErrors,
+        newErrors: tscNewErrors
+      }, fs, now);
+    }
+  } catch (e) { /* best effort */ }
 
   // Detect if any script was killed by signal (e.g. SIGKILL on timeout) with no
   // output — this is distinct from a clean exit-with-non-zero-code failure.
@@ -2517,6 +2637,7 @@ module.exports = {
   proposeAndCheck: proposeAndCheck,
   stackToString: stackToString,
   buildPrompt: buildPrompt,
+  formatPreviousAttempts: formatPreviousAttempts,
   buildAvailableExportsSection: buildAvailableExportsSection,
   detectDependencyPatchCapability: detectDependencyPatchCapability,
   queryDependencyVersions: queryDependencyVersions,

@@ -1851,7 +1851,13 @@ async function runRepair(deps) {
   //    per-signature and global caps itself (model.consume applies a second,
   //    shared gate inside the real proposeAndCheck); either cap ends the loop
   //    with the attempts recorded and the task still unmet.
+  //    An unexpected exception inside an attempt is recorded in
+  //    attempt-error.json, counts as one consumed attempt, and the loop
+  //    CONTINUES (the next attempt sees a fresh state). It only stops after 2
+  //    consecutive unexpected errors, which almost certainly indicate the same
+  //    root cause re-firing and are treated as BLOCKED.
   var attemptNumber = 0;
+  var consecutiveUnexpectedErrors = 0;
   while (Date.now() < state.deadline &&
          attemptNumber < budget.global &&
          attemptNumber < budget.perSignature) {
@@ -1860,10 +1866,31 @@ async function runRepair(deps) {
     var result;
     try {
       result = await proposeAttempt(cfg, adapters, state, located, attemptNumber, budget);
+      consecutiveUnexpectedErrors = 0;
     } catch (err) {
+      consecutiveUnexpectedErrors += 1;
       writeAttemptError(cfg, err, 'propose-attempt');
-      state.blockers.push(normalizeBlocker('REPAIR_ATTEMPT_ERROR', safeErr(err), {}));
-      break;
+      // Record the failed attempt so the report carries it and the next
+      // proposal in the loop can see it too (previousEvidence chain).
+      var attemptErrCode = safeErr(err);
+      state.attempts.push({
+        n: attemptNumber,
+        signature: state.finding.signature || '',
+        domain: state.finding.domain || '',
+        repairKind: 'proposal-crash',
+        status: 'REPAIR_ATTEMPT_ERROR',
+        message: attemptErrCode,
+        verifyStatus: null
+      });
+      if (consecutiveUnexpectedErrors >= 2) {
+        state.blockers.push(normalizeBlocker('REPAIR_ATTEMPT_ERROR', attemptErrCode + ' (2 consecutive unexpected errors)', {}));
+        state.outcome = OUTCOME_BLOCKED;
+        state.exitCode = EXIT_BLOCKED;
+        break;
+      }
+      // Otherwise continue the loop: one unexpected error consumes one attempt
+      // but does not end the repair.
+      continue;
     }
 
     if (result.next === 'stop-fixed') {

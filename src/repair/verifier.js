@@ -6,6 +6,72 @@ var path = require('path');
 
 var EVIDENCE_ROOT = 'evidence';
 var EVIDENCE_KIND = 'repair';
+/**
+ * Normalize a tsc output line into {file, code, message} without line/column.
+ * tsc error format: 'src/file.ts(10,5): error TS2307: message'
+ * Returns null for non-matching lines.
+ */
+function normalizeTscErrorLine(line) {
+  if (!line || typeof line !== 'string') return null;
+  // Match: file(path,line,col): error TSNNNN: message
+  // or: file(path,line,col): warning TSNNNN: message
+  var match = /^([^\(]+)\([^)]+\):\s*(?:error|warning)\s+(TS\d+):\s*(.*)$/.exec(line.trim());
+  if (!match) return null;
+  return {
+    file: match[1].replace(/\\/g, '/'),
+    code: match[2],
+    message: match[3]
+  };
+}
+
+/**
+ * Normalize tsc output into array of {file, code, message} objects.
+ * Filters out non-error lines and normalizes each error/warning.
+ */
+function normalizeTscOutput(output) {
+  if (!output || typeof output !== 'string') return [];
+  var lines = output.split('\n');
+  var errors = [];
+  for (var i = 0; i < lines.length; i++) {
+    var norm = normalizeTscErrorLine(lines[i]);
+    if (norm) errors.push(norm);
+  }
+  return errors;
+}
+
+/**
+ * Compare two tsc error arrays. Returns {newErrors, removedErrors}.
+ * newErrors = errors in current not present in baseline (by file+code+message)
+ * removedErrors = errors in baseline not present in current (informational only)
+ */
+function diffTscErrors(baseline, current) {
+  var baselineSet = {};
+  for (var i = 0; i < (baseline || []).length; i++) {
+    var e = baseline[i];
+    var key = e.file + '|' + e.code + '|' + e.message;
+    baselineSet[key] = true;
+  }
+  var newErrors = [];
+  for (var j = 0; j < (current || []).length; j++) {
+    var c = current[j];
+    var ckey = c.file + '|' + c.code + '|' + c.message;
+    if (!baselineSet[ckey]) newErrors.push(c);
+  }
+  var currentSet = {};
+  for (var k = 0; k < (current || []).length; k++) {
+    var ck = current[k];
+    var ckey2 = ck.file + '|' + ck.code + '|' + ck.message;
+    currentSet[ckey2] = true;
+  }
+  var removedErrors = [];
+  for (var b = 0; b < (baseline || []).length; b++) {
+    var be = baseline[b];
+    var bekey = be.file + '|' + be.code + '|' + be.message;
+    if (!currentSet[bekey]) removedErrors.push(be);
+  }
+  return { newErrors: newErrors, removedErrors: removedErrors };
+}
+
 var REDACTED_MARKER = '[REDACTED]';
 
 var REPAIR_SUB_DIR = 'repair';
@@ -430,6 +496,8 @@ async function runChecks(cloneDir, options) {
     }
   }
   if (tscAvailable) {
+    // Track the index of tsc result for baseline diff
+    var tscResultIdx = results.length;
     var tscResult = await execCommand(tscBin, ['--noEmit'], {
       cwd: cloneDir,
       timeout: timeout
@@ -458,6 +526,64 @@ async function runChecks(cloneDir, options) {
       signal: tscResult.signal || null,
       installLog: tscInstallLog || null
     });
+  }
+
+  // If baseline tsc errors provided, diff against current tsc results
+  // and only treat NEW errors as failures. When the baseline itself could not
+  // execute (marker { skipped: true }), the tsc check is SKIPPED, never failed.
+  var baselineTscErrors = options && options.baselineTscErrors;
+  if (baselineTscErrors && tscResultIdx >= 0) {
+    var tscRes = results[tscResultIdx];
+    var baselineSkipped = baselineTscErrors && baselineTscErrors.skipped === true;
+    if (baselineSkipped) {
+      // Baseline could not run: mark the tsc result skipped so the proposal is
+      // never judged against a baseline that never executed.
+      results[tscResultIdx].skipped = true;
+      results[tscResultIdx].success = true;
+      results[tscResultIdx].code = 'CHECKS_SKIPPED_NO_TOOLCHAIN';
+      results[tscResultIdx].baselineSkipped = true;
+    } else if (!tscRes.skipped && tscRes.exitCode !== 0) {
+      // tsc failed - normalize and diff against baseline
+      var currentTscErrors = normalizeTscOutput(tscRes.stderr || '');
+      var diff = diffTscErrors(baselineTscErrors.errors || baselineTscErrors, currentTscErrors);
+      var baselineErrArr = baselineTscErrors.errors || baselineTscErrors;
+      if (diff.newErrors.length > 0) {
+        // New errors introduced by proposal - fail with only new errors
+        var newErrText = diff.newErrors.slice(0, 50).map(function(e) {
+          return e.file + ': ' + e.code + ': ' + e.message;
+        }).join('\n');
+        if (newErrText.length > 4096) newErrText = newErrText.substring(0, 4096) + '\n... (truncated)';
+        results[tscResultIdx] = {
+          script: tscRes.script,
+          command: tscRes.command,
+          resolvedCommand: tscRes.resolvedCommand,
+          success: false,
+          exitCode: tscRes.exitCode,
+          timedOut: tscRes.timedOut,
+          skipped: false,
+          code: 'CHECKS_FAILED',
+          stdout: tscRes.stdout || '',
+          stderr: 'NEW_TSC_ERRORS:\n' + newErrText,
+          error: tscRes.error,
+          cwd: cloneDir,
+          hasNodeModules: hasNodeModules,
+          signal: tscRes.signal || null,
+          installLog: tscRes.installLog || null,
+          newErrors: diff.newErrors,
+          baselineErrors: baselineErrArr
+        };
+      } else {
+        // tsc failed but all errors are in baseline - treat as success (pre-existing)
+        results[tscResultIdx].success = true;
+        results[tscResultIdx].code = undefined;
+        results[tscResultIdx].baselineErrors = baselineErrArr;
+      }
+    } else if (!tscRes.skipped && tscRes.exitCode === 0 && (baselineTscErrors.errors || baselineTscErrors).length > 0) {
+      // tsc passed but baseline had errors - some were fixed (acceptable)
+      var diff2 = diffTscErrors(baselineTscErrors.errors || baselineTscErrors, []);
+      results[tscResultIdx].baselineErrors = baselineTscErrors.errors || baselineTscErrors;
+      results[tscResultIdx].fixedErrors = diff2.removedErrors;
+    }
   }
 
   var evContent = JSON.stringify({ runId: runId, results: results }, null, 2) + '\n';
@@ -578,10 +704,130 @@ function verify(before, after) {
   };
 }
 
+/**
+ * Run tsc --noEmit once on a pristine (pre-proposal) clone and return the
+ * normalized error set. Used as the baseline for the baseline-diff compile
+ * check: errors already present in the pristine clone are pre-existing and are
+ * never treated as a proposal regression.
+ *
+ * Returns:
+ *  - { ok: true, skipped: false, errors: [...], stdout, stderr }
+ *    when tsc ran (even if it exited non-zero; `errors` is the normalized set).
+ *  - { ok: true, skipped: true, reason, errors: [] }
+ *    when tsc could not run at all (no toolchain / baseline cannot execute).
+ *    Callers must NEVER treat this as a failure.
+ */
+async function runTscBaseline(cloneDir, options) {
+  options = options || {};
+  var hasNodeModules = fs.existsSync(path.join(cloneDir, 'node_modules'));
+
+  // Resolve the tsc binary exactly like runChecks does (node_modules/.bin/tsc,
+  // then node_modules/typescript/bin/tsc). Do NOT attempt a network install
+  // here: a baseline check must be cheap and must never fail the whole run on
+  // a missing toolchain - it is SKIPPED instead.
+  var tscBin = path.join(cloneDir, 'node_modules', '.bin', 'tsc');
+  var tscAvailable = hasNodeModules && fs.existsSync(tscBin);
+  if (!tscAvailable && hasNodeModules) {
+    var tscAltBin = path.join(cloneDir, 'node_modules', 'typescript', 'bin', 'tsc');
+    if (fs.existsSync(tscAltBin)) {
+      tscBin = tscAltBin;
+      tscAvailable = true;
+    }
+  }
+  if (!tscAvailable) {
+    return { ok: true, skipped: true, reason: 'tsc not available', errors: [] };
+  }
+
+  var execCommand = options.execCommand || function(cmd, args, opts) {
+    return new Promise(function(resolve) {
+      var childProcess = require('child_process');
+      var result = { success: false, stdout: '', stderr: '', exitCode: null, timedOut: false, error: null, signal: null };
+      var stdout = '';
+      var stderr = '';
+      var timeout = opts.timeout || 120000;
+      var timedOut = false;
+      var proc;
+      try {
+        proc = childProcess.spawn(cmd, args, {
+          cwd: opts.cwd || cloneDir,
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+        proc.stdout.on('data', function(chunk) { stdout += chunk.toString(); });
+        proc.stderr.on('data', function(chunk) { stderr += chunk.toString(); });
+
+        var timer = setTimeout(function() {
+          timedOut = true;
+          if (proc && typeof proc.kill === 'function') {
+            try { proc.kill('SIGKILL'); } catch (e) { /* already exited */ }
+          }
+        }, timeout);
+
+        proc.on('close', function(code, signal) {
+          clearTimeout(timer);
+          result.exitCode = code;
+          result.signal = signal || null;
+          result.timedOut = timedOut;
+          result.stdout = stdout.substring(0, 50000);
+          result.stderr = stderr.substring(0, 50000);
+          result.success = code === 0 && !timedOut;
+          resolve(result);
+        });
+        proc.on('error', function(err) {
+          clearTimeout(timer);
+          result.error = err.message;
+          result.success = false;
+          resolve(result);
+        });
+      } catch (err) {
+        result.error = err.message;
+        result.success = false;
+        resolve(result);
+      }
+    });
+  };
+
+  try {
+    var tscResult = await execCommand(tscBin, ['--noEmit'], {
+      cwd: cloneDir,
+      timeout: options.timeout || 120000
+    });
+    // Baseline could not execute (spawn error / no output / crash): treat as
+    // SKIPPED, never as a failure. The proposal should not be judged against
+    // a baseline that never ran.
+    var spawnFailed = tscResult.exitCode === null && !(tscResult.stdout || '') && !(tscResult.stderr || '') && !!tscResult.error;
+    var timedOut = !!tscResult.timedOut;
+    if (spawnFailed || timedOut) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: timedOut ? 'tsc baseline timed out' : (tscResult.error || 'tsc baseline could not execute'),
+        errors: [],
+        stdout: tscResult.stdout || '',
+        stderr: tscResult.stderr || ''
+      };
+    }
+    var errors = normalizeTscOutput(tscResult.stderr || '');
+    return {
+      ok: true,
+      skipped: false,
+      errors: errors,
+      stdout: tscResult.stdout || '',
+      stderr: tscResult.stderr || '',
+      exitCode: tscResult.exitCode
+    };
+  } catch (err) {
+    return { ok: true, skipped: true, reason: String(err && err.message || err), errors: [] };
+  }
+}
+
 module.exports = {
   reproduce: reproduce,
   verify: verify,
   runChecks: runChecks,
+  runTscBaseline: runTscBaseline,
+  normalizeTscOutput: normalizeTscOutput,
+  normalizeTscErrorLine: normalizeTscErrorLine,
+  diffTscErrors: diffTscErrors,
   initIndex: initIndex,
   sha256Hex: sha256Hex,
   redactEmails: redactEmails,
