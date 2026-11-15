@@ -169,7 +169,23 @@ function callModel(opts) {
   } else if (typeof process !== 'undefined' && process.env && typeof process.env.REPAIR_PROVIDER_ORDER === 'string' && process.env.REPAIR_PROVIDER_ORDER !== '') {
     providerOrder = process.env.REPAIR_PROVIDER_ORDER.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
   }
-  var providerIgnore = (env && env.provider && Array.isArray(env.provider.ignore)) ? env.provider.ignore.slice() : [];
+  // providerIgnore: primary is env.REPAIR_PROVIDER_IGNORE string; backward-compat
+  // fallback to env.provider.ignore array (pre-existing object form).
+  var providerIgnore = [];
+  if (env && env.provider && Array.isArray(env.provider.ignore)) {
+    providerIgnore = env.provider.ignore.slice();
+  }
+  if (env && typeof env.REPAIR_PROVIDER_IGNORE === 'string' && env.REPAIR_PROVIDER_IGNORE !== '') {
+    var strParts = env.REPAIR_PROVIDER_IGNORE.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+    strParts.forEach(function(p) {
+      if (providerIgnore.indexOf(p) === -1) providerIgnore.push(p);
+    });
+  } else if (typeof process !== 'undefined' && process.env && typeof process.env.REPAIR_PROVIDER_IGNORE === 'string' && process.env.REPAIR_PROVIDER_IGNORE !== '') {
+    var procParts = process.env.REPAIR_PROVIDER_IGNORE.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+    procParts.forEach(function(p) {
+      if (providerIgnore.indexOf(p) === -1) providerIgnore.push(p);
+    });
+  }
 
   var apiKey;
   if (typeof env === 'object' && env !== null && env.OPENROUTER_API_KEY) {

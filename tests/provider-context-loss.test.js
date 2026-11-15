@@ -161,8 +161,8 @@ test('context-loss empty proposal switches provider, retries without double-cons
   assert.strictEqual(deps._callCount.consume, 1, 'per-signature attempt must NOT be consumed again on provider switch');
   // The bad provider must be recorded in env.provider.ignore so later requests
   // avoid it for the rest of the run.
-  assert.ok(env.provider && Array.isArray(env.provider.ignore), 'provider.ignore must be tracked in env');
-  assert.ok(env.provider.ignore.indexOf('badProvider') !== -1, 'context-loss provider must be added to the ignore list');
+  assert.strictEqual(typeof env.REPAIR_PROVIDER_IGNORE, 'string', 'REPAIR_PROVIDER_IGNORE must be set as a string');
+  assert.ok(env.REPAIR_PROVIDER_IGNORE.indexOf('badProvider') !== -1, 'context-loss provider must be added to REPAIR_PROVIDER_IGNORE');
 });
 
 test('context-loss empty proposal that persists is REJECTED with PROVIDER_CONTEXT_LOSS, capped at 3 switches', async function() {
@@ -185,9 +185,9 @@ test('context-loss empty proposal that persists is REJECTED with PROVIDER_CONTEX
   assert.strictEqual(result.status, 'REJECTED', 'persistent context loss must be REJECTED');
   assert.strictEqual(result.rejectionCodes[0], 'PROVIDER_CONTEXT_LOSS', 'rejection code must be PROVIDER_CONTEXT_LOSS');
   assert.strictEqual(deps._callCount.model, 4, 'initial call + at most 3 provider switches');
-  assert.ok(env.provider, 'env.provider must be initialized');
-  assert.ok(Array.isArray(env.provider.ignore), 'provider.ignore must be an array');
-  assert.strictEqual(env.provider.ignore.length, 3, 'three providers added to ignore list (capped at 3 switches)');
+  assert.strictEqual(typeof env.REPAIR_PROVIDER_IGNORE, 'string', 'REPAIR_PROVIDER_IGNORE must be a string');
+  var ignoredList = env.REPAIR_PROVIDER_IGNORE ? env.REPAIR_PROVIDER_IGNORE.split(',').filter(Boolean) : [];
+  assert.strictEqual(ignoredList.length, 3, 'three providers added to REPAIR_PROVIDER_IGNORE (capped at 3 switches)');
 
   // attempt-N.json records provider, switches and the reason.
   var attemptFile = path.join('evidence', runId, 'repair', 'attempt-1.json');
@@ -389,8 +389,8 @@ test('context-loss: tokens<1500 + elapsed<6000 triggers PROVIDER_CONTEXT_LOSS ev
 
   assert.strictEqual(result.status, 'REJECTED', 'fast empty response must be REJECTED');
   assert.strictEqual(result.rejectionCodes[0], 'PROVIDER_CONTEXT_LOSS', 'fast empty with tokens<1500+elapsed<6000 must be PROVIDER_CONTEXT_LOSS');
-  assert.ok(env.provider && Array.isArray(env.provider.ignore), 'provider must be added to ignore list');
-  assert.ok(env.provider.ignore.indexOf('fastEmptyProvider') !== -1, 'fast-empty provider must be ignored');
+  assert.strictEqual(typeof env.REPAIR_PROVIDER_IGNORE, 'string', 'REPAIR_PROVIDER_IGNORE must be set');
+  assert.ok(env.REPAIR_PROVIDER_IGNORE.indexOf('fastEmptyProvider') !== -1, 'fast-empty provider must be added to REPAIR_PROVIDER_IGNORE');
 });
 
 test('context-loss: tokens>=1500 with substantive rationale is NOT context loss', async function() {
@@ -408,6 +408,76 @@ test('context-loss: tokens>=1500 with substantive rationale is NOT context loss'
   assert.strictEqual(result.status, 'REJECTED', 'non-context-loss empty must be REJECTED');
   assert.strictEqual(result.rejectionCodes[0], 'EMPTY_PROPOSAL', 'substantive response with enough tokens must be EMPTY_PROPOSAL, not PROVIDER_CONTEXT_LOSS');
   assert.ok(!env.provider || !env.provider.ignore || env.provider.ignore.indexOf('slowProvider') === -1, 'non-context-loss provider must NOT be ignored');
+});
+
+// =============================================================================
+// 5b. process.env-like (stringifying) env: context-loss switch via REPAIR_PROVIDER_IGNORE
+// =============================================================================
+
+test('stringifying env (process.env mock): context-loss switch stores provider in REPAIR_PROVIDER_IGNORE, next call gets provider.ignore', async function() {
+  var dir = createTempProject({ 'src/x.js': 'old content\n' });
+  var deps = baseFakeDeps();
+  var capturedBodies = [];
+  var responses = [
+    { ok: true, text: JSON.stringify({ repairKind: 'source-edit', rationale: 'No target file, bug description or prior edit context was included', edits: [], newFiles: [] }), usage: { total_tokens: 5 }, provider: 'badProvider' },
+    { ok: true, text: JSON.stringify({ repairKind: 'source-edit', rationale: 'fix the bug', edits: [{ path: 'src/x.js', oldString: 'old content', newString: 'new content' }], newFiles: [] }), usage: { total_tokens: 10 }, provider: 'goodProvider' }
+  ];
+  deps._modelResponses = responses.slice();
+
+  // Proxy that String()-coerces every assigned value, simulating process.env
+  // behavior which turns `env.provider = {}` into `env.provider = "[object Object]"`.
+  var stringifyingEnv = new Proxy({}, {
+    set: function(target, prop, value) {
+      target[prop] = String(value);
+      return true;
+    }
+  });
+
+  // Capture the built request body on each model call so we can inspect
+  // provider.ignore without needing a real fetch.
+  var originalCallModel = deps.model.callModel;
+  deps.model.callModel = function(opts) {
+    var bodyStr = '';
+    try {
+      // Replicate the buildBody logic from modelClient to capture the body
+      var b = {
+        model: 'openrouter/fix',
+        messages: [{ role: 'user', content: opts.prompt }],
+        provider: { data_collection: 'deny', require_parameters: true }
+      };
+      var envIgnore = [];
+      if (opts.env && typeof opts.env.REPAIR_PROVIDER_IGNORE === 'string' && opts.env.REPAIR_PROVIDER_IGNORE !== '') {
+        envIgnore = opts.env.REPAIR_PROVIDER_IGNORE.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+      }
+      if (envIgnore.length > 0) b.provider.ignore = envIgnore.slice();
+      bodyStr = JSON.stringify(b);
+    } catch (e) {
+      bodyStr = String(e.message);
+    }
+    capturedBodies.push(bodyStr);
+    return originalCallModel.call(this, opts);
+  };
+
+  var result = await runPropose({ deps: deps, cloneDir: dir, env: stringifyingEnv });
+
+  assert.strictEqual(result.status, 'READY', 'context-loss switch must lead to READY: ' + result.status);
+  assert.strictEqual(capturedBodies.length, 2, 'model must be called twice');
+  // After the first (context-loss) call sets REPAIR_PROVIDER_IGNORE, the retry
+  // call must carry that provider in provider.ignore.
+  assert.ok(
+    capturedBodies[1].indexOf('badProvider') !== -1,
+    'retry call must include badProvider in provider.ignore; bodies: ' + capturedBodies.join(' | ')
+  );
+  // Verify the env string was actually set to a plain string (no crash on assignment)
+  assert.strictEqual(
+    typeof stringifyingEnv.REPAIR_PROVIDER_IGNORE,
+    'string',
+    'REPAIR_PROVIDER_IGNORE must be a string (not a crashed-object)'
+  );
+  assert.ok(
+    stringifyingEnv.REPAIR_PROVIDER_IGNORE.indexOf('badProvider') !== -1,
+    'REPAIR_PROVIDER_IGNORE must contain badProvider: ' + stringifyingEnv.REPAIR_PROVIDER_IGNORE
+  );
 });
 
 // =============================================================================
@@ -476,4 +546,50 @@ test('buildAvailableExportsSection: node_modules candidate includes package.json
   assert.ok(section.indexOf('main:') !== -1 || section.indexOf('types:') !== -1, 'section must include package.json fields');
   var sectionLower = section.toLowerCase();
   assert.ok(sectionLower.indexOf('use only the symbols') !== -1 || sectionLower.indexOf('never guess') !== -1, 'section must include import instruction');
+});
+
+// =============================================================================
+// 8. modelClient: REPAIR_PROVIDER_IGNORE env string -> provider.ignore array
+// =============================================================================
+
+test('modelClient: REPAIR_PROVIDER_IGNORE env string maps to provider.ignore array in request body', function() {
+  var modelClient = require('../src/repair/modelClient');
+  var capturedBody = null;
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: {
+      OPENROUTER_API_KEY: 'tok',
+      REPAIR_PROVIDER_IGNORE: 'A,B'
+    },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function(url, opts) {
+      capturedBody = opts.body;
+      return Promise.resolve({ status: 200, ok: true, json: function() { return Promise.resolve({ choices: [{ message: { content: '{}' } }], usage: { total_tokens: 10 } }); } });
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, true);
+    var body = JSON.parse(capturedBody);
+    assert.deepStrictEqual(body.provider.ignore, ['A', 'B'], 'REPAIR_PROVIDER_IGNORE A,B must map to provider.ignore [A,B]');
+    assert.strictEqual(body.provider.data_collection, 'deny', 'data_collection deny must be kept');
+  });
+});
+
+test('modelClient with empty env does not include provider.ignore in body', function() {
+  var modelClient = require('../src/repair/modelClient');
+  var capturedBody = null;
+  return modelClient.callModel({
+    prompt: 'hello',
+    env: {
+      OPENROUTER_API_KEY: 'tok'
+    },
+    budget: { model: { used: 0, maxTokensTotal: 400000 } },
+    fetch: function(url, opts) {
+      capturedBody = opts.body;
+      return Promise.resolve({ status: 200, ok: true, json: function() { return Promise.resolve({ choices: [{ message: { content: '{}' } }], usage: { total_tokens: 10 } }); } });
+    }
+  }).then(function(r) {
+    assert.strictEqual(r.ok, true);
+    var body = JSON.parse(capturedBody);
+    assert.strictEqual(body.provider.ignore, undefined, 'no REPAIR_PROVIDER_IGNORE means no provider.ignore in body');
+  });
 });

@@ -1702,13 +1702,39 @@ async function proposeAndCheck(options) {
     var contextLossProvider = null;
     var contextLossReason = null;
     if (isContextLossRationale(emptyReason, { tokens: modelResult.usage ? modelResult.usage.total_tokens : null, elapsedMs: elapsedMs })) {
-      // Initialize provider tracking in env. env.provider may be pre-set by an
-      // earlier stage as an object without the ignore/order fields, so always
-      // enforce the shapes rather than relying on the short-circuit defaults.
-      if (!env.provider) env.provider = {};
-      if (!Array.isArray(env.provider.ignore)) env.provider.ignore = [];
-      if (env.provider.order === undefined || env.provider.order === null) env.provider.order = null;
+      // Provider ignore list: stored as env.REPAIR_PROVIDER_IGNORE comma-string so it
+      // works when env is process.env (which String()-coerces all assigned values).
+      // Backward-compat: also reads env.provider.ignore if it is a real array.
       var MAX_PROVIDER_SWITCHES = 3;
+
+      // Provider ignore list helpers: store as env.REPAIR_PROVIDER_IGNORE string
+      // to avoid process.env stringification bug. Backward-compat: also reads
+      // env.provider.ignore if it is a real array (pre-existing object form).
+      function readProviderIgnore(env) {
+        var list = [];
+        // Backward-compat: read from env.provider.ignore object if it exists
+        if (env && env.provider && Array.isArray(env.provider.ignore)) {
+          list = list.concat(env.provider.ignore);
+        }
+        // Primary storage: REPAIR_PROVIDER_IGNORE string
+        if (env && typeof env.REPAIR_PROVIDER_IGNORE === 'string' && env.REPAIR_PROVIDER_IGNORE !== '') {
+          var parts = env.REPAIR_PROVIDER_IGNORE.split(',')
+            .map(function(s) { return s.trim(); })
+            .filter(Boolean);
+          // Avoid duplicates when merging backward-compat array
+          parts.forEach(function(p) {
+            if (list.indexOf(p) === -1) list.push(p);
+          });
+        }
+        return list;
+      }
+      function addProviderIgnore(env, name) {
+        var list = readProviderIgnore(env);
+        if (name && list.indexOf(name) === -1) {
+          list.push(name);
+          env.REPAIR_PROVIDER_IGNORE = list.join(',');
+        }
+      }
 
       while (providerSwitches < MAX_PROVIDER_SWITCHES) {
         var currentProvider = modelResult.provider || null;
@@ -1717,9 +1743,7 @@ async function proposeAndCheck(options) {
 
         // Add current provider to ignore list
         if (currentProvider) {
-          if (env.provider.ignore.indexOf(currentProvider) === -1) {
-            env.provider.ignore.push(currentProvider);
-          }
+          addProviderIgnore(env, currentProvider);
         }
         providerSwitches++;
 
@@ -1750,9 +1774,6 @@ async function proposeAndCheck(options) {
               contextLossProvider = retryResult.provider || currentProvider;
               // Prefer the provider that last produced a valid proposal for future attempts
               var validProvider = retryResult.provider || currentProvider;
-              if (validProvider) {
-                env.provider.order = [validProvider];
-              }
               break;
             }
             // Still empty - check if it's also context loss
