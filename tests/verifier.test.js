@@ -38,6 +38,14 @@ function writePkg(tmpDir, scripts) {
   fs.mkdirSync(path.join(tmpDir, 'node_modules'), { recursive: true });
 }
 
+// Creates node_modules/typescript/bin/tsc so the tsc availability check succeeds.
+// Tests that need the tsc baseline-diff gate to run must call this after writePkg.
+function addTscStub(tmpDir) {
+  var tscDir = path.join(tmpDir, 'node_modules', 'typescript', 'bin');
+  fs.mkdirSync(tscDir, { recursive: true });
+  fs.writeFileSync(path.join(tscDir, 'tsc'), '// stub', 'utf8');
+}
+
 test('verify: fixed - all old signatures gone', function() {
   var before = ['sig-abc', 'sig-def', 'sig-ghi'];
   var after = [];
@@ -583,4 +591,112 @@ test('runChecks: real child spawn error is captured as CHECKS_SKIPPED_NO_TOOLCHA
   assert.ok(result.results[0].error, 'spawn error should be recorded');
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+// --- INCONCLUSIVE_TOOLCHAIN baseline reliability -----------------------------
+
+test('detectUnreliableBaselineErrors: TS2307 for core module => unreliable', function() {
+  var errors = [
+    { file: 'src/a.ts', code: 'TS2307', message: "Cannot find module '@nestjs/common'" },
+    { file: 'src/b.ts', code: 'TS2307', message: "Cannot find module 'typeorm'" }
+  ];
+  var r = verifier.detectUnreliableBaselineErrors(errors);
+  assert.strictEqual(r.unreliable, true);
+  assert.strictEqual(r.baselineErrorCount, 2);
+});
+
+test('detectUnreliableBaselineErrors: TS2580/TS2304 missing node globals => unreliable', function() {
+  var errors = [
+    { file: 'src/a.ts', code: 'TS2580', message: "Cannot find name 'process'. Do you need to install type definitions for node?" },
+    { file: 'src/b.ts', code: 'TS2304', message: "Cannot find name '__dirname'" }
+  ];
+  assert.strictEqual(verifier.detectUnreliableBaselineErrors(errors).unreliable, true);
+});
+
+test('detectUnreliableBaselineErrors: TS2305 @vendure/core export missing => unreliable', function() {
+  var errors = [
+    { file: 'src/a.ts', code: 'TS2305', message: "Module '@vendure/core' has no exported member 'ID'." }
+  ];
+  assert.strictEqual(verifier.detectUnreliableBaselineErrors(errors).unreliable, true);
+});
+
+test('detectUnreliableBaselineErrors: clean non-core errors => reliable', function() {
+  var errors = [
+    { file: 'src/a.ts', code: 'TS2353', message: 'Object literal may only specify known properties' }
+  ];
+  var r = verifier.detectUnreliableBaselineErrors(errors);
+  assert.strictEqual(r.unreliable, false);
+  assert.strictEqual(r.baselineErrorCount, 1);
+});
+
+test('detectUnreliableBaselineErrors: empty input => reliable (not unreliable)', function() {
+  var r = verifier.detectUnreliableBaselineErrors([]);
+  assert.strictEqual(r.unreliable, false);
+  assert.strictEqual(r.baselineErrorCount, 0);
+});
+
+test('runChecks: reliable baseline + new error => FAIL (blocking)', async function() {
+  var tmpDir = path.join(os.tmpdir(), 'run-checks-fail-block-' + Date.now());
+  writePkg(tmpDir, { test: 'node -e "console.log(1)"' });
+  addTscStub(tmpDir);
+  // Empty baseline so any tsc error is treated as a NEW error (blocking).
+  var result = await verifier.runChecks(tmpDir, {
+    execCommand: makeFakeExecCommand([
+      { success: true, stdout: '1\n', stderr: '', exitCode: 0 },
+      { success: false, stdout: '', stderr: 'src/c.ts(1,1): error TS2345: Argument of type is incorrect\n', exitCode: 1 }
+    ]),
+    baselineTscErrors: [],
+    runId: 'checks-fail-block-' + Date.now(),
+    root: TEST_EVIDENCE_ROOT
+  });
+  assert.strictEqual(result.ok, false, 'reliable baseline + new error must fail');
+  // results[0] = passing test script, results[1] = tsc check with new errors
+  assert.strictEqual(result.results[0].success, true, 'script should pass');
+  var tscRes = result.results[1];
+  assert.strictEqual(tscRes.code, 'CHECKS_FAILED', 'tsc must report CHECKS_FAILED for new errors');
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('runChecks: unreliable baseline => INCONCLUSIVE_TOOLCHAIN and flow continues', async function() {
+  var tmpDir = path.join(os.tmpdir(), 'run-checks-inconclusive-' + Date.now());
+  writePkg(tmpDir, { test: 'node -e "console.log(1)"' });
+  addTscStub(tmpDir);
+  // Unreliable baseline: core-module errors mean toolchain is inconclusive.
+  // INCONCLUSIVE_TOOLCHAIN must NOT block the repair flow; ok stays true.
+  var result = await verifier.runChecks(tmpDir, {
+    execCommand: makeFakeExecCommand([
+      { success: true, stdout: '1\n', stderr: '', exitCode: 0 },
+      { success: false, stdout: '', stderr: 'src/c.ts(1,1): error TS2307: Cannot find \'typeorm\'\n', exitCode: 1 }
+    ]),
+    baselineTscErrors: {
+      unreliable: true,
+      errors: [{ file: 'src/c.ts', code: 'TS2307', message: 'Cannot find \'typeorm\'' }],
+      baselineErrorCount: 1,
+      topCodes: ['TS2307']
+    },
+    runId: 'checks-inconclusive-' + Date.now(),
+    root: TEST_EVIDENCE_ROOT
+  });
+  // INCONCLUSIVE_TOOLCHAIN must not block: runChecks reports ok.
+  assert.strictEqual(result.ok, true, 'INCONCLUSIVE_TOOLCHAIN must not block the flow');
+  // results[0] = passing test script, results[1] = inconclusive tsc check
+  assert.strictEqual(result.results[0].success, true, 'script should pass');
+  var tscRes = result.results[1];
+  assert.strictEqual(tscRes.code, 'INCONCLUSIVE_TOOLCHAIN', 'tsc must be marked INCONCLUSIVE_TOOLCHAIN');
+  assert.strictEqual(tscRes.baselineUnreliable, true);
+  assert.ok(result.results[1].success, 'inconclusive check should not be reported as failed');
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+// --- checkStatus display -----------------------------------------------------
+
+test('checkStatus: SKIPPED, INCONCLUSIVE_TOOLCHAIN, FAIL, PASS shown exactly as recorded', function() {
+  var proposeAndCheck = require('../src/repair/proposeAndCheck');
+  var checkStatus = proposeAndCheck.checkStatus;
+  assert.strictEqual(checkStatus({ skipped: true }), 'SKIPPED');
+  assert.strictEqual(checkStatus({ success: true }), 'PASS');
+  assert.strictEqual(checkStatus({ success: false }), 'FAIL');
+  assert.strictEqual(checkStatus({ timedOut: true }), 'TIMED_OUT');
+  assert.strictEqual(checkStatus({ code: 'INCONCLUSIVE_TOOLCHAIN', success: true }), 'INCONCLUSIVE_TOOLCHAIN');
+  assert.strictEqual(checkStatus(null), 'FAIL');
 });

@@ -314,6 +314,7 @@ function callModel(opts) {
         return {
           ok: false,
           retry: true,
+          model: usedModel,
           blocker: {
             code: 'MODEL_TIMEOUT',
             message: 'OpenRouter request timed out after ' + Math.round(elapsedMs / 1000) + 's',
@@ -326,6 +327,7 @@ function callModel(opts) {
       return {
         ok: false,
         retry: true,
+        model: usedModel,
         blocker: {
           code: 'NETWORK_ERROR',
           message: 'Failed to reach OpenRouter: ' + fetchErr.message,
@@ -369,11 +371,11 @@ function callModel(opts) {
       var refused = response.blocker;
       var refusedEvidence = Object.assign({}, refused.evidence || {},
         fetchUtil.fetchEvidence('model', 'POST', API_URL, response, 'fetch adapter refused'));
-      return { ok: false, blocker: { code: refused.code, message: refused.message || ('fetch adapter ' + refused.code), evidence: refusedEvidence } };
+      return { ok: false, requestedModel: usedModel, model: usedModel, blocker: { code: refused.code, message: refused.message || ('fetch adapter ' + refused.code), evidence: refusedEvidence } };
     }
 
     if (!fetchUtil.isResponseLike(response)) {
-      return { ok: false, blocker: { code: 'INVALID_RESPONSE', message: 'Invalid response from fetch', evidence: fetchUtil.fetchEvidence('model', 'POST', API_URL, response, 'fetch resolved with a non-Response value') } };
+      return { ok: false, blocker: { code: 'INVALID_RESPONSE', message: 'Invalid response from fetch', evidence: fetchUtil.fetchEvidence('model', 'POST', API_URL, response, 'fetch resolved with a non-Response value') }, requestedModel: usedModel, model: usedModel };
     }
 
     var status = response.status;
@@ -383,6 +385,7 @@ function callModel(opts) {
       return {
         ok: false,
         retry: true,
+        model: usedModel,
         blocker: {
           code: 'HTTP_' + status,
           message: 'OpenRouter API returned ' + status + ' (' + reason + ')',
@@ -416,12 +419,12 @@ function callModel(opts) {
           if (bodyResult.ok && bodyResult.text) errBody = bodyResult.text;
           else if (bodyResult.ok && bodyResult.json) { try { errBody = JSON.stringify(bodyResult.json); } catch (e) { errBody = ''; } }
           if (detectNoEligibleProvider(errBody)) {
-            return { ok: false, requestedModel: usedModel, blocker: { code: 'MODEL_NO_ELIGIBLE_PROVIDER', message: 'no eligible provider for model ' + usedModel + ' matching the data collection policy and required parameters', evidence: evidence } };
+            return { ok: false, requestedModel: usedModel, model: usedModel, blocker: { code: 'MODEL_NO_ELIGIBLE_PROVIDER', message: 'no eligible provider for model ' + usedModel + ' matching the data collection policy and required parameters', evidence: evidence } };
           }
-          return { ok: false, retryDrop: detectRejectedParam(errBody), requestedModel: usedModel, blocker: { code: 'HTTP_' + status, message: message, evidence: evidence } };
+          return { ok: false, retryDrop: detectRejectedParam(errBody), requestedModel: usedModel, model: usedModel, blocker: { code: 'HTTP_' + status, message: message, evidence: evidence } };
         });
       }
-      return { ok: false, requestedModel: usedModel, blocker: { code: 'HTTP_' + status, message: message, evidence: evidence } };
+      return { ok: false, requestedModel: usedModel, model: usedModel, blocker: { code: 'HTTP_' + status, message: message, evidence: evidence } };
     }
 
     return readBody(response).then(function(bodyResult) {
@@ -489,7 +492,7 @@ function callModel(opts) {
     evidence.attempt = meta.attempt;
     evidence.maxTokensSent = meta.maxTokensSent;
     if (length != null && evidence.bodyLength == null) evidence.bodyLength = length;
-    return { ok: false, blocker: { code: 'INVALID_RESPONSE', message: 'Failed to parse OpenRouter response: ' + reason, evidence: evidence } };
+    return { ok: false, requestedModel: usedModel, model: usedModel, blocker: { code: 'INVALID_RESPONSE', message: 'Failed to parse OpenRouter response: ' + reason, evidence: evidence } };
   }
 }
 

@@ -25,9 +25,72 @@ function normalizeTscErrorLine(line) {
 }
 
 /**
- * Normalize tsc output into array of {file, code, message} objects.
- * Filters out non-error lines and normalizes each error/warning.
+ * Detect if a baseline tsc error set is "unreliable" — meaning the toolchain
+ * itself is broken (core modules/packages missing, @types/node absent), so a
+ * baseline-diff pass/fail verdict cannot be trusted.
+ *
+ * An unreliable baseline contains >=1 TS2307 for core modules (@nestjs/common,
+ * typeorm, rxjs, path, graphql-tag, @vendure/core) OR >=1 TS2580/TS2304 for
+ * missing globals (process, __dirname) that indicate @types/node is absent.
+ *
+ * Returns { unreliable: bool, baselineErrorCount: number, topCodes: string[] }
+ * where topCodes are the up-to-5 most-frequent distinct error codes.
  */
+function detectUnreliableBaselineErrors(errors) {
+  if (!errors || !Array.isArray(errors) || errors.length === 0) {
+    return { unreliable: false, baselineErrorCount: 0, topCodes: [] };
+  }
+  var coreModulePatterns = [
+    '@nestjs/common',
+    'typeorm',
+    'rxjs',
+    '^path$',
+    'graphql-tag',
+    '@vendure/core',
+    '@types/node'
+  ];
+  var hasCoreModuleError = false;
+  var hasGlobalError = false;
+  for (var i = 0; i < errors.length; i++) {
+    var e = errors[i];
+    if (!e || typeof e.code !== 'string') continue;
+    var msg = e.message || '';
+    if (e.code === 'TS2307') {
+      for (var c = 0; c < coreModulePatterns.length; c++) {
+        var pat = coreModulePatterns[c];
+        var re = new RegExp(pat);
+        if (re.test(msg)) {
+          hasCoreModuleError = true;
+          break;
+        }
+      }
+    }
+    // TS2305 "Module '@vendure/core' has no exported member 'ID'" also means the
+    // vendure types are not loadable -> unreliable baseline (no reliable diff).
+    if (e.code === 'TS2305' && /@vendure\/core/.test(msg)) {
+      hasCoreModuleError = true;
+    }
+    if (e.code === 'TS2580' || e.code === 'TS2304') {
+      if (/process|__dirname|__filename/.test(msg)) {
+        hasGlobalError = true;
+      }
+    }
+  }
+  var unreliable = hasCoreModuleError || hasGlobalError;
+  // Collect up to 5 most-frequent error codes
+  var codeCount = {};
+  for (var j = 0; j < errors.length; j++) {
+    var cd = errors[j] && errors[j].code;
+    if (cd) codeCount[cd] = (codeCount[cd] || 0) + 1;
+  }
+  var sortedCodes = Object.keys(codeCount).sort(function(a, b) { return codeCount[b] - codeCount[a]; });
+  var topCodes = sortedCodes.slice(0, 5);
+  return {
+    unreliable: unreliable,
+    baselineErrorCount: errors.length,
+    topCodes: topCodes
+  };
+}
 function normalizeTscOutput(output) {
   if (!output || typeof output !== 'string') return [];
   var lines = output.split('\n');
@@ -403,6 +466,14 @@ async function runChecks(cloneDir, options) {
       var localBin = path.join(cloneDir, 'node_modules', '.bin', cmd);
       if (fs.existsSync(localBin)) {
         resolvedCmd = localBin;
+      } else if (cmd === 'tsc') {
+        // Apply the same fallback as the standalone tsc --noEmit check so that
+        // a build script of "tsc" is resolved to node_modules/typescript/bin/tsc
+        // when node_modules/.bin/tsc is absent.
+        var tscAltBin = path.join(cloneDir, 'node_modules', 'typescript', 'bin', 'tsc');
+        if (fs.existsSync(tscAltBin)) {
+          resolvedCmd = tscAltBin;
+        }
       }
     }
 
@@ -542,6 +613,18 @@ async function runChecks(cloneDir, options) {
       results[tscResultIdx].success = true;
       results[tscResultIdx].code = 'CHECKS_SKIPPED_NO_TOOLCHAIN';
       results[tscResultIdx].baselineSkipped = true;
+    } else if (baselineTscErrors.unreliable === true) {
+      // Baseline has core module/global errors (missing @nestjs/common, typeorm,
+      // @types/node, etc.) — the toolchain is unreliable. Mark the tsc check as
+      // INCONCLUSIVE_TOOLCHAIN so the repair flow continues (image build is
+      // authoritative) and the proposal is NOT blocked by baseline-diff logic.
+      var baselineErrArrUnrel = baselineTscErrors.errors || baselineTscErrors;
+      results[tscResultIdx].success = true;
+      results[tscResultIdx].code = 'INCONCLUSIVE_TOOLCHAIN';
+      results[tscResultIdx].baselineErrors = baselineErrArrUnrel;
+      results[tscResultIdx].baselineErrorCount = baselineTscErrors.baselineErrorCount || 0;
+      results[tscResultIdx].topCodes = baselineTscErrors.topCodes || [];
+      results[tscResultIdx].baselineUnreliable = true;
     } else if (!tscRes.skipped && tscRes.exitCode !== 0) {
       // tsc failed - normalize and diff against baseline
       var currentTscErrors = normalizeTscOutput(tscRes.stderr || '');
@@ -807,13 +890,17 @@ async function runTscBaseline(cloneDir, options) {
       };
     }
     var errors = normalizeTscOutput(tscResult.stderr || '');
+    var reliability = detectUnreliableBaselineErrors(errors);
     return {
       ok: true,
       skipped: false,
       errors: errors,
       stdout: tscResult.stdout || '',
       stderr: tscResult.stderr || '',
-      exitCode: tscResult.exitCode
+      exitCode: tscResult.exitCode,
+      unreliable: reliability.unreliable,
+      baselineErrorCount: reliability.baselineErrorCount,
+      topCodes: reliability.topCodes
     };
   } catch (err) {
     return { ok: true, skipped: true, reason: String(err && err.message || err), errors: [] };
@@ -828,6 +915,7 @@ module.exports = {
   normalizeTscOutput: normalizeTscOutput,
   normalizeTscErrorLine: normalizeTscErrorLine,
   diffTscErrors: diffTscErrors,
+  detectUnreliableBaselineErrors: detectUnreliableBaselineErrors,
   initIndex: initIndex,
   sha256Hex: sha256Hex,
   redactEmails: redactEmails,

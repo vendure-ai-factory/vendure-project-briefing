@@ -772,6 +772,10 @@ function checkStatus(r) {
   if (!r) return 'FAIL';
   if (r.skipped) return 'SKIPPED';
   if (r.timedOut) return 'TIMED_OUT';
+  // INCONCLUSIVE_TOOLCHAIN is a distinct status: the baseline was unreliable
+  // (core modules missing from node_modules) so the diff cannot be trusted.
+  // Show it as recorded, not as FAIL.
+  if (r.code === 'INCONCLUSIVE_TOOLCHAIN') return 'INCONCLUSIVE_TOOLCHAIN';
   if (r.success) return RESULT_PASS;
   return 'FAIL';
 }
@@ -1901,13 +1905,16 @@ async function proposeAndCheck(options) {
       requestedModel: modelResult.requestedModel,
       provider: modelResult.provider
     }, fs, now);
+    // Save rejected proposal for diagnostics; include offending paths in message.
+    writeRejectedProposal(runId, attemptNumber, editSet, cloneDir, fs, now);
+    var offendingList = (pathGate.offending || []).join(', ');
     return {
       status: 'REJECTED',
       rejectionCodes: rejectionCodes,
       validCandidatePaths: validPaths,
       requestedPaths: requestedPaths,
       errors: pathGate.offending.map(function(p) { return '[' + rejectionCodes[0] + '] path not a listed candidate: ' + p; }),
-      blocker: { code: 'PROPOSAL_OUTSIDE_CANDIDATES', message: 'proposal edits a path that is not a listed candidate: ' + pathGate.offending.join(', ') }
+      blocker: { code: 'PROPOSAL_OUTSIDE_CANDIDATES', message: 'proposal edits a path that is not a listed candidate: ' + offendingList + ' (newFiles under src/ are allowed for local-wrapper repair kind)' }
     };
   }
 
@@ -2665,5 +2672,6 @@ module.exports = {
   candidateRelPaths: candidateRelPaths,
   validateProposalPaths: validateProposalPaths,
   installedDependencyVersion: installedDependencyVersion,
-  proposalSummaryOf: proposalSummaryOf
+  proposalSummaryOf: proposalSummaryOf,
+  checkStatus: checkStatus
 };

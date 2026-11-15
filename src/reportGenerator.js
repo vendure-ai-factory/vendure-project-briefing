@@ -578,12 +578,18 @@ function renderMarkdownReport(report, options) {
       lines.push('| n | signature | domain | repairKind | status | checks | branch | headSha | deployed | verifyStatus |');
       lines.push('|---|---|---|---|---|---|---|---|---|---|');
       attempts.forEach(function(a) {
+        var checksDisplay = '';
+        if (Array.isArray(a.checks) && a.checks.length > 0) {
+          checksDisplay = a.checks.map(function(c) {
+            return (c && c.name ? c.name : '?') + ':' + (c && c.status ? c.status : '?');
+          }).join(',');
+        }
         lines.push('| ' + (a.n || '') +
           ' | ' + (a.signature || '') +
           ' | ' + (a.domain || '') +
           ' | ' + (a.repairKind || '') +
           ' | ' + (a.status || '') +
-          ' | ' + (a.checks || '') +
+          ' | ' + checksDisplay +
           ' | ' + (a.branch || '') +
           ' | ' + (a.headSha ? a.headSha.substring(0, 7) : '') +
           ' | ' + (a.deployed ? 'yes' : 'no') +
