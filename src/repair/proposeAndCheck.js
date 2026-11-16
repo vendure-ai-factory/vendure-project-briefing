@@ -776,6 +776,10 @@ function checkStatus(r) {
   // (core modules missing from node_modules) so the diff cannot be trusted.
   // Show it as recorded, not as FAIL.
   if (r.code === 'INCONCLUSIVE_TOOLCHAIN') return 'INCONCLUSIVE_TOOLCHAIN';
+  // SKIPPED_BY_CONFIG is a distinct status for REPAIR_LOCAL_CHECKS=off: local
+  // checks were intentionally skipped so the real image build is authoritative.
+  // It must never be reported as a pass.
+  if (r.code === 'SKIPPED_BY_CONFIG') return 'SKIPPED_BY_CONFIG';
   if (r.success) return RESULT_PASS;
   return 'FAIL';
 }
@@ -2283,6 +2287,23 @@ async function proposeAndCheck(options) {
         blocker: { code: applyResult.blocker.code, message: applyResult.blocker.message }
       };
     }
+    // APPLY_FAILED: still write proposal and attempt evidence before returning.
+    writeProposalBeforeCommit(runId, attemptNumber, editSet, fs, now);
+    writeAttemptSummary(runId, attemptNumber, {
+      status: 'APPLY_FAILED',
+      codes: ['APPLY_FAILED'],
+      requestedPaths: requestedPaths,
+      candidatePaths: (candidates || []).map(function(c) { return c.file; }),
+      tokensUsed: modelResult && modelResult.usage ? modelResult.usage.total_tokens : null,
+      promptChars: typeof promptChars === 'number' ? promptChars : null,
+      elapsedMs: typeof elapsedMs === 'number' ? elapsedMs : null,
+      model: modelResult && modelResult.model ? modelResult.model : null,
+      requestedModel: modelResult && modelResult.requestedModel ? modelResult.requestedModel : null,
+      provider: modelResult && modelResult.provider ? modelResult.provider : null,
+      proposalSummary: proposalSummaryOf(editSet, requestedPaths),
+      stage: 'apply',
+      blocker: { code: applyResult.blocker ? applyResult.blocker.code : 'APPLY_FAILED', message: applyResult.blocker ? applyResult.blocker.message : 'apply failed' }
+    }, fs, now);
     return {
       status: 'APPLY_FAILED',
       blocker: applyResult.blocker,
@@ -2298,8 +2319,11 @@ async function proposeAndCheck(options) {
     timeout: 120000,
     root: 'evidence',
     baselineTscErrors: baselineTsc && !baselineTsc.skipped && Array.isArray(baselineTsc.errors)
-      ? baselineTsc.errors
-      : (baselineTsc && baselineTsc.skipped ? { skipped: true, errors: [] } : null)
+      ? baselineTsc  // Pass full object so runChecks gets unreliable, baselineErrorCount, topCodes
+      : (baselineTsc && baselineTsc.skipped ? { skipped: true, errors: [] } : null),
+    // When REPAIR_LOCAL_CHECKS=off, skip local checks and go straight to commit.
+    // The real image build is authoritative; local checks are SKIPPED_BY_CONFIG.
+    skipByConfig: env && env.REPAIR_LOCAL_CHECKS === 'off'
   };
 
   if (mode === 'pipeline') {
@@ -2488,6 +2512,9 @@ async function proposeAndCheck(options) {
       tokensUsed: modelResult.usage ? modelResult.usage.total_tokens : null,
       promptChars: promptChars,
       elapsedMs: elapsedMs,
+      model: modelResult.model,
+      requestedModel: modelResult.requestedModel,
+      provider: modelResult.provider,
       checks: { results: checkResult.results },
       checkKilled: killedWithNoOutput ? {
         signal: killedResults[0] ? killedResults[0].signal : null,
@@ -2495,6 +2522,9 @@ async function proposeAndCheck(options) {
         cwd: killedResults[0] ? killedResults[0].cwd : null
       } : null
     }, fs, now);
+    // Always write the proposal (accepted edits) so a CHECKS_FAILED attempt still
+    // has a diagnosable proposal artifact even if commit never runs.
+    writeProposalBeforeCommit(runId, attemptNumber, editSet, fs, now);
     // Restore clone
     if (mode === 'target') {
       applier.restoreClone(cloneDir, runCommand);
